@@ -7,4 +7,5 @@ pub mod march;
 pub mod mask_table;
 pub mod material;
 pub mod node;
+pub mod normal;
 pub mod testing;

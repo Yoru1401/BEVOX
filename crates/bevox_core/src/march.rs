@@ -25,9 +25,17 @@ pub struct Hit {
     pub face_normal: Vec3,
 }
 
+/// Totals accumulated across every `march` call they are passed to.
+///
+/// `steps` is cumulative on purpose, so a whole render can be measured with one
+/// counter. The step cap is deliberately *not* checked against it: that budget
+/// is per ray, tracked separately inside each call, or a long render would
+/// exhaust a shared counter and every later ray would report a false miss.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MarchStats {
+    /// Child visits across all rays.
     pub steps: u32,
+    /// Rays that exceeded `MAX_STEPS`, counted once each.
     pub overruns: u32,
 }
 
@@ -100,6 +108,9 @@ pub fn march(
     let extent = volume.extent() as f32;
     let (t_enter, t_exit) = ray_box(local_origin, inv_dir, Vec3::ZERO, Vec3::splat(extent))?;
 
+    // Budget belongs to this ray alone.
+    let mut ray_steps = 0u32;
+
     visit(
         volume,
         volume.root(),
@@ -108,6 +119,7 @@ pub fn march(
         &ray,
         t_enter.max(0.0),
         t_exit,
+        &mut ray_steps,
         stats,
     )
 }
@@ -120,6 +132,7 @@ fn visit(
     ray: &Ray,
     t_enter: f32,
     t_exit: f32,
+    ray_steps: &mut u32,
     stats: &mut MarchStats,
 ) -> Option<Hit> {
     if node.is_empty() || t_enter > ray.max_dist || t_enter > t_exit {
@@ -160,8 +173,12 @@ fn visit(
                     continue;
                 }
                 stats.steps += 1;
-                if stats.steps > MAX_STEPS {
-                    stats.overruns += 1;
+                *ray_steps += 1;
+                if *ray_steps > MAX_STEPS {
+                    // Count the ray once, on the step that crosses the budget.
+                    if *ray_steps == MAX_STEPS + 1 {
+                        stats.overruns += 1;
+                    }
                     return None;
                 }
                 let child_origin = origin + UVec3::new(x, y, z) * step;
@@ -219,6 +236,7 @@ fn visit(
             ray,
             child_enter,
             child_exit.min(t_exit),
+            ray_steps,
             stats,
         ) {
             return Some(hit);

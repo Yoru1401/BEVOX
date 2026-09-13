@@ -152,6 +152,32 @@ fn any_hit_finds_something_without_visiting_more_than_closest_hit() {
 }
 
 #[test]
+fn the_step_budget_is_per_ray_not_cumulative() {
+    // A render shares one MarchStats across every ray. If the cap were checked
+    // against the running total, later rays would report false misses once the
+    // total passed MAX_STEPS.
+    let tree = single_voxel_tree();
+    let mut stats = MarchStats::default();
+
+    for _ in 0..5000 {
+        let hit = march(
+            &tree,
+            Affine3A::IDENTITY,
+            Vec3::new(-5.0, 8.5, 8.5),
+            Vec3::X,
+            100.0,
+            false,
+            &mut stats,
+        );
+        assert!(hit.is_some(), "a later ray reported a false miss");
+    }
+
+    assert_eq!(stats.overruns, 0);
+    // The shared counter should have accumulated well past a single ray's cap.
+    assert!(stats.steps > 5000, "steps should accumulate across rays");
+}
+
+#[test]
 fn a_translated_volume_hits_the_same_voxel() {
     let tree = single_voxel_tree();
     let shift = Vec3::new(100.0, 0.0, 0.0);

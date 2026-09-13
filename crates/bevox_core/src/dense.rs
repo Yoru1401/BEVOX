@@ -67,6 +67,11 @@ impl DenseVolume {
         let i = self.index(p);
         self.data[i] = material.0;
     }
+
+    /// Convenience for tests and examples.
+    pub fn into_contree(self) -> crate::contree::Contree {
+        crate::contree::Contree::from_dense(&self)
+    }
 }
 
 #[cfg(test)]

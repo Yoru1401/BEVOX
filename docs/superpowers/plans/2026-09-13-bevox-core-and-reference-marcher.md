@@ -2363,6 +2363,17 @@ fn visit(
 }
 ```
 
+> **Correction applied during execution (Task 8).** The code above checks the
+> step cap against `stats.steps`, which is cumulative across every `march` call
+> sharing that `MarchStats`. A render shares one counter across hundreds of
+> thousands of rays, so the total passes `MAX_STEPS` early and every later ray
+> returns a false miss — 199,882 overruns on the first run of the reference
+> renderer. The cap is per ray, so `visit` takes a separate `ray_steps: &mut u32`
+> that `march` initialises to zero per call, while `stats.steps` keeps
+> accumulating totals and `stats.overruns` counts each exceeding ray once. The
+> regression test is `the_step_budget_is_per_ray_not_cumulative`; every other
+> marcher test used a fresh counter, which is why none of them caught it.
+
 Note on `any_hit`: it skips the near-to-far sort, so a shadow ray may return any occluder rather than the nearest one. That is the correct semantics for shadows and it is why the flag earns its place instead of being dead weight. The test asserts only that `any_hit` never visits more children than closest-hit, which holds in both modes.
 
 Add to `crates/bevox_core/src/lib.rs`:
