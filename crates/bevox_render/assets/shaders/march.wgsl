@@ -91,7 +91,31 @@ struct Frame {
     visited_hi: u32,
 };
 
-struct Hit { hit: bool, material: u32, t: f32 };
+struct Hit {
+    hit: bool,
+    material: u32,
+    t: f32,
+    voxel: vec3<u32>,
+    face_normal: vec3<f32>,
+};
+
+/// Which face of a box the ray entered, from the per-axis entry distances.
+/// Mirrors `entry_normal` in bevox_core::march.
+fn entry_normal(origin: vec3<f32>, inv_dir: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>) -> vec3<f32> {
+    let t0 = (lo - origin) * inv_dir;
+    let t1 = (hi - origin) * inv_dir;
+    let near = min(t0, t1);
+    if near.x >= near.y && near.x >= near.z {
+        if inv_dir.x >= 0.0 { return vec3<f32>(-1.0, 0.0, 0.0); }
+        return vec3<f32>(1.0, 0.0, 0.0);
+    }
+    if near.y >= near.z {
+        if inv_dir.y >= 0.0 { return vec3<f32>(0.0, -1.0, 0.0); }
+        return vec3<f32>(0.0, 1.0, 0.0);
+    }
+    if inv_dir.z >= 0.0 { return vec3<f32>(0.0, 0.0, -1.0); }
+    return vec3<f32>(0.0, 0.0, 1.0);
+}
 
 fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
     // Float division by zero yields infinity in WGSL, which is exactly what the
@@ -103,7 +127,7 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
     let extent = f32(view.volume_params.y);
     let root_slab = ray_box(origin, inv_dir, vec3<f32>(0.0), vec3<f32>(extent));
     if !root_slab.hit {
-        return Hit(false, 0u, 0.0);
+        return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0));
     }
 
     // Element 0 of `nodes` is the root written by the uploader, so every arena
@@ -135,7 +159,21 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
             continue;
         }
         if is_uniform_solid(frame.node) {
-            return Hit(true, node_material(frame.node), frame.t_enter);
+            let region = f32(level_extent(frame.level));
+            let lo = vec3<f32>(frame.origin);
+            let hi = lo + vec3<f32>(region);
+            // A collapsed region covers many voxels: report the one actually
+            // entered, not the region's origin. bevox_core::march does the same,
+            // and the parity test pins it.
+            let point = origin + dir * frame.t_enter;
+            let entered = clamp(floor(point), lo, lo + vec3<f32>(region - 1.0));
+            return Hit(
+                true,
+                node_material(frame.node),
+                frame.t_enter,
+                vec3<u32>(entered),
+                entry_normal(origin, inv_dir, lo, hi),
+            );
         }
 
         // Nearest child this ray crosses that this frame has not descended into.
@@ -196,7 +234,15 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
         let slot = child_slot(frame.node, best_i);
 
         if frame.level == 0u {
-            return Hit(true, voxel_byte(slot), best_t);
+            let lo = vec3<f32>(best_origin);
+            let hi = lo + vec3<f32>(1.0);
+            return Hit(
+                true,
+                voxel_byte(slot),
+                best_t,
+                best_origin,
+                entry_normal(origin, inv_dir, lo, hi),
+            );
         }
 
         sp = sp + 1u;
@@ -211,7 +257,7 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
         );
     }
 
-    return Hit(false, 0u, 0.0);
+    return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0));
 }
 
 /// Ray direction for a pixel. Shared so both entry points march identical rays.
@@ -222,6 +268,27 @@ fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
     );
     let far = view.world_from_clip * vec4<f32>(ndc, 1.0, 1.0);
     return normalize(far.xyz / far.w - view.camera_position.xyz);
+}
+
+/// Hit voxel coordinate in RGB, hit flag in alpha. Read by the parity test only.
+@compute @workgroup_size(8, 8, 1)
+fn march_voxel_id(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(output);
+    if id.x >= size.x || id.y >= size.y { return; }
+
+    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), 1000.0);
+
+    var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if hit.hit {
+        // Volumes in these tests are at most 256 per axis, so a byte each.
+        colour = vec4<f32>(
+            f32(hit.voxel.x) / 255.0,
+            f32(hit.voxel.y) / 255.0,
+            f32(hit.voxel.z) / 255.0,
+            1.0,
+        );
+    }
+    textureStore(output, vec2<i32>(id.xy), colour);
 }
 
 /// Material identity in red, hit flag in green. Read by the parity test only.

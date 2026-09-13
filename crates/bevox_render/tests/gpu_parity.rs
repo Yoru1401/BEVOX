@@ -191,6 +191,72 @@ fn the_display_entry_point_renders_a_scene() {
     assert!(near_sky, "no sky-coloured pixel found; every ray hit something");
 }
 
+/// The hit voxel coordinate must match the CPU exactly. A collapsed uniform
+/// region is the case that breaks: the region's origin is not the voxel the ray
+/// entered, and shading a normal at the wrong coordinate is invisible in a flat
+/// material but wrong everywhere a surface turns.
+#[test]
+fn the_gpu_reports_the_same_hit_voxel_as_the_cpu() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+
+    let tree = parity_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (64u32, 64u32);
+    let eye = Vec3::new(-30.0, 40.0, -30.0);
+    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, width as f32 / height as f32, 0.1, 500.0);
+    let world_from_clip = (projection * view).inverse();
+
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader file missing");
+    let pixels = run_march(
+        &device,
+        &queue,
+        &shader,
+        "march_voxel_id",
+        world_from_clip,
+        eye,
+        &tree,
+        &gpu_volume,
+        width,
+        height,
+    );
+
+    let mut stats = MarchStats::default();
+    let mut mismatches = 0usize;
+    let mut first = String::new();
+
+    for y in 0..height {
+        for x in 0..width {
+            let dir = ray_direction(world_from_clip, eye, x, y, width, height);
+            let cpu = march(&tree, Affine3A::IDENTITY, eye, dir, 1000.0, false, &mut stats);
+            let i = ((y * width + x) * 4) as usize;
+
+            // Volume extent is 64, so each axis fits in one byte.
+            let gpu_hit = pixels[i + 3] > 0;
+            let gpu_voxel = UVec3::new(pixels[i] as u32, pixels[i + 1] as u32, pixels[i + 2] as u32);
+
+            let bad = match cpu {
+                Some(hit) => !gpu_hit || gpu_voxel != hit.voxel,
+                None => gpu_hit,
+            };
+            if bad {
+                if mismatches == 0 {
+                    first = format!(
+                        "at ({x},{y}) cpu={:?} gpu_hit={gpu_hit} gpu_voxel={gpu_voxel:?}",
+                        cpu.map(|h| h.voxel)
+                    );
+                }
+                mismatches += 1;
+            }
+        }
+    }
+
+    assert_eq!(mismatches, 0, "{mismatches} voxel coordinates disagreed; first {first}");
+}
+
 #[test]
 fn the_gpu_traversal_agrees_with_the_cpu_reference() {
     let Some((device, queue)) = gpu_device() else {
