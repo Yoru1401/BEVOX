@@ -195,6 +195,85 @@ fn collapse_uniform(children: &[Node; CHILDREN as usize]) -> Option<Node> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CanonicalError {
+    /// A subdivided node whose children are all empty; it should be `Node::EMPTY`.
+    UncollapsedEmpty { level: u32 },
+    /// A subdivided node whose children are all the same uniform solid.
+    UncollapsedUniform { level: u32 },
+    /// An empty node occupying a child slot, which wastes space and breaks
+    /// the invariant that a set mask bit implies a non-empty child.
+    EmptyChildStored { level: u32, slot: u32 },
+    /// A child slot outside the arena.
+    SlotOutOfBounds { slot: u32 },
+}
+
+impl Contree {
+    /// Root replacement for tests that build deliberately invalid trees.
+    /// Integration tests are separate crates, so this has to be public.
+    #[doc(hidden)]
+    pub fn set_root_for_test(&mut self, root: Node) {
+        self.root = root;
+    }
+
+    pub fn check_canonical(&self) -> Result<(), CanonicalError> {
+        self.check_node(self.root, self.depth - 1)
+    }
+
+    fn check_node(&self, node: Node, level: u32) -> Result<(), CanonicalError> {
+        if !node.is_subdivided() {
+            return Ok(());
+        }
+
+        // Leaf bricks address voxel bytes, which cannot be empty by construction
+        // because empty voxels clear their mask bit. Only bounds need checking.
+        if level == 0 {
+            let last = node.child_base + node.child_count() - 1;
+            if last as usize >= self.arena.voxels().len() {
+                return Err(CanonicalError::SlotOutOfBounds { slot: last });
+            }
+            for i in 0..CHILDREN {
+                if let Some(slot) = node.child_slot(i)
+                    && self.arena.voxel(slot) == 0
+                {
+                    return Err(CanonicalError::EmptyChildStored { level, slot });
+                }
+            }
+            return Ok(());
+        }
+
+        let last = node.child_base + node.child_count() - 1;
+        if last as usize >= self.arena.nodes().len() {
+            return Err(CanonicalError::SlotOutOfBounds { slot: last });
+        }
+
+        let mut all_same_uniform = node.child_count() == CHILDREN;
+        let mut first = Node::EMPTY;
+        for i in 0..CHILDREN {
+            let Some(slot) = node.child_slot(i) else {
+                all_same_uniform = false;
+                continue;
+            };
+            let child = self.arena.node(slot);
+            if child.is_empty() {
+                return Err(CanonicalError::EmptyChildStored { level, slot });
+            }
+            if i == 0 {
+                first = child;
+            }
+            if !child.is_uniform_solid() || child != first {
+                all_same_uniform = false;
+            }
+            self.check_node(child, level - 1)?;
+        }
+
+        if all_same_uniform {
+            return Err(CanonicalError::UncollapsedUniform { level });
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
