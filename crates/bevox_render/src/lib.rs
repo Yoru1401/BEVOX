@@ -20,6 +20,9 @@ pub struct BevoxRenderPlugin;
 impl Plugin for BevoxRenderPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(BevoxReady)
+            // Always present, so the renderer draws an empty world rather than
+            // going dark when no scene has been inserted.
+            .init_resource::<upload::GpuSceneData>()
             .add_plugins(ExtractResourcePlugin::<upload::MarchTarget>::default())
             .add_plugins(ExtractResourcePlugin::<upload::GpuSceneData>::default())
             .add_plugins(ExtractResourcePlugin::<upload::ExtractedMarchCamera>::default())

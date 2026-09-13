@@ -48,6 +48,23 @@ pub struct GpuSceneData {
     pub generation: u32,
 }
 
+impl Default for GpuSceneData {
+    /// A single empty root node: a valid volume that every ray misses.
+    ///
+    /// This resource always exists, so the dispatch is never gated on a scene
+    /// being loaded. An empty world must render sky, not a black screen.
+    fn default() -> Self {
+        Self {
+            nodes: vec![GpuNode::default()],
+            voxels: Vec::new(),
+            // Depth must be at least 1: the shader starts at level `depth - 1`.
+            depth: 1,
+            extent: 4,
+            generation: 0,
+        }
+    }
+}
+
 /// The active camera, as the render world needs it.
 #[derive(Resource, Clone, ExtractResource)]
 pub struct ExtractedMarchCamera {

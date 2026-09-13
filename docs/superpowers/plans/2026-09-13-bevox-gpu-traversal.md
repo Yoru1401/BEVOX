@@ -31,6 +31,11 @@ Recorded here because several differ from what this plan originally assumed.
 - `GlobalTransform::compute_matrix` is now `to_matrix`.
 - `WindowResolution` implements `From<(u32, u32)>`, not `From<(f32, f32)>`.
 - `EventReader` is gone; 0.19 uses `MessageReader`.
+- `GpuSceneData` must be registered with `init_resource` and default to a single
+  empty root node. Gating the dispatch on a scene existing makes an empty world
+  render black instead of sky, and Task 4's own deliverable check failed on
+  exactly this: `main.rs` does not insert a `VoxelScene` until Task 7, so
+  `prepare_march_buffers` bailed every frame and nothing was ever dispatched.
 - `AssetPlugin::file_path` resolves relative to the **executable**, not the
   workspace root, so the app sets it absolute via
   `concat!(env!("CARGO_MANIFEST_DIR"), "/../bevox_render/assets")`.
