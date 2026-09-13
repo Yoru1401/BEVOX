@@ -30,6 +30,7 @@ pub struct MarchBuffers {
     pub nodes: Buffer,
     pub voxels: Buffer,
     pub palette: Buffer,
+    pub direction_masks: Buffer,
     pub generation: u32,
 }
 
@@ -55,6 +56,7 @@ pub fn init_march_pipeline(
             // Palette: array<vec4<f32>>, so one element is 16 bytes.
             storage_buffer_read_only_sized(false, NonZero::new(16)),
             texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
+            storage_buffer_read_only_sized(false, NonZero::new(8)),
         ),
     );
 
@@ -132,6 +134,11 @@ pub fn prepare_march_buffers(
             contents: &voxel_bytes,
             usage: BufferUsages::STORAGE,
         }),
+        direction_masks: device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("bevox_direction_masks"),
+            contents: bytemuck::cast_slice(&scene.direction_masks),
+            usage: BufferUsages::STORAGE,
+        }),
         palette: device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("bevox_palette"),
             contents: bytemuck::cast_slice(&scene.palette),
@@ -171,6 +178,7 @@ pub fn dispatch_march(
             buffers.voxels.as_entire_binding(),
             buffers.palette.as_entire_binding(),
             &gpu_image.texture_view,
+            buffers.direction_masks.as_entire_binding(),
         )),
     );
 

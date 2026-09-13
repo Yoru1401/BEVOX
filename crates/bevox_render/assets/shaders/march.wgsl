@@ -24,6 +24,9 @@ const FLAG_BEAM: u32 = 4u;
 @group(0) @binding(2) var<storage, read> voxels: array<u32>;
 @group(0) @binding(3) var<storage, read> palette: array<vec4<f32>>;
 @group(0) @binding(4) var output: texture_storage_2d<rgba8unorm, write>;
+// Reachability masks as low/high halves, indexed cell * 8 + octant. WGSL has no
+// 64-bit integer, so the u64 table is split rather than reshaped.
+@group(0) @binding(5) var<storage, read> direction_masks: array<vec2<u32>>;
 
 const BRICK_EDGE: u32 = 4u;
 const CHILDREN: u32 = 64u;
@@ -152,6 +155,28 @@ fn cell_of_index(i: u32) -> vec3<i32> {
     );
 }
 
+fn direction_mask(cell: u32, octant: u32) -> vec2<u32> {
+    return direction_masks[cell * 8u + octant];
+}
+
+/// Whether this ray, entering `node` at `cell`, can still reach any occupied
+/// child of it. Conservative: a true answer does not promise a hit.
+fn brick_reachable(node: vec4<u32>, cell: u32, octant: u32) -> bool {
+    let m = direction_mask(cell, octant);
+    return (node_mask_lo(node) & m.x) != 0u || (node_mask_hi(node) & m.y) != 0u;
+}
+
+/// Sign octant of a direction, matching bevox_core::mask_table::octant_index.
+/// A zero component counts as positive, which keeps the mask conservative
+/// instead of dropping a whole plane of cells.
+fn octant_of(dir: vec3<f32>) -> u32 {
+    var octant: u32 = 0u;
+    if dir.x < 0.0 { octant = octant | 1u; }
+    if dir.y < 0.0 { octant = octant | 2u; }
+    if dir.z < 0.0 { octant = octant | 4u; }
+    return octant;
+}
+
 struct Hit {
     hit: bool,
     material: u32,
@@ -207,6 +232,9 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
         NO_CURSOR,
         0.0,
     );
+
+    // Constant for the whole ray.
+    let octant = octant_of(dir);
 
     var steps: u32 = 0u;
 
@@ -380,9 +408,29 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
             );
         }
 
+        let child = nodes[slot + 1u];
+
+        // Skip a child the ray cannot reach anything inside of. Only subdivided
+        // children carry an occupancy mask; a uniform solid's mask is zero and
+        // the filter would erase it from the scene.
+        if flag_enabled(FLAG_MASK_FILTER) && is_subdivided(child) {
+            let child_cell_size = f32(step_size) * 0.25;
+            let point = origin + dir * best_t;
+            let cell = clamp(
+                vec3<i32>(floor((point - vec3<f32>(best_origin)) / child_cell_size)),
+                vec3<i32>(0),
+                vec3<i32>(3),
+            );
+            // The child is already recorded as visited above, so continuing
+            // re-enters this frame and moves on to the next child.
+            if !brick_reachable(child, index_of_cell(cell), octant) {
+                continue;
+            }
+        }
+
         sp = sp + 1u;
         stack[sp] = Frame(
-            nodes[slot + 1u],
+            child,
             best_origin,
             frame.level - 1u,
             best_t,

@@ -679,3 +679,58 @@ fn dda_leaves_output_bit_identical() {
         }
     }
 }
+
+/// The filter decides which bricks are entered, never what is found inside one.
+///
+/// Combinations are tested too: an optimisation can be individually sound and
+/// wrong in company, and the app runs them together. The cameras are the same
+/// awkward set the DDA test uses, for the same reason — the filter reads the
+/// cell a ray enters a child at, so it inherits every boundary case DDA has.
+#[test]
+fn the_mask_filter_leaves_output_bit_identical() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let tree = parity_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (96u32, 96u32);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    let cameras = [
+        (Vec3::new(-30.0, 40.0, -30.0), Vec3::new(32.0, 12.0, 32.0)),
+        (Vec3::new(32.0, 18.0, -40.0), Vec3::new(32.0, 18.0, 32.0)),
+        (Vec3::new(32.0, 90.0, 32.0001), Vec3::new(32.0, 0.0, 32.0)),
+        (Vec3::new(96.0, 60.0, 96.0), Vec3::new(32.0, 12.0, 32.0)),
+        (Vec3::new(10.0, 7.0, 10.0), Vec3::new(60.0, 7.5, 60.0)),
+    ];
+
+    for (i, (eye, target)) in cameras.iter().enumerate() {
+        let view = Mat4::look_at_rh(*eye, *target, Vec3::Y);
+        let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+        let world_from_clip = (projection * view).inverse();
+
+        for entry in ["march_identity", "march_normal", "march_shadow", "march"] {
+            let reference = run_march_flagged(
+                &device, &queue, &shader, entry, world_from_clip, *eye, &tree, &gpu_volume, width,
+                height, march_flags::NONE,
+            );
+            for flags in [
+                march_flags::MASK_FILTER,
+                march_flags::DDA | march_flags::MASK_FILTER,
+            ] {
+                let got = run_march_flagged(
+                    &device, &queue, &shader, entry, world_from_clip, *eye, &tree, &gpu_volume,
+                    width, height, flags,
+                );
+                let differing =
+                    reference.chunks(4).zip(got.chunks(4)).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differing, 0,
+                    "camera {i}, {entry}, flags {flags:#b}: {differing} of {} pixels differ",
+                    width * height
+                );
+            }
+        }
+    }
+}

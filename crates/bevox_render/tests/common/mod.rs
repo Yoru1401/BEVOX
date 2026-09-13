@@ -194,6 +194,11 @@ impl Prepared {
             usage: wgpu::BufferUsages::STORAGE,
         });
         let palette = parity_materials().to_gpu();
+        let mask_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("masks"),
+            contents: bytemuck::cast_slice(&bevox_render::upload::gpu_direction_masks()),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
         let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("palette"),
             contents: bytemuck::cast_slice(&palette),
@@ -228,6 +233,7 @@ impl Prepared {
                     },
                     count: None,
                 },
+                storage_entry(5, 8),
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -262,6 +268,7 @@ impl Prepared {
                 wgpu::BindGroupEntry { binding: 1, resource: node_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: voxel_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: palette_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: mask_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&view),

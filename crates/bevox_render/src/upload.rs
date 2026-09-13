@@ -6,6 +6,7 @@ use bevy::render::extract_resource::ExtractResource;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevox_core::contree::Contree;
 use bevox_core::gpu::{GpuNode, GpuVolume};
+use bevox_core::mask_table::build_direction_masks;
 use bevox_core::material::MaterialTable;
 use bytemuck::{Pod, Zeroable};
 
@@ -69,6 +70,9 @@ pub struct GpuSceneData {
     pub nodes: Vec<GpuNode>,
     pub voxels: Vec<u32>,
     pub palette: Vec<[f32; 4]>,
+    /// Reachability masks as low/high halves: WGSL has no 64-bit integer.
+    /// Constant, so it is built once rather than per scene.
+    pub direction_masks: Vec<[u32; 2]>,
     pub depth: u32,
     pub extent: u32,
     pub generation: u32,
@@ -84,6 +88,7 @@ impl Default for GpuSceneData {
             nodes: vec![GpuNode::default()],
             voxels: Vec::new(),
             palette: MaterialTable::new().to_gpu(),
+            direction_masks: gpu_direction_masks(),
             // Depth must be at least 1: the shader starts at level `depth - 1`.
             depth: 1,
             extent: 4,
@@ -97,6 +102,14 @@ impl Default for GpuSceneData {
 pub struct ExtractedMarchCamera {
     pub world_from_clip: Mat4,
     pub position: Vec3,
+}
+
+/// The reachability table split into halves the shader can index.
+pub fn gpu_direction_masks() -> Vec<[u32; 2]> {
+    build_direction_masks()
+        .iter()
+        .map(|m| [*m as u32, (*m >> 32) as u32])
+        .collect()
 }
 
 /// Rebuilds the GPU-side representation whenever the scene changes.
@@ -113,6 +126,7 @@ pub fn build_gpu_scene(mut commands: Commands, scene: Option<Res<VoxelScene>>) {
         nodes: volume.buffer_nodes(),
         voxels: volume.voxels,
         palette: scene.materials.to_gpu(),
+        direction_masks: gpu_direction_masks(),
         depth: scene.tree.depth(),
         extent: scene.tree.extent(),
         generation: scene.generation,
@@ -194,6 +208,16 @@ pub fn march_uniform(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mask_halves_reassemble_into_the_originals() {
+        let split = gpu_direction_masks();
+        let source = build_direction_masks();
+        assert_eq!(split.len(), source.len());
+        for (got, want) in split.iter().zip(source.iter()) {
+            assert_eq!(u64::from(got[0]) | (u64::from(got[1]) << 32), *want);
+        }
+    }
 
     #[test]
     fn the_uniform_is_the_size_the_shader_expects() {

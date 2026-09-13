@@ -11,6 +11,7 @@
 use bevox_core::contree::Contree;
 use bevox_core::gpu::GpuVolume;
 use bevox_core::material::MaterialId;
+use bevox_render::upload::march_flags;
 use glam::{Mat4, UVec3, Vec3};
 
 mod common;
@@ -153,13 +154,16 @@ fn record_the_baseline() {
     assert!(ms > 0.0, "the timer returned nothing");
 }
 
-/// DDA against the scan, interleaved in one process on one device.
+/// Every optimisation, and every combination the app might ship, against the
+/// scan — interleaved in one process on one device.
 ///
-/// A/B/A, not A-then-B: the two baseline readings bracket the variant, so
+/// A/B/A, not A-then-B: the two baseline readings bracket each variant, so
 /// thermal drift and clock ramping are visible rather than being attributed to
-/// the change. A win smaller than the spread between them is not a win.
+/// the change. A win smaller than the spread between them is not a win. This is
+/// also why the numbers here do not match a baseline recorded in an earlier
+/// process — only the comparison within one run means anything.
 #[test]
-fn dda_is_measured_against_the_baseline() {
+fn optimisations_are_measured_against_the_baseline() {
     let Some((device, queue)) = gpu_device() else {
         eprintln!("no GPU adapter available, skipping");
         return;
@@ -172,31 +176,26 @@ fn dda_is_measured_against_the_baseline() {
 
     let make = |flags: u32| {
         Prepared::new(
-            &device,
-            &shader,
-            "march",
-            &tree,
-            &volume,
-            world_from_clip,
-            eye,
-            1280,
-            720,
-            flags,
+            &device, &shader, "march", &tree, &volume, world_from_clip, eye, 1280, 720, flags,
         )
     };
-    let baseline = make(0);
-    let variant = make(1);
+    let baseline = make(march_flags::NONE);
 
-    let (a1, b, a2) = compare_aba(&device, &queue, &baseline, &variant);
-    let drift = (a1 - a2).abs();
-    let gain = (a1 + a2) * 0.5 - b;
-    println!(
-        "scan: {a1:.2} / {a2:.2} ms (drift {drift:.2})\n\
-         dda:  {b:.2} ms\n\
-         gain: {gain:.2} ms ({:.1}%), {}",
-        gain / ((a1 + a2) * 0.5) * 100.0,
-        if gain > drift { "larger than drift" } else { "WITHIN DRIFT, not a result" }
-    );
-
-    assert!(b > 0.0, "the timer returned nothing");
+    for (name, flags) in [
+        ("dda", march_flags::DDA),
+        ("mask", march_flags::MASK_FILTER),
+        ("dda+mask", march_flags::DDA | march_flags::MASK_FILTER),
+    ] {
+        let variant = make(flags);
+        let (a1, b, a2) = compare_aba(&device, &queue, &baseline, &variant);
+        let drift = (a1 - a2).abs();
+        let scan = (a1 + a2) * 0.5;
+        let gain = scan - b;
+        println!(
+            "{name:>9}: {b:6.2} ms vs scan {a1:.2}/{a2:.2} (drift {drift:.2})  gain {gain:6.2} ms ({:5.1}%) {}",
+            gain / scan * 100.0,
+            if gain.abs() > drift { "" } else { "<- within drift, not a result" }
+        );
+        assert!(b > 0.0, "{name}: the timer returned nothing");
+    }
 }
