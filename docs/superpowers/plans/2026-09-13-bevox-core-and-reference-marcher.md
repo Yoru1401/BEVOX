@@ -675,7 +675,7 @@ git commit -m "feat(core): add node arena with size-class free lists and dirty r
 
 **Interfaces:**
 - Consumes: `Node`, `MaterialId`, `NodeArena`, `child_index`, `BRICK_EDGE`, `CHILDREN`.
-- Produces: `DenseVolume::new(extent: u32) -> DenseVolume`, `get(&self, UVec3) -> MaterialId`, `set(&mut self, UVec3, MaterialId)`, `extent(&self) -> u32`. `XorShift64::new(seed: u64) -> XorShift64`, `next_u64(&mut self) -> u64`, `next_below(&mut self, u32) -> u32`. `Contree::empty(depth: u32) -> Contree`, `from_dense(&DenseVolume) -> Contree`, `to_dense(&self) -> DenseVolume`, `get(&self, UVec3) -> MaterialId`, `depth(&self) -> u32`, `extent(&self) -> u32`, `root(&self) -> Node`, `arena(&self) -> &NodeArena`, `arena_mut(&mut self) -> &mut NodeArena`, plus `pub(crate)` field access for later tasks in the same crate.
+- Produces: `VolumeError::InvalidExtent { extent: u32 }` implementing `Display` and `core::error::Error`; `DenseVolume::new(extent: u32) -> Result<DenseVolume, VolumeError>`, `get(&self, UVec3) -> MaterialId`, `set(&mut self, UVec3, MaterialId)`, `extent(&self) -> u32`. `XorShift64::new(seed: u64) -> XorShift64`, `next_u64(&mut self) -> u64`, `next_below(&mut self, u32) -> u32`. `Contree::empty(depth: u32) -> Contree`, `from_dense(&DenseVolume) -> Contree`, `to_dense(&self) -> DenseVolume`, `get(&self, UVec3) -> MaterialId`, `depth(&self) -> u32`, `extent(&self) -> u32`, `root(&self) -> Node`, `arena(&self) -> &NodeArena`, `arena_mut(&mut self) -> &mut NodeArena`, plus `pub(crate)` field access for later tasks in the same crate.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -750,20 +750,57 @@ pub struct DenseVolume {
     data: Vec<u8>,
 }
 
+/// Why a volume could not be created.
+///
+/// This is a real error rather than an assertion because model import feeds
+/// extents straight from files, and MagicaVoxel models are arbitrary sizes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VolumeError {
+    /// Extents must be 4, 16, 64, 256 ... so that they map onto whole tree levels.
+    InvalidExtent { extent: u32 },
+}
+
+impl core::fmt::Display for VolumeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            VolumeError::InvalidExtent { extent } => write!(
+                f,
+                "volume extent {extent} is not a power of four of at least 4"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for VolumeError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn extents_that_are_not_powers_of_four_are_rejected() {
+        for bad in [0u32, 1, 2, 8, 15, 32, 100] {
+            assert_eq!(
+                DenseVolume::new(bad),
+                Err(VolumeError::InvalidExtent { extent: bad }),
+                "extent {bad} should have been rejected"
+            );
+        }
+        for good in [4u32, 16, 64, 256] {
+            assert!(DenseVolume::new(good).is_ok(), "extent {good} should be legal");
+        }
+    }
+
+    #[test]
     fn a_new_volume_is_entirely_empty() {
-        let volume = DenseVolume::new(16);
+        let volume = DenseVolume::new(16).unwrap();
         assert_eq!(volume.extent(), 16);
         assert_eq!(volume.get(UVec3::new(3, 4, 5)), MaterialId::EMPTY);
     }
 
     #[test]
     fn set_then_get_returns_the_material() {
-        let mut volume = DenseVolume::new(16);
+        let mut volume = DenseVolume::new(16).unwrap();
         volume.set(UVec3::new(3, 4, 5), MaterialId(9));
         assert_eq!(volume.get(UVec3::new(3, 4, 5)), MaterialId(9));
         assert_eq!(volume.get(UVec3::new(3, 4, 6)), MaterialId::EMPTY);
@@ -808,7 +845,7 @@ mod tests {
 
     #[test]
     fn an_empty_volume_collapses_to_an_empty_root() {
-        let tree = Contree::from_dense(&DenseVolume::new(64));
+        let tree = Contree::from_dense(&DenseVolume::new(64).unwrap());
         assert!(tree.root().is_empty());
         assert_eq!(tree.arena().nodes().len(), 0);
         assert_eq!(tree.arena().voxels().len(), 0);
@@ -816,7 +853,7 @@ mod tests {
 
     #[test]
     fn a_completely_full_volume_collapses_to_a_uniform_root() {
-        let mut dense = DenseVolume::new(64);
+        let mut dense = DenseVolume::new(64).unwrap();
         for z in 0..64 {
             for y in 0..64 {
                 for x in 0..64 {
@@ -832,7 +869,7 @@ mod tests {
 
     #[test]
     fn a_single_voxel_is_readable() {
-        let mut dense = DenseVolume::new(16);
+        let mut dense = DenseVolume::new(16).unwrap();
         dense.set(UVec3::new(7, 2, 11), MaterialId(3));
         let tree = Contree::from_dense(&dense);
         assert_eq!(tree.get(UVec3::new(7, 2, 11)), MaterialId(3));
@@ -844,7 +881,7 @@ mod tests {
     #[test]
     fn every_voxel_of_a_random_volume_round_trips() {
         let mut rng = XorShift64::new(0xDEAD_BEEF);
-        let mut dense = DenseVolume::new(16);
+        let mut dense = DenseVolume::new(16).unwrap();
         for z in 0..16 {
             for y in 0..16 {
                 for x in 0..16 {
@@ -882,7 +919,7 @@ use glam::UVec3;
 /// exercises both the collapse path and the subdivided path.
 fn mixed_volume(extent: u32, seed: u64) -> DenseVolume {
     let mut rng = XorShift64::new(seed);
-    let mut dense = DenseVolume::new(extent);
+    let mut dense = DenseVolume::new(extent).unwrap();
     // A solid slab across the bottom quarter.
     for z in 0..extent {
         for y in 0..extent / 4 {
@@ -934,10 +971,20 @@ Insert into `crates/bevox_core/src/dense.rs`, above the test module:
 
 ```rust
 impl DenseVolume {
-    /// `extent` must be a power of four so that it maps onto whole tree levels.
-    pub fn new(extent: u32) -> Self {
-        debug_assert!(extent.is_power_of_two() && extent.trailing_zeros() % 2 == 0);
-        Self { extent, data: vec![0; (extent as usize).pow(3)] }
+    /// Creates an empty volume.
+    ///
+    /// `extent` must be a power of four, at least 4, so that it maps onto whole
+    /// tree levels. Anything else is rejected here, at the boundary, which is
+    /// what lets [`crate::contree::Contree::from_dense`] be infallible: a
+    /// `DenseVolume` that exists is proof its extent is legal.
+    pub fn new(extent: u32) -> Result<Self, VolumeError> {
+        if extent < crate::node::BRICK_EDGE
+            || !extent.is_power_of_two()
+            || extent.trailing_zeros() % 2 != 0
+        {
+            return Err(VolumeError::InvalidExtent { extent });
+        }
+        Ok(Self { extent, data: vec![0; (extent as usize).pow(3)] })
     }
 
     pub fn extent(&self) -> u32 {
@@ -1116,7 +1163,8 @@ impl Contree {
 
     pub fn to_dense(&self) -> DenseVolume {
         let extent = self.extent();
-        let mut dense = DenseVolume::new(extent);
+        let mut dense = DenseVolume::new(extent)
+            .expect("a tree's extent is a power of four by construction");
         for z in 0..extent {
             for y in 0..extent {
                 for x in 0..extent {
@@ -1191,7 +1239,7 @@ use glam::UVec3;
 fn trees_built_from_dense_volumes_are_canonical() {
     let mut rng = XorShift64::new(4242);
     for extent in [4u32, 16, 64] {
-        let mut dense = DenseVolume::new(extent);
+        let mut dense = DenseVolume::new(extent).unwrap();
         for _ in 0..extent * extent {
             let p = UVec3::new(
                 rng.next_below(extent),
@@ -1389,7 +1437,7 @@ use glam::{UVec3, Vec3};
 
 /// Ground truth: the same sphere applied to a flat volume.
 fn dense_sphere(extent: u32, center: Vec3, radius: f32, material: MaterialId) -> DenseVolume {
-    let mut dense = DenseVolume::new(extent);
+    let mut dense = DenseVolume::new(extent).unwrap();
     for z in 0..extent {
         for y in 0..extent {
             for x in 0..extent {
@@ -1414,7 +1462,7 @@ fn a_sphere_added_to_an_empty_tree_matches_the_dense_result() {
 
 #[test]
 fn voxels_outside_the_radius_are_untouched() {
-    let mut dense = DenseVolume::new(16);
+    let mut dense = DenseVolume::new(16).unwrap();
     dense.set(UVec3::new(0, 0, 0), MaterialId(7));
     dense.set(UVec3::new(15, 15, 15), MaterialId(7));
     let mut tree = Contree::from_dense(&dense);
@@ -1428,7 +1476,7 @@ fn voxels_outside_the_radius_are_untouched() {
 
 #[test]
 fn erasing_with_the_empty_material_removes_voxels_and_recollapses() {
-    let mut dense = DenseVolume::new(16);
+    let mut dense = DenseVolume::new(16).unwrap();
     for z in 0..16 {
         for y in 0..16 {
             for x in 0..16 {
@@ -1906,7 +1954,7 @@ use bevox_core::material::MaterialId;
 use glam::{Affine3A, UVec3, Vec3};
 
 fn single_voxel_tree() -> Contree {
-    let mut dense = DenseVolume::new(16);
+    let mut dense = DenseVolume::new(16).unwrap();
     dense.set(UVec3::new(8, 8, 8), MaterialId(3));
     Contree::from_dense(&dense)
 }
@@ -1969,7 +2017,7 @@ fn an_empty_tree_is_never_hit() {
 
 #[test]
 fn the_nearer_of_two_voxels_is_returned() {
-    let mut dense = DenseVolume::new(16);
+    let mut dense = DenseVolume::new(16).unwrap();
     dense.set(UVec3::new(4, 8, 8), MaterialId(1));
     dense.set(UVec3::new(12, 8, 8), MaterialId(2));
     let tree = Contree::from_dense(&dense);
@@ -2020,7 +2068,7 @@ fn max_dist_stops_the_ray_short() {
 
 #[test]
 fn any_hit_finds_something_without_visiting_more_than_closest_hit() {
-    let mut dense = DenseVolume::new(16);
+    let mut dense = DenseVolume::new(16).unwrap();
     for x in 0..16 {
         dense.set(UVec3::new(x, 8, 8), MaterialId(1));
     }
@@ -2392,7 +2440,7 @@ mod tests {
     use crate::dense::DenseVolume;
 
     fn tree_from(points: &[(UVec3, u8)]) -> Contree {
-        let mut dense = DenseVolume::new(16);
+        let mut dense = DenseVolume::new(16).unwrap();
         for (p, m) in points {
             dense.set(*p, MaterialId(*m));
         }
@@ -2463,7 +2511,7 @@ use glam::{Affine3A, UVec3, Vec3};
 
 /// A floor slab with a block standing on it.
 fn scene() -> Contree {
-    let mut dense = DenseVolume::new(64);
+    let mut dense = DenseVolume::new(64).unwrap();
     for z in 0..64 {
         for x in 0..64 {
             for y in 0..8 {
@@ -2696,7 +2744,7 @@ fn shade(
 }
 
 fn build_scene(stone: MaterialId, brick: MaterialId) -> Contree {
-    let mut dense = DenseVolume::new(64);
+    let mut dense = DenseVolume::new(64).unwrap();
     for z in 0..64 {
         for x in 0..64 {
             for y in 0..8 {
