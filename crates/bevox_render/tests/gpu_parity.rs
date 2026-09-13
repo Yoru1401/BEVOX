@@ -6,6 +6,7 @@ use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
 use bevox_core::gpu::GpuVolume;
 use bevox_core::march::{MarchStats, march};
+use bevox_render::upload::march_flags;
 use bevox_core::material::MaterialId;
 use glam::{Affine3A, Mat4, UVec3, Vec3, Vec4};
 
@@ -443,6 +444,9 @@ fn a_distant_camera_on_a_large_volume_still_reaches_the_geometry() {
 /// before anything depends on it.
 #[test]
 fn setting_flags_does_not_change_output_yet() {
+    // 0b110 only: DDA has landed and owns its own identity test below. The
+    // remaining bits must still be inert, which is what keeps a half-finished
+    // optimisation from silently altering output.
     let Some((device, queue)) = gpu_device() else {
         eprintln!("no GPU adapter available, skipping");
         return;
@@ -463,7 +467,7 @@ fn setting_flags_does_not_change_output_yet() {
         );
         let on = run_march_flagged(
             &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume, width,
-            height, 0b111,
+            height, 0b110,
         );
         assert_eq!(off, on, "{entry}: flags changed output before any optimisation exists");
     }
@@ -611,5 +615,67 @@ fn the_harness_can_run_a_trivial_shader() {
     // Every pixel is opaque red.
     for px in pixels.chunks_exact(4) {
         assert_eq!(px, [255, 0, 0, 255], "unexpected pixel");
+    }
+}
+
+/// The whole point of DDA: fewer child tests, byte-for-byte the same image.
+///
+/// Stepping emits cells in ray order; the scan emitted them in nearest-entry
+/// order. Those agree only while cells are equal sized and disjoint — true
+/// within one node, which is why this can be an identity and not a tolerance.
+/// The cameras are chosen to attack that: axis-aligned directions put the ray
+/// exactly on cell boundaries, where `floor` can pick the neighbour the scan
+/// would not have, and a zero direction component makes an exit distance
+/// undefined unless it is special-cased.
+#[test]
+fn dda_leaves_output_bit_identical() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let tree = parity_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (96u32, 96u32);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    let cameras = [
+        // Oblique: the ordinary case, every direction component non-zero.
+        (Vec3::new(-30.0, 40.0, -30.0), Vec3::new(32.0, 12.0, 32.0)),
+        // Straight down one axis: two direction components are exactly zero.
+        (Vec3::new(32.0, 18.0, -40.0), Vec3::new(32.0, 18.0, 32.0)),
+        // Straight down, through the sphere the scene carves out.
+        (Vec3::new(32.0, 90.0, 32.0001), Vec3::new(32.0, 0.0, 32.0)),
+        // Negative direction on every axis, so the DDA steps backwards.
+        (Vec3::new(96.0, 60.0, 96.0), Vec3::new(32.0, 12.0, 32.0)),
+        // Inside the volume, grazing the floor: rays start mid-node, so most
+        // frames are entered somewhere other than at a corner.
+        (Vec3::new(10.0, 7.0, 10.0), Vec3::new(60.0, 7.5, 60.0)),
+    ];
+
+    for (i, (eye, target)) in cameras.iter().enumerate() {
+        let view = Mat4::look_at_rh(*eye, *target, Vec3::Y);
+        let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+        let world_from_clip = (projection * view).inverse();
+
+        for entry in ["march_identity", "march_normal", "march_shadow", "march"] {
+            let off = run_march_flagged(
+                &device, &queue, &shader, entry, world_from_clip, *eye, &tree, &gpu_volume, width,
+                height, march_flags::NONE,
+            );
+            let on = run_march_flagged(
+                &device, &queue, &shader, entry, world_from_clip, *eye, &tree, &gpu_volume, width,
+                height, march_flags::DDA,
+            );
+            let differing = off
+                .chunks(4)
+                .zip(on.chunks(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                differing, 0,
+                "camera {i}, {entry}: DDA changed {differing} of {} pixels",
+                width * height
+            );
+        }
     }
 }

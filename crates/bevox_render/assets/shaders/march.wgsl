@@ -93,6 +93,9 @@ fn ray_box(origin: vec3<f32>, inv_dir: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>) 
     return Slab(t_enter <= t_exit && t_exit >= 0.0, t_enter, t_exit);
 }
 
+/// No DDA cell visited yet in this frame.
+const NO_CURSOR: u32 = 0xFFFFFFFFu;
+
 struct Frame {
     node: vec4<u32>,
     origin: vec3<u32>,
@@ -100,9 +103,54 @@ struct Frame {
     t_enter: f32,
     t_exit: f32,
     // Children of this frame already descended into, as two 32-bit halves.
+    // Used by the scan path only; DDA visits each crossed cell once, in order,
+    // so it has nothing to remember.
     visited_lo: u32,
     visited_hi: u32,
+    // DDA resume point: the cell last descended into and its entry distance.
+    // Storing the cursor rather than the whole DDA state keeps the frame small,
+    // at the cost of recomputing three boundary distances on re-entry. A frame
+    // twelve words wider would cost occupancy, which is the thing being bought.
+    cursor: u32,
+    cursor_t: f32,
 };
+
+/// Distance along the ray to each of this cell's exit planes.
+fn cell_exits(
+    origin: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>,
+    node_lo: vec3<f32>, cell_size: f32, cell: vec3<i32>, stepv: vec3<i32>,
+) -> vec3<f32> {
+    // The exit plane is the far face in the direction of travel.
+    let next = vec3<f32>(cell + max(stepv, vec3<i32>(0)));
+    let boundary = node_lo + next * cell_size;
+    let t = (boundary - origin) * inv_dir;
+    // A zero direction component never crosses that axis. Left alone it would
+    // produce a NaN or a negative infinity and win the minimum, stalling the walk.
+    return vec3<f32>(
+        select(t.x, 1e30, dir.x == 0.0),
+        select(t.y, 1e30, dir.y == 0.0),
+        select(t.z, 1e30, dir.z == 0.0),
+    );
+}
+
+/// Index of the smallest component: the axis the ray leaves through first.
+fn min_axis(t: vec3<f32>) -> u32 {
+    if t.x <= t.y && t.x <= t.z { return 0u; }
+    if t.y <= t.z { return 1u; }
+    return 2u;
+}
+
+fn index_of_cell(c: vec3<i32>) -> u32 {
+    return u32(c.x) + u32(c.y) * BRICK_EDGE + u32(c.z) * BRICK_EDGE * BRICK_EDGE;
+}
+
+fn cell_of_index(i: u32) -> vec3<i32> {
+    return vec3<i32>(
+        i32(i % BRICK_EDGE),
+        i32((i / BRICK_EDGE) % BRICK_EDGE),
+        i32(i / (BRICK_EDGE * BRICK_EDGE)),
+    );
+}
 
 struct Hit {
     hit: bool,
@@ -156,6 +204,8 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
         root_slab.t_exit,
         0u,
         0u,
+        NO_CURSOR,
+        0.0,
     );
 
     var steps: u32 = 0u;
@@ -200,6 +250,7 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
             step_size = level_extent(frame.level - 1u);
         }
 
+        if !flag_enabled(FLAG_DDA) {
         for (var i: u32 = 0u; i < CHILDREN; i = i + 1u) {
             if !has_child(frame.node, i) { continue; }
 
@@ -232,13 +283,84 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
             }
         }
 
+        } else {
+            // DDA: step the ray through this node's children in order instead of
+            // rescanning all 64 for the nearest unvisited one. Cells here are
+            // equal sized and disjoint, so ray order and nearest-entry order are
+            // the same, which is why output can stay bit-identical.
+            let cell_size = f32(step_size);
+            let node_lo = vec3<f32>(frame.origin);
+            let stepv = vec3<i32>(
+                select(-1, 1, dir.x > 0.0),
+                select(-1, 1, dir.y > 0.0),
+                select(-1, 1, dir.z > 0.0),
+            );
+
+            var cell: vec3<i32>;
+            var t_cur: f32;
+            if frame.cursor == NO_CURSOR {
+                t_cur = frame.t_enter;
+                let p = origin + dir * t_cur;
+                cell = clamp(
+                    vec3<i32>(floor((p - node_lo) / cell_size)),
+                    vec3<i32>(0),
+                    vec3<i32>(3),
+                );
+            } else {
+                // Resuming: step past the cell already descended into.
+                cell = cell_of_index(frame.cursor);
+                let tm = cell_exits(origin, dir, inv_dir, node_lo, cell_size, cell, stepv);
+                let axis = min_axis(tm);
+                if axis == 0u { t_cur = tm.x; cell.x = cell.x + stepv.x; }
+                else if axis == 1u { t_cur = tm.y; cell.y = cell.y + stepv.y; }
+                else { t_cur = tm.z; cell.z = cell.z + stepv.z; }
+            }
+
+            // A ray crosses at most a handful of cells in a 4x4x4 grid; the
+            // bound is generous and exists so a degenerate direction cannot spin.
+            var guard: u32 = 0u;
+            loop {
+                guard = guard + 1u;
+                if guard > CHILDREN { break; }
+                if cell.x < 0 || cell.y < 0 || cell.z < 0
+                    || cell.x > 3 || cell.y > 3 || cell.z > 3 { break; }
+                if t_cur > frame.t_exit || t_cur > max_dist { break; }
+
+                let i = index_of_cell(cell);
+                let tm = cell_exits(origin, dir, inv_dir, node_lo, cell_size, cell, stepv);
+                let axis = min_axis(tm);
+                var t_out: f32;
+                if axis == 0u { t_out = tm.x; }
+                else if axis == 1u { t_out = tm.y; }
+                else { t_out = tm.z; }
+
+                if has_child(frame.node, i) {
+                    best_i = i;
+                    best_t = max(t_cur, frame.t_enter);
+                    best_exit = min(t_out, frame.t_exit);
+                    best_origin = frame.origin + vec3<u32>(cell) * step_size;
+                    stack[sp].cursor = i;
+                    stack[sp].cursor_t = t_cur;
+                    break;
+                }
+
+                t_cur = t_out;
+                if axis == 0u { cell.x = cell.x + stepv.x; }
+                else if axis == 1u { cell.y = cell.y + stepv.y; }
+                else { cell.z = cell.z + stepv.z; }
+            }
+        }
+
         if best_i == CHILDREN || best_t > max_dist {
             if sp == 0u { running = false; } else { sp = sp - 1u; }
             continue;
         }
 
-        // Mark it visited in the stored frame, not the local copy.
-        if best_i < 32u {
+        // Mark it visited in the stored frame, not the local copy. DDA needs
+        // no such record: it visits each crossed cell once, in order.
+        if flag_enabled(FLAG_DDA) {
+            // nothing to record
+        } else if best_i < 32u {
             stack[sp].visited_lo = stack[sp].visited_lo | (1u << best_i);
         } else {
             stack[sp].visited_hi = stack[sp].visited_hi | (1u << (best_i - 32u));
@@ -267,6 +389,8 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
             min(best_exit, frame.t_exit),
             0u,
             0u,
+            NO_CURSOR,
+            0.0,
         );
     }
 

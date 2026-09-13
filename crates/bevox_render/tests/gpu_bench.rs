@@ -152,3 +152,51 @@ fn record_the_baseline() {
 
     assert!(ms > 0.0, "the timer returned nothing");
 }
+
+/// DDA against the scan, interleaved in one process on one device.
+///
+/// A/B/A, not A-then-B: the two baseline readings bracket the variant, so
+/// thermal drift and clock ramping are visible rather than being attributed to
+/// the change. A win smaller than the spread between them is not a win.
+#[test]
+fn dda_is_measured_against_the_baseline() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+
+    let (tree, extent) = bench_scene();
+    let volume = GpuVolume::from_contree(&tree);
+    let (eye, world_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    let make = |flags: u32| {
+        Prepared::new(
+            &device,
+            &shader,
+            "march",
+            &tree,
+            &volume,
+            world_from_clip,
+            eye,
+            1280,
+            720,
+            flags,
+        )
+    };
+    let baseline = make(0);
+    let variant = make(1);
+
+    let (a1, b, a2) = compare_aba(&device, &queue, &baseline, &variant);
+    let drift = (a1 - a2).abs();
+    let gain = (a1 + a2) * 0.5 - b;
+    println!(
+        "scan: {a1:.2} / {a2:.2} ms (drift {drift:.2})\n\
+         dda:  {b:.2} ms\n\
+         gain: {gain:.2} ms ({:.1}%), {}",
+        gain / ((a1 + a2) * 0.5) * 100.0,
+        if gain > drift { "larger than drift" } else { "WITHIN DRIFT, not a result" }
+    );
+
+    assert!(b > 0.0, "the timer returned nothing");
+}
