@@ -474,6 +474,7 @@ name = "bevox_core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "dot_vox",
  "glam",
  "image",
 ]
@@ -2511,6 +2512,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
+]
+
+[[package]]
+name = "dot_vox"
+version = "5.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f160bf661e495a80ec98ac88a6535f5c80c02d2271c7013af70fe9ec670ccbff"
+dependencies = [
+ "ahash",
+ "lazy_static",
+ "log",
+ "nom",
 ]
 
 [[package]]

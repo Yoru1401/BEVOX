@@ -10,3 +10,4 @@ pub mod material;
 pub mod node;
 pub mod normal;
 pub mod testing;
+pub mod vox;
