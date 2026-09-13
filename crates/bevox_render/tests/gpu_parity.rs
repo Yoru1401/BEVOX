@@ -257,6 +257,80 @@ fn the_gpu_reports_the_same_hit_voxel_as_the_cpu() {
     assert_eq!(mismatches, 0, "{mismatches} voxel coordinates disagreed; first {first}");
 }
 
+/// Normals are summed from neighbour occupancy, so they exercise point sampling
+/// at six coordinates around every hit — a completely different path through the
+/// tree than the ray march that found the voxel.
+#[test]
+fn the_gpu_normals_match_the_cpu() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+
+    let tree = parity_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (64u32, 64u32);
+    let eye = Vec3::new(-30.0, 40.0, -30.0);
+    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, width as f32 / height as f32, 0.1, 500.0);
+    let world_from_clip = (projection * view).inverse();
+
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader file missing");
+    let pixels = run_march(
+        &device,
+        &queue,
+        &shader,
+        "march_normal",
+        world_from_clip,
+        eye,
+        &tree,
+        &gpu_volume,
+        width,
+        height,
+    );
+
+    let mut stats = MarchStats::default();
+    let mut mismatches = 0usize;
+    let mut worst = 0.0f32;
+    let mut first = String::new();
+    let mut compared = 0usize;
+
+    for y in 0..height {
+        for x in 0..width {
+            let dir = ray_direction(world_from_clip, eye, x, y, width, height);
+            let Some(hit) = march(&tree, Affine3A::IDENTITY, eye, dir, 1000.0, false, &mut stats)
+            else {
+                continue;
+            };
+            compared += 1;
+
+            let cpu_n = bevox_core::normal::implicit_normal(&tree, hit.voxel, hit.face_normal);
+            let i = ((y * width + x) * 4) as usize;
+            let gpu_n = Vec3::new(
+                pixels[i] as f32 / 255.0 * 2.0 - 1.0,
+                pixels[i + 1] as f32 / 255.0 * 2.0 - 1.0,
+                pixels[i + 2] as f32 / 255.0 * 2.0 - 1.0,
+            );
+
+            // One byte per component quantises to steps of 2/255, so allow a
+            // little over one step before calling it a disagreement.
+            let delta = (gpu_n - cpu_n).length();
+            if delta > worst {
+                worst = delta;
+            }
+            if delta > 0.02 {
+                if mismatches == 0 {
+                    first = format!("at ({x},{y}) cpu={cpu_n:?} gpu={gpu_n:?} delta={delta}");
+                }
+                mismatches += 1;
+            }
+        }
+    }
+
+    assert!(compared > 500, "only {compared} pixels hit geometry; the test is vacuous");
+    assert_eq!(mismatches, 0, "{mismatches} normals disagreed (worst {worst}); first {first}");
+}
+
 #[test]
 fn the_gpu_traversal_agrees_with_the_cpu_reference() {
     let Some((device, queue)) = gpu_device() else {

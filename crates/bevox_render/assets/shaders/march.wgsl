@@ -260,6 +260,68 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
     return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0));
 }
 
+/// Material at a voxel coordinate, or 0 outside the volume.
+///
+/// This is the tree descent from Contree::get: at each level pick the child
+/// containing the coordinate, stopping early at an unsubdivided node. An empty
+/// node's material is 0 and a uniform solid's is its own, so the single early
+/// return covers both without conflating them.
+fn material_at(p: vec3<i32>) -> u32 {
+    let extent = i32(view.volume_params.y);
+    if p.x < 0 || p.y < 0 || p.z < 0 || p.x >= extent || p.y >= extent || p.z >= extent {
+        return 0u;
+    }
+
+    var node = nodes[0];
+    var level = view.volume_params.x - 1u;
+    var local = vec3<u32>(p);
+
+    // Bounded by tree depth; a volume is never deeper than MAX_DEPTH.
+    for (var guard: u32 = 0u; guard < MAX_DEPTH; guard = guard + 1u) {
+        if !is_subdivided(node) {
+            return node_material(node);
+        }
+
+        if level == 0u {
+            let i = local.x + local.y * BRICK_EDGE + local.z * BRICK_EDGE * BRICK_EDGE;
+            if !has_child(node, i) {
+                return 0u;
+            }
+            return voxel_byte(child_slot(node, i));
+        }
+
+        let step_size = level_extent(level - 1u);
+        let cell = local / step_size;
+        let i = cell.x + cell.y * BRICK_EDGE + cell.z * BRICK_EDGE * BRICK_EDGE;
+        if !has_child(node, i) {
+            return 0u;
+        }
+        node = nodes[child_slot(node, i) + 1u];
+        local = local - cell * step_size;
+        level = level - 1u;
+    }
+    return 0u;
+}
+
+/// Sums the directions in which a voxel is exposed, falling back to the entry
+/// face when that carries no information. Mirrors bevox_core::normal.
+fn implicit_normal(voxel: vec3<u32>, face_normal: vec3<f32>) -> vec3<f32> {
+    let base = vec3<i32>(voxel);
+    var sum = vec3<f32>(0.0);
+
+    if material_at(base + vec3<i32>(1, 0, 0)) == 0u { sum += vec3<f32>(1.0, 0.0, 0.0); }
+    if material_at(base + vec3<i32>(-1, 0, 0)) == 0u { sum += vec3<f32>(-1.0, 0.0, 0.0); }
+    if material_at(base + vec3<i32>(0, 1, 0)) == 0u { sum += vec3<f32>(0.0, 1.0, 0.0); }
+    if material_at(base + vec3<i32>(0, -1, 0)) == 0u { sum += vec3<f32>(0.0, -1.0, 0.0); }
+    if material_at(base + vec3<i32>(0, 0, 1)) == 0u { sum += vec3<f32>(0.0, 0.0, 1.0); }
+    if material_at(base + vec3<i32>(0, 0, -1)) == 0u { sum += vec3<f32>(0.0, 0.0, -1.0); }
+
+    if dot(sum, sum) < 1e-6 {
+        return face_normal;
+    }
+    return normalize(sum);
+}
+
 /// Ray direction for a pixel. Shared so both entry points march identical rays.
 fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
     let ndc = vec2<f32>(
@@ -268,6 +330,22 @@ fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
     );
     let far = view.world_from_clip * vec4<f32>(ndc, 1.0, 1.0);
     return normalize(far.xyz / far.w - view.camera_position.xyz);
+}
+
+/// Normal encoded into unsigned bytes, hit flag in alpha. Parity test only.
+@compute @workgroup_size(8, 8, 1)
+fn march_normal(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(output);
+    if id.x >= size.x || id.y >= size.y { return; }
+
+    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), 1000.0);
+
+    var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if hit.hit {
+        let n = implicit_normal(hit.voxel, hit.face_normal);
+        colour = vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);
+    }
+    textureStore(output, vec2<i32>(id.xy), colour);
 }
 
 /// Hit voxel coordinate in RGB, hit flag in alpha. Read by the parity test only.
