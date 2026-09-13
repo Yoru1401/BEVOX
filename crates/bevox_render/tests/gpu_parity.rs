@@ -42,6 +42,31 @@ fn parity_scene() -> Contree {
     tree
 }
 
+/// Colours for `parity_scene`'s two materials. A zeroed palette would make the
+/// display entry point render every surface black, which is indistinguishable
+/// from a broken traversal.
+fn parity_materials() -> bevox_core::material::MaterialTable {
+    use bevox_core::material::{Material, MaterialTable};
+    let mut table = MaterialTable::new();
+    table.push(Material { color: [140, 140, 150, 255] }).unwrap(); // 1: stone
+    table.push(Material { color: [180, 90, 70, 255] }).unwrap(); // 2: brick
+    table
+}
+
+/// One read-only storage binding of the given minimum element size.
+fn storage_entry(binding: u32, min_size: u64) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: wgpu::BufferSize::new(min_size),
+        },
+        count: None,
+    }
+}
+
 /// Same ray construction the shader performs, so both sides march the same rays.
 fn ray_direction(world_from_clip: Mat4, eye: Vec3, x: u32, y: u32, w: u32, h: u32) -> Vec3 {
     let ndc_x = (x as f32 + 0.5) / w as f32 * 2.0 - 1.0;
@@ -103,6 +128,12 @@ fn run_march(
         contents: &voxel_bytes,
         usage: wgpu::BufferUsages::STORAGE,
     });
+    let palette = parity_materials().to_gpu();
+    let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("palette"),
+        contents: bytemuck::cast_slice(&palette),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
 
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("march"),
@@ -111,9 +142,48 @@ fn run_march(
     let texture = storage_target(device, width, height);
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+    // An explicit layout, not an auto-derived one. With `layout: None` naga
+    // derives the layout from the bindings an entry point actually uses, so an
+    // entry point that ignores the palette gets four bindings while one that
+    // reads it gets five. Declaring it here mirrors init_march_pipeline, so the
+    // harness tests the layout the app really ships.
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("march_layout"),
+        entries: &[
+            storage_entry(1, 16),
+            storage_entry(2, 4),
+            storage_entry(3, 16),
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(size_of::<TestUniform>() as u64),
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("march_pipeline_layout"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("march_pipeline"),
-        layout: None,
+        layout: Some(&pipeline_layout),
         module: &module,
         entry_point: Some(entry_point),
         compilation_options: Default::default(),
@@ -121,13 +191,14 @@ fn run_march(
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
-        layout: &pipeline.get_bind_group_layout(0),
+        layout: &layout,
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: node_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: palette_buffer.as_entire_binding() },
             wgpu::BindGroupEntry {
-                binding: 3,
+                binding: 4,
                 resource: wgpu::BindingResource::TextureView(&view),
             },
         ],

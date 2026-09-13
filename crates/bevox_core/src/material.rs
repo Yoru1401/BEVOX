@@ -52,6 +52,21 @@ impl MaterialTable {
     pub fn is_empty(&self) -> bool {
         self.entries.len() <= 1
     }
+
+    /// The palette as the shader indexes it: 256 linear RGBA entries, whatever
+    /// the table's current length, because a voxel byte can name any slot.
+    pub fn to_gpu(&self) -> Vec<[f32; 4]> {
+        let mut out = vec![[0.0f32; 4]; 256];
+        for (i, m) in self.entries.iter().enumerate().skip(1) {
+            out[i] = [
+                m.color[0] as f32 / 255.0,
+                m.color[1] as f32 / 255.0,
+                m.color[2] as f32 / 255.0,
+                m.color[3] as f32 / 255.0,
+            ];
+        }
+        out
+    }
 }
 
 impl Default for MaterialTable {
@@ -63,6 +78,34 @@ impl Default for MaterialTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gpu_palette_is_always_two_hundred_and_fifty_six_entries() {
+        let mut table = MaterialTable::new();
+        table.push(Material { color: [255, 128, 0, 255] }).unwrap();
+        let gpu = table.to_gpu();
+        assert_eq!(gpu.len(), 256, "the shader indexes this by a byte");
+    }
+
+    #[test]
+    fn palette_entries_are_normalised_and_slot_zero_is_transparent() {
+        let mut table = MaterialTable::new();
+        let id = table.push(Material { color: [255, 128, 0, 255] }).unwrap();
+        let gpu = table.to_gpu();
+
+        assert_eq!(gpu[0], [0.0, 0.0, 0.0, 0.0], "slot 0 is empty space");
+        let e = gpu[id.0 as usize];
+        assert!((e[0] - 1.0).abs() < 1e-6, "red was {}", e[0]);
+        assert!((e[1] - 128.0 / 255.0).abs() < 1e-6, "green was {}", e[1]);
+        assert!((e[3] - 1.0).abs() < 1e-6, "alpha was {}", e[3]);
+    }
+
+    #[test]
+    fn unset_palette_slots_are_zero() {
+        let table = MaterialTable::new();
+        let gpu = table.to_gpu();
+        assert!(gpu.iter().all(|e| *e == [0.0, 0.0, 0.0, 0.0]));
+    }
 
     #[test]
     fn slot_zero_is_empty_and_not_pushable() {

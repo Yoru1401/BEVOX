@@ -6,12 +6,15 @@ use bevy::render::extract_resource::ExtractResource;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevox_core::contree::Contree;
 use bevox_core::gpu::{GpuNode, GpuVolume};
+use bevox_core::material::MaterialTable;
 use bytemuck::{Pod, Zeroable};
 
 /// The scene the renderer draws. Replacing it re-uploads on the next frame.
 #[derive(Resource)]
 pub struct VoxelScene {
     pub tree: Contree,
+    /// Colours the voxel material indices name.
+    pub materials: MaterialTable,
     /// Bumped whenever `tree` changes, so the render world knows to re-upload.
     pub generation: u32,
 }
@@ -51,6 +54,7 @@ pub struct MarchTarget {
 pub struct GpuSceneData {
     pub nodes: Vec<GpuNode>,
     pub voxels: Vec<u32>,
+    pub palette: Vec<[f32; 4]>,
     pub depth: u32,
     pub extent: u32,
     pub generation: u32,
@@ -65,6 +69,7 @@ impl Default for GpuSceneData {
         Self {
             nodes: vec![GpuNode::default()],
             voxels: Vec::new(),
+            palette: MaterialTable::new().to_gpu(),
             // Depth must be at least 1: the shader starts at level `depth - 1`.
             depth: 1,
             extent: 4,
@@ -93,6 +98,7 @@ pub fn build_gpu_scene(mut commands: Commands, scene: Option<Res<VoxelScene>>) {
     commands.insert_resource(GpuSceneData {
         nodes: volume.buffer_nodes(),
         voxels: volume.voxels,
+        palette: scene.materials.to_gpu(),
         depth: scene.tree.depth(),
         extent: scene.tree.extent(),
         generation: scene.generation,

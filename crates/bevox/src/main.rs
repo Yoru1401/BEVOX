@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
-use bevox_core::material::MaterialId;
+use bevox_core::material::{Material, MaterialId, MaterialTable};
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::FlyCamera;
 use bevox_render::upload::VoxelScene;
@@ -48,12 +48,14 @@ fn setup(mut commands: Commands) {
         FlyCamera::looking_at(Vec3::new(-30.0, 40.0, -30.0), Vec3::new(32.0, 12.0, 32.0)),
     ));
 
-    commands.insert_resource(VoxelScene { tree: demo_scene(), generation: 1 });
+    let (tree, materials) = demo_scene();
+    commands.insert_resource(VoxelScene { tree, materials, generation: 1 });
 }
 
 /// The same floor, column and carved sphere the parity test uses, so what is on
-/// screen is what the test proved correct.
-fn demo_scene() -> Contree {
+/// screen is what the test proved correct, together with the palette it is
+/// drawn from.
+fn demo_scene() -> (Contree, MaterialTable) {
     let mut dense = DenseVolume::new(64).unwrap();
     for z in 0..64 {
         for x in 0..64 {
@@ -71,5 +73,9 @@ fn demo_scene() -> Contree {
     }
     let mut tree = dense.into_contree();
     tree.apply_sphere(Vec3::new(32.0, 18.0, 32.0), 5.0, MaterialId::EMPTY);
-    tree
+
+    let mut materials = MaterialTable::new();
+    materials.push(Material { color: [140, 140, 150, 255] }).unwrap(); // 1: stone
+    materials.push(Material { color: [180, 90, 70, 255] }).unwrap(); // 2: brick
+    (tree, materials)
 }

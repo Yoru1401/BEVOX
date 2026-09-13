@@ -15,7 +15,8 @@ struct MarchUniform {
 @group(0) @binding(0) var<uniform> view: MarchUniform;
 @group(0) @binding(1) var<storage, read> nodes: array<vec4<u32>>;
 @group(0) @binding(2) var<storage, read> voxels: array<u32>;
-@group(0) @binding(3) var output: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(3) var<storage, read> palette: array<vec4<f32>>;
+@group(0) @binding(4) var output: texture_storage_2d<rgba8unorm, write>;
 
 const BRICK_EDGE: u32 = 4u;
 const CHILDREN: u32 = 64u;
@@ -418,15 +419,8 @@ fn march_identity(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(output, vec2<i32>(id.xy), colour);
 }
 
-/// Palette lookup. A real material table arrives with milestone 5; two colours
-/// are enough to prove the scene reads correctly.
-fn material_colour(material: u32) -> vec3<f32> {
-    if material == 1u { return vec3<f32>(0.55, 0.55, 0.58); }
-    if material == 2u { return vec3<f32>(0.70, 0.35, 0.27); }
-    return vec3<f32>(1.0, 0.0, 1.0);  // unmapped materials are obvious
-}
-
-/// What the window shows.
+/// What the window shows: palette colour, diffuse from the implicit normal, and
+/// a shadow ray toward the sun.
 @compute @workgroup_size(8, 8, 1)
 fn march(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
@@ -436,10 +430,17 @@ fn march(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var colour = vec3<f32>(0.35, 0.47, 0.70);  // sky
     if hit.hit {
-        // Distance falloff only. This is deliberately not lighting: normals and
-        // shadows are milestone 5, and faking them here would hide their absence.
-        let fade = clamp(1.0 - hit.t / 160.0, 0.25, 1.0);
-        colour = material_colour(hit.material) * fade;
+        let n = implicit_normal(hit.voxel, hit.face_normal);
+        let sun = view.sun_direction.xyz;
+
+        let origin = vec3<f32>(hit.voxel) + vec3<f32>(0.5) + n * 0.75;
+        var diffuse = max(dot(n, sun), 0.0) * 0.75;
+        if traverse_any(origin, sun, 500.0) {
+            diffuse = 0.0;
+        }
+
+        let base = palette[hit.material].rgb;
+        colour = base * (0.25 + diffuse);
     }
     textureStore(output, vec2<i32>(id.xy), vec4<f32>(colour, 1.0));
 }
