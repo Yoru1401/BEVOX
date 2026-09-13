@@ -6,6 +6,7 @@ use crate::dense::DenseVolume;
 use crate::material::MaterialId;
 use crate::node::{BRICK_EDGE, CHILDREN, Node, child_index};
 use glam::UVec3;
+use std::collections::{HashMap, HashSet};
 
 pub struct Contree {
     pub(crate) arena: NodeArena,
@@ -123,6 +124,133 @@ impl Contree {
 
         let count = mask.count_ones();
         let base = self.arena.alloc_voxels(count);
+        let mut slot = base;
+        for m in materials.iter() {
+            if !m.is_empty() {
+                self.arena.set_voxel(slot, m.0);
+                slot += 1;
+            }
+        }
+        Node::subdivided(mask, base)
+    }
+
+    /// Builds a tree from a sparse voxel list, without a dense intermediate.
+    ///
+    /// A scene spanning 1024 voxels per axis would cost a gigabyte of RAM as a
+    /// `DenseVolume` and a few megabytes here, because nothing walks empty
+    /// space: cost tracks the number of filled voxels rather than the volume.
+    ///
+    /// Where a coordinate repeats, the later entry wins.
+    pub fn from_voxels(extent: u32, voxels: &[(UVec3, MaterialId)]) -> Self {
+        debug_assert!(extent.is_power_of_two() && extent.trailing_zeros() % 2 == 0);
+        let depth = extent.trailing_zeros() / 2;
+        debug_assert!(depth >= 1);
+        let mut tree = Self::empty(depth);
+
+        // Bucket into 4x4x4 leaf bricks.
+        let mut bricks: HashMap<UVec3, [MaterialId; CHILDREN as usize]> = HashMap::new();
+        for (p, m) in voxels {
+            if m.is_empty() || p.x >= extent || p.y >= extent || p.z >= extent {
+                continue;
+            }
+            let brick = *p / BRICK_EDGE;
+            let local = *p % BRICK_EDGE;
+            let slot = child_index(local.x, local.y, local.z) as usize;
+            bricks.entry(brick).or_insert([MaterialId::EMPTY; CHILDREN as usize])[slot] = *m;
+        }
+        if bricks.is_empty() {
+            return tree;
+        }
+
+        // Which node coordinates hold anything, per level. Level 0 is brick
+        // coordinates; each level up divides by the brick edge. This is what
+        // lets the descent skip empty subtrees instead of visiting the volume.
+        let mut occupied: Vec<HashSet<UVec3>> = Vec::with_capacity(depth as usize);
+        let mut current: HashSet<UVec3> = bricks.keys().copied().collect();
+        for _ in 0..depth {
+            occupied.push(current.clone());
+            current = current.iter().map(|c| *c / BRICK_EDGE).collect();
+        }
+
+        let root = tree.build_sparse(depth - 1, UVec3::ZERO, &bricks, &occupied);
+        tree.set_root(root);
+        tree
+    }
+
+    /// Post-order descent over occupied subtrees only.
+    ///
+    /// The traversal order matters as much as the result: arena slots are handed
+    /// out as nodes are finished, so visiting z-outermost and finishing children
+    /// before parents is what makes this produce the same arena `from_dense`
+    /// does, byte for byte.
+    fn build_sparse(
+        &mut self,
+        level: u32,
+        coord: UVec3,
+        bricks: &HashMap<UVec3, [MaterialId; CHILDREN as usize]>,
+        occupied: &[HashSet<UVec3>],
+    ) -> Node {
+        if !occupied[level as usize].contains(&coord) {
+            return Node::EMPTY;
+        }
+        if level == 0 {
+            return self.build_leaf_from_materials(&bricks[&coord]);
+        }
+
+        let mut children = [Node::EMPTY; CHILDREN as usize];
+        let mut mask = 0u64;
+        for z in 0..BRICK_EDGE {
+            for y in 0..BRICK_EDGE {
+                for x in 0..BRICK_EDGE {
+                    let child_coord = coord * BRICK_EDGE + UVec3::new(x, y, z);
+                    let child = self.build_sparse(level - 1, child_coord, bricks, occupied);
+                    let i = child_index(x, y, z);
+                    children[i as usize] = child;
+                    if !child.is_empty() {
+                        mask |= 1u64 << i;
+                    }
+                }
+            }
+        }
+
+        if mask == 0 {
+            return Node::EMPTY;
+        }
+        if let Some(node) = collapse_uniform(&children) {
+            return node;
+        }
+
+        let base = self.arena.alloc_nodes(mask.count_ones());
+        let mut slot = base;
+        for child in children.iter() {
+            if !child.is_empty() {
+                self.arena.set_node(slot, *child);
+                slot += 1;
+            }
+        }
+        Node::subdivided(mask, base)
+    }
+
+    /// Leaf brick from 64 materials. Shares its collapse rules with `build_leaf`
+    /// so the two builders cannot disagree about what counts as uniform.
+    fn build_leaf_from_materials(&mut self, materials: &[MaterialId; CHILDREN as usize]) -> Node {
+        let mut mask = 0u64;
+        for (i, m) in materials.iter().enumerate() {
+            if !m.is_empty() {
+                mask |= 1u64 << i;
+            }
+        }
+        if mask == 0 {
+            return Node::EMPTY;
+        }
+        if mask == u64::MAX {
+            let first = materials[0];
+            if materials.iter().all(|m| *m == first) {
+                return Node::uniform(first);
+            }
+        }
+
+        let base = self.arena.alloc_voxels(mask.count_ones());
         let mut slot = base;
         for m in materials.iter() {
             if !m.is_empty() {
