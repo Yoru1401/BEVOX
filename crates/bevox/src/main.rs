@@ -42,8 +42,10 @@ fn setup(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
         Camera { order: -1, is_active: false, ..default() },
-        Transform::from_xyz(-30.0, 40.0, -30.0).looking_at(Vec3::new(32.0, 12.0, 32.0), Vec3::Y),
-        FlyCamera::default(),
+        Transform::from_xyz(-30.0, 40.0, -30.0),
+        // Yaw and pitch must agree with the intended direction: the fly camera
+        // rewrites the transform's rotation from them every frame.
+        FlyCamera::looking_at(Vec3::new(-30.0, 40.0, -30.0), Vec3::new(32.0, 12.0, 32.0)),
     ));
 
     commands.insert_resource(VoxelScene { tree: demo_scene(), generation: 1 });

@@ -21,6 +21,33 @@ impl Default for FlyCamera {
     }
 }
 
+impl FlyCamera {
+    /// Builds a camera already facing `target` from `from`.
+    ///
+    /// This exists because `fly_camera_system` rewrites the transform's rotation
+    /// from yaw and pitch every frame. Spawning with `Transform::looking_at` and
+    /// a default `FlyCamera` therefore looks correct for exactly one frame and
+    /// is then overwritten with identity — the camera silently turns away from
+    /// whatever it was aimed at.
+    pub fn looking_at(from: Vec3, target: Vec3) -> Self {
+        let (yaw, pitch) = yaw_pitch_towards(target - from);
+        Self { yaw, pitch, ..Default::default() }
+    }
+}
+
+/// Yaw and pitch whose resulting forward vector matches `direction`.
+///
+/// Inverts `rotation = Y(yaw) * X(pitch)` applied to -Z.
+pub fn yaw_pitch_towards(direction: Vec3) -> (f32, f32) {
+    let d = direction.normalize_or_zero();
+    if d == Vec3::ZERO {
+        return (0.0, 0.0);
+    }
+    let pitch = d.y.clamp(-1.0, 1.0).asin();
+    let yaw = (-d.x).atan2(-d.z);
+    (yaw, pitch)
+}
+
 /// Applies mouse motion to a yaw/pitch pair. Pitch is clamped; yaw is free.
 pub fn apply_look(yaw: f32, pitch: f32, delta: Vec2, sensitivity: f32) -> (f32, f32) {
     let new_yaw = yaw - delta.x * sensitivity;
@@ -123,5 +150,36 @@ mod tests {
     #[test]
     fn no_input_produces_no_movement() {
         assert_eq!(movement_vector(1.2, 0.0, 0.0, 0.0), Vec3::ZERO);
+    }
+
+    /// The rotation the system builds each frame must actually face the target,
+    /// or the camera turns away from whatever it was spawned looking at.
+    #[test]
+    fn looking_at_produces_a_rotation_that_faces_the_target() {
+        let from = Vec3::new(-30.0, 40.0, -30.0);
+        let target = Vec3::new(32.0, 12.0, 32.0);
+        let cam = FlyCamera::looking_at(from, target);
+
+        // Exactly what fly_camera_system assigns to Transform::rotation.
+        let rotation = Quat::from_rotation_y(cam.yaw) * Quat::from_rotation_x(cam.pitch);
+        let forward = rotation * Vec3::NEG_Z;
+        let wanted = (target - from).normalize();
+
+        assert!(
+            (forward - wanted).length() < 1e-4,
+            "forward {forward:?} should match {wanted:?}"
+        );
+    }
+
+    #[test]
+    fn looking_straight_down_negative_z_is_the_default_orientation() {
+        let (yaw, pitch) = yaw_pitch_towards(Vec3::NEG_Z);
+        assert!(yaw.abs() < 1e-6, "yaw was {yaw}");
+        assert!(pitch.abs() < 1e-6, "pitch was {pitch}");
+    }
+
+    #[test]
+    fn a_zero_direction_falls_back_to_the_default_orientation() {
+        assert_eq!(yaw_pitch_towards(Vec3::ZERO), (0.0, 0.0));
     }
 }

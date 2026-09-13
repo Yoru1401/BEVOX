@@ -31,6 +31,12 @@ Recorded here because several differ from what this plan originally assumed.
 - `GlobalTransform::compute_matrix` is now `to_matrix`.
 - `WindowResolution` implements `From<(u32, u32)>`, not `From<(f32, f32)>`.
 - `EventReader` is gone; 0.19 uses `MessageReader`.
+- `fly_camera_system` rewrites `Transform::rotation` from yaw and pitch every
+  frame, so spawning with `Transform::looking_at` plus a default `FlyCamera`
+  aims the camera correctly for one frame and then snaps it to identity. Use
+  `FlyCamera::looking_at(from, target)`, which derives yaw and pitch from the
+  direction. This was the real cause of the "sky but no geometry" screen: the
+  compute was correct and faithfully rendering empty space behind the scene.
 - Storage buffer minimum binding sizes must match the shader's element type.
   `array<vec4<u32>>` needs 16 and `array<u32>` needs 4; declaring both via
   `storage_buffer_read_only::<Vec<u32>>` (minimum 4) is accepted at layout
