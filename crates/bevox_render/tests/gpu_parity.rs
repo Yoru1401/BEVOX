@@ -8,16 +8,10 @@ use bevox_core::gpu::GpuVolume;
 use bevox_core::march::{MarchStats, march};
 use bevox_core::material::MaterialId;
 use glam::{Affine3A, Mat4, UVec3, Vec3, Vec4};
-use wgpu::util::DeviceExt;
 
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct TestUniform {
-    world_from_clip: [[f32; 4]; 4],
-    camera_position: [f32; 4],
-    sun_direction: [f32; 4],
-    volume_params: [u32; 4],
-}
+mod common;
+use common::*;
+
 
 /// Small scene with a floor, a column and a carved sphere: collapsed uniform
 /// regions, subdivided nodes and empty space all in one.
@@ -42,30 +36,7 @@ fn parity_scene() -> Contree {
     tree
 }
 
-/// Colours for `parity_scene`'s two materials. A zeroed palette would make the
-/// display entry point render every surface black, which is indistinguishable
-/// from a broken traversal.
-fn parity_materials() -> bevox_core::material::MaterialTable {
-    use bevox_core::material::{Material, MaterialTable};
-    let mut table = MaterialTable::new();
-    table.push(Material { color: [140, 140, 150, 255] }).unwrap(); // 1: stone
-    table.push(Material { color: [180, 90, 70, 255] }).unwrap(); // 2: brick
-    table
-}
 
-/// One read-only storage binding of the given minimum element size.
-fn storage_entry(binding: u32, min_size: u64) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
-            min_binding_size: wgpu::BufferSize::new(min_size),
-        },
-        count: None,
-    }
-}
 
 /// Same ray construction the shader performs, so both sides march the same rays.
 fn ray_direction(world_from_clip: Mat4, eye: Vec3, x: u32, y: u32, w: u32, h: u32) -> Vec3 {
@@ -75,7 +46,7 @@ fn ray_direction(world_from_clip: Mat4, eye: Vec3, x: u32, y: u32, w: u32, h: u3
     (far.truncate() / far.w - eye).normalize()
 }
 
-/// Binds the full four-resource layout the real shader declares.
+/// Renders one frame with the shared configuration and reads it back.
 #[allow(clippy::too_many_arguments)]
 fn run_march(
     device: &wgpu::Device,
@@ -89,130 +60,10 @@ fn run_march(
     width: u32,
     height: u32,
 ) -> Vec<u8> {
-    let uniform = TestUniform {
-        world_from_clip: world_from_clip.to_cols_array_2d(),
-        camera_position: eye.extend(0.0).to_array(),
-        sun_direction: bevox_render::upload::SUN_DIRECTION
-            .normalize()
-            .extend(0.0)
-            .to_array(),
-        volume_params: [tree.depth(), tree.extent(), 0, 0],
-    };
-
-    // Root first, arena shifted by one: the layout the shader indexes.
-    let nodes = volume.buffer_nodes();
-    let node_bytes: Vec<u8> = if nodes.is_empty() {
-        vec![0u8; 16]
-    } else {
-        bytemuck::cast_slice(&nodes).to_vec()
-    };
-    // A zero-length storage buffer is invalid, so an empty volume gets padding.
-    let voxel_bytes: Vec<u8> = if volume.voxels.is_empty() {
-        vec![0u8; 4]
-    } else {
-        bytemuck::cast_slice(&volume.voxels).to_vec()
-    };
-
-    let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("uniform"),
-        contents: bytemuck::bytes_of(&uniform),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
-    let node_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("nodes"),
-        contents: &node_bytes,
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let voxel_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("voxels"),
-        contents: &voxel_bytes,
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let palette = parity_materials().to_gpu();
-    let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("palette"),
-        contents: bytemuck::cast_slice(&palette),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("march"),
-        source: wgpu::ShaderSource::Wgsl(source.into()),
-    });
-    let texture = storage_target(device, width, height);
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-    // An explicit layout, not an auto-derived one. With `layout: None` naga
-    // derives the layout from the bindings an entry point actually uses, so an
-    // entry point that ignores the palette gets four bindings while one that
-    // reads it gets five. Declaring it here mirrors init_march_pipeline, so the
-    // harness tests the layout the app really ships.
-    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("march_layout"),
-        entries: &[
-            storage_entry(1, 16),
-            storage_entry(2, 4),
-            storage_entry(3, 16),
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(size_of::<TestUniform>() as u64),
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 4,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture {
-                    access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            },
-        ],
-    });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("march_pipeline_layout"),
-        bind_group_layouts: &[Some(&layout)],
-        immediate_size: 0,
-    });
-
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("march_pipeline"),
-        layout: Some(&pipeline_layout),
-        module: &module,
-        entry_point: Some(entry_point),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: node_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: voxel_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: palette_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-        ],
-    });
-
-    let mut encoder = device.create_command_encoder(&Default::default());
-    {
-        let mut pass = encoder.begin_compute_pass(&Default::default());
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
-    }
-
-    read_texture(device, queue, encoder, &texture, width, height)
+    Prepared::new(
+        device, source, entry_point, tree, volume, world_from_clip, eye, width, height, 0,
+    )
+    .read_back(device, queue)
 }
 
 /// The display entry point shares `traverse` with `march_identity`, but writes
@@ -648,88 +499,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-fn gpu_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    pollster::block_on(async {
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .ok()?;
-        adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("bevox_test_device"),
-                ..Default::default()
-            })
-            .await
-            .ok()
-    })
-}
 
-/// Copies a texture back as tightly packed RGBA bytes.
-///
-/// Readback rows must be padded to 256 bytes, so the padding is stripped here
-/// rather than leaking into every comparison.
-fn read_texture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    encoder: wgpu::CommandEncoder,
-    texture: &wgpu::Texture,
-    width: u32,
-    height: u32,
-) -> Vec<u8> {
-    let unpadded = width * 4;
-    let padded = unpadded.div_ceil(256) * 256;
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback"),
-        size: (padded * height) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
 
-    let mut encoder = encoder;
-    encoder.copy_texture_to_buffer(
-        texture.as_image_copy(),
-        wgpu::TexelCopyBufferInfo {
-            buffer: &readback,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(padded),
-                rows_per_image: Some(height),
-            },
-        },
-        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-    );
-    queue.submit([encoder.finish()]);
-
-    let slice = readback.slice(..);
-    slice.map_async(wgpu::MapMode::Read, |_| {});
-    device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("device poll failed");
-
-    let data = slice.get_mapped_range();
-    let mut out = Vec::with_capacity((unpadded * height) as usize);
-    for row in 0..height {
-        let start = (row * padded) as usize;
-        out.extend_from_slice(&data[start..start + unpadded as usize]);
-    }
-    drop(data);
-    readback.unmap();
-    out
-}
-
-fn storage_target(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
-    device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("test_target"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    })
-}
 
 /// Runs a shader whose only binding is the output storage texture.
 fn run_flat(
