@@ -3,6 +3,7 @@ pub mod arena;
 pub mod contree;
 pub mod dense;
 pub mod edit;
+pub mod mask_table;
 pub mod material;
 pub mod node;
 pub mod testing;
