@@ -28,6 +28,13 @@ fn main() {
                     ..default()
                 }),
         )
+        // Frame times are the argument for the optimisations in milestone 8, so
+        // they are measured rather than estimated by eye.
+        .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
+        .add_plugins(bevy::diagnostic::LogDiagnosticsPlugin {
+            wait_duration: std::time::Duration::from_secs(3),
+            ..default()
+        })
         .add_plugins(BevoxRenderPlugin)
         .add_systems(Startup, setup)
         .run();
@@ -38,10 +45,14 @@ fn setup(mut commands: Commands) {
     commands.spawn(Camera2d);
 
     let (tree, materials) = match std::env::args().nth(1) {
-        Some(path) => match bevox_core::vox::load_vox(std::path::Path::new(&path)) {
-            Ok((volume, materials)) => {
-                info!("loaded {path}: extent {}", volume.extent());
-                (volume.into_contree(), materials)
+        Some(path) => match bevox_core::vox::load_scene(std::path::Path::new(&path)) {
+            Ok((tree, materials)) => {
+                info!(
+                    "loaded {path}: extent {}, {} arena nodes",
+                    tree.extent(),
+                    tree.arena().nodes().len()
+                );
+                (tree, materials)
             }
             Err(e) => {
                 // A bad path is a typo, not a crash: say so and show the demo.

@@ -324,6 +324,17 @@ fn implicit_normal(voxel: vec3<u32>, face_normal: vec3<f32>) -> vec3<f32> {
     return normalize(sum);
 }
 
+/// How far a ray may travel before giving up.
+///
+/// Derived from the volume rather than fixed: a camera framed at a few extents
+/// away from a 4096 scene sits ~4500 units out, so a hardcoded budget of 1000
+/// kills every ray before it reaches the geometry and the screen shows only sky.
+/// Rays terminate at the volume's exit anyway, so a generous bound costs
+/// nothing; the step cap is what bounds the work.
+fn max_ray_distance() -> f32 {
+    return max(f32(view.volume_params.y) * 8.0, 1000.0);
+}
+
 /// Ray direction for a pixel. Shared so both entry points march identical rays.
 fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
     let ndc = vec2<f32>(
@@ -350,7 +361,7 @@ fn march_shadow(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
     if id.x >= size.x || id.y >= size.y { return; }
 
-    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), 1000.0);
+    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), max_ray_distance());
 
     var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if hit.hit {
@@ -359,7 +370,7 @@ fn march_shadow(@builtin(global_invocation_id) id: vec3<u32>) {
         // voxel. 0.75 matches bevox_core's reference renderer.
         let origin = vec3<f32>(hit.voxel) + vec3<f32>(0.5) + n * 0.75;
         var shadowed = 0.0;
-        if traverse_any(origin, view.sun_direction.xyz, 500.0) {
+        if traverse_any(origin, view.sun_direction.xyz, max_ray_distance()) {
             shadowed = 1.0;
         }
         colour = vec4<f32>(shadowed, 0.0, 0.0, 1.0);
@@ -373,7 +384,7 @@ fn march_normal(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
     if id.x >= size.x || id.y >= size.y { return; }
 
-    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), 1000.0);
+    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), max_ray_distance());
 
     var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if hit.hit {
@@ -389,7 +400,7 @@ fn march_voxel_id(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
     if id.x >= size.x || id.y >= size.y { return; }
 
-    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), 1000.0);
+    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), max_ray_distance());
 
     var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if hit.hit {
@@ -410,7 +421,7 @@ fn march_identity(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
     if id.x >= size.x || id.y >= size.y { return; }
 
-    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), 1000.0);
+    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), max_ray_distance());
 
     var colour = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     if hit.hit {
@@ -426,7 +437,7 @@ fn march(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
     if id.x >= size.x || id.y >= size.y { return; }
 
-    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), 1000.0);
+    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), max_ray_distance());
 
     var colour = vec3<f32>(0.35, 0.47, 0.70);  // sky
     if hit.hit {
@@ -435,7 +446,7 @@ fn march(@builtin(global_invocation_id) id: vec3<u32>) {
 
         let origin = vec3<f32>(hit.voxel) + vec3<f32>(0.5) + n * 0.75;
         var diffuse = max(dot(n, sun), 0.0) * 0.75;
-        if traverse_any(origin, sun, 500.0) {
+        if traverse_any(origin, sun, max_ray_distance()) {
             diffuse = 0.0;
         }
 

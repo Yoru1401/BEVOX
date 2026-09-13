@@ -283,6 +283,12 @@ fn apply(m: [[f32; 3]; 3], v: IVec3) -> IVec3 {
     )
 }
 
+/// Reads a `.vox` file and composes its whole scene.
+pub fn load_scene(path: &std::path::Path) -> Result<(Contree, MaterialTable), VoxError> {
+    let data = dot_vox::load(path.to_str().unwrap_or_default()).map_err(|_| VoxError::ReadFailed)?;
+    import_scene(&data)
+}
+
 /// Reads a `.vox` file and imports its first model.
 pub fn load_vox(path: &std::path::Path) -> Result<(DenseVolume, MaterialTable), VoxError> {
     // A missing file and a file with no models are different faults, and saying

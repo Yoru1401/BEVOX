@@ -39,6 +39,18 @@ fn main() {
         largest.1, largest.0
     );
 
+    let started = std::time::Instant::now();
+    match bevox_core::vox::import_scene(&data) {
+        Ok((tree, _)) => println!(
+            "composed  : extent {}, {} arena nodes, {} voxel bytes, {:.2}s",
+            tree.extent(),
+            tree.arena().nodes().len(),
+            tree.arena().voxels().len(),
+            started.elapsed().as_secs_f32()
+        ),
+        Err(e) => println!("composed  : rejected, {e}"),
+    }
+
     // The first few models, which is what import_model(.., 0) would pick up.
     for (i, m) in data.models.iter().take(5).enumerate() {
         println!(

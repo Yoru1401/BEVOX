@@ -481,6 +481,90 @@ fn the_gpu_shadows_match_the_cpu() {
     assert_eq!(mismatches, 0, "{mismatches} shadow decisions disagreed; first {first}");
 }
 
+/// A large volume viewed from where the app frames its camera.
+///
+/// The ray budget used to be a hardcoded 1000 units. At extent 4096 the camera
+/// sits ~4500 units out, so every ray died before reaching the geometry and the
+/// screen showed nothing but sky — while still reporting a healthy 60 fps,
+/// because missing everything is cheap. Frame rate cannot detect this; hit
+/// counts can.
+#[test]
+fn a_distant_camera_on_a_large_volume_still_reaches_the_geometry() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+
+    let extent = 4096u32;
+    let centre = extent / 2;
+    // Large enough to subtend several pixels from the camera distance below:
+    // at 4500 units with a 0.9 rad fov, a 64x64 image resolves ~63 units per
+    // pixel, so a small block would be sub-pixel and legitimately invisible.
+    let half = 64u32;
+
+    // A solid block at the centre of an otherwise empty 4096 volume.
+    let mut voxels = Vec::new();
+    for z in (centre - half)..(centre + half) {
+        for y in (centre - half)..(centre + half) {
+            for x in (centre - half)..(centre + half) {
+                voxels.push((UVec3::new(x, y, z), MaterialId(1)));
+            }
+        }
+    }
+    let tree = Contree::from_voxels(extent, &voxels);
+    let gpu_volume = GpuVolume::from_contree(&tree);
+
+    // Framed exactly as the app frames it.
+    let centre_f = Vec3::splat(extent as f32 * 0.5);
+    let eye = centre_f + Vec3::new(-1.0, 1.2, -1.0).normalize() * extent as f32 * 1.1;
+
+    let (width, height) = (256u32, 256u32);
+    let view = Mat4::look_at_rh(eye, centre_f, Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 20_000.0);
+    let world_from_clip = (projection * view).inverse();
+
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader file missing");
+    let pixels = run_march(
+        &device,
+        &queue,
+        &shader,
+        "march_identity",
+        world_from_clip,
+        eye,
+        &tree,
+        &gpu_volume,
+        width,
+        height,
+    );
+
+    let hits = pixels.chunks_exact(4).filter(|px| px[1] > 0).count();
+
+    // The CPU reference from the same camera. If it finds the geometry and the
+    // GPU does not, the fault is in the shader; if neither does, it is in the
+    // tree or the camera.
+    let mut stats = MarchStats::default();
+    let mut cpu_hits = 0usize;
+    for y in 0..height {
+        for x in 0..width {
+            let dir = ray_direction(world_from_clip, eye, x, y, width, height);
+            if march(&tree, Affine3A::IDENTITY, eye, dir, 100_000.0, false, &mut stats).is_some() {
+                cpu_hits += 1;
+            }
+        }
+    }
+
+    assert!(
+        cpu_hits > 20,
+        "the CPU reference found only {cpu_hits} hits, so the tree or camera is at fault, \
+         not the shader (overruns: {})",
+        stats.overruns
+    );
+    assert!(
+        hits > 20,
+        "GPU reached {hits} pixels but the CPU reached {cpu_hits}; the shader is at fault"
+    );
+}
+
 #[test]
 fn the_gpu_traversal_agrees_with_the_cpu_reference() {
     let Some((device, queue)) = gpu_device() else {
