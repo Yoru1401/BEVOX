@@ -31,6 +31,14 @@ Recorded here because several differ from what this plan originally assumed.
 - `GlobalTransform::compute_matrix` is now `to_matrix`.
 - `WindowResolution` implements `From<(u32, u32)>`, not `From<(f32, f32)>`.
 - `EventReader` is gone; 0.19 uses `MessageReader`.
+- Storage buffer minimum binding sizes must match the shader's element type.
+  `array<vec4<u32>>` needs 16 and `array<u32>` needs 4; declaring both via
+  `storage_buffer_read_only::<Vec<u32>>` (minimum 4) is accepted at layout
+  creation and then rejected at dispatch as "Error matching shader requirements
+  against the pipeline". Use `storage_buffer_read_only_sized`.
+- `RenderAssetUsages::RENDER_WORLD` alone discards the image from
+  `Assets<Image>`, leaving a sprite with no dimensions to size itself from. Keep
+  `MAIN_WORLD` as well, and set `Sprite::custom_size` explicitly.
 - `active` is a reserved keyword in WGSL. The traversal loop flag is `running`.
 - `GpuSceneData` must be registered with `init_resource` and default to a single
   empty root node. Gating the dispatch on a scene existing makes an empty world

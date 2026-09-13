@@ -123,7 +123,10 @@ pub fn create_march_target(
         TextureDimension::D2,
         &[0, 0, 0, 255],
         TextureFormat::Rgba8Unorm,
-        RenderAssetUsages::RENDER_WORLD,
+        // MAIN_WORLD is kept deliberately: dropping it discards the asset from
+        // Assets<Image>, and the sprite then has no dimensions to size itself
+        // from, so it draws nothing at all.
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     );
     // STORAGE_BINDING is the one that matters: without it the bind group is
     // rejected at creation, and the symptom is a black window with a validation
@@ -132,7 +135,13 @@ pub fn create_march_target(
         TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING;
 
     let handle = images.add(image);
-    commands.spawn(Sprite::from_image(handle.clone()));
+    commands.spawn(Sprite {
+        image: handle.clone(),
+        // Stated explicitly rather than inferred, so the sprite covers the
+        // window regardless of when the image's size becomes known.
+        custom_size: Some(Vec2::new(width as f32, height as f32)),
+        ..default()
+    });
     commands.insert_resource(MarchTarget { image: handle, width, height });
 }
 

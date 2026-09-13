@@ -139,6 +139,58 @@ fn run_march(
     read_texture(device, queue, encoder, &texture, width, height)
 }
 
+/// The display entry point shares `traverse` with `march_identity`, but writes
+/// colours rather than identities. This proves it renders a scene — distinct
+/// sky, floor and column — rather than a uniform field, which is what a
+/// silently-skipped dispatch or a missed volume would produce.
+#[test]
+fn the_display_entry_point_renders_a_scene() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+
+    let tree = parity_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+
+    let (width, height) = (64u32, 64u32);
+    let eye = Vec3::new(-30.0, 40.0, -30.0);
+    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, width as f32 / height as f32, 0.1, 500.0);
+    let world_from_clip = (projection * view).inverse();
+
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader file missing");
+    let pixels = run_march(
+        &device,
+        &queue,
+        &shader,
+        "march",
+        world_from_clip,
+        eye,
+        &tree,
+        &gpu_volume,
+        width,
+        height,
+    );
+
+    let mut distinct = std::collections::HashSet::new();
+    for px in pixels.chunks_exact(4) {
+        distinct.insert([px[0], px[1], px[2]]);
+    }
+    assert!(
+        distinct.len() > 2,
+        "expected sky, floor and column to differ; got {} distinct colours",
+        distinct.len()
+    );
+
+    // The sky colour must appear: some rays miss the volume entirely.
+    let sky = [(0.35 * 255.0) as u8, (0.47 * 255.0) as u8, (0.70 * 255.0) as u8];
+    let near_sky = distinct
+        .iter()
+        .any(|c| c.iter().zip(sky).all(|(a, b)| a.abs_diff(b) <= 2));
+    assert!(near_sky, "no sky-coloured pixel found; every ray hit something");
+}
+
 #[test]
 fn the_gpu_traversal_agrees_with_the_cpu_reference() {
     let Some((device, queue)) = gpu_device() else {
@@ -160,7 +212,7 @@ fn the_gpu_traversal_agrees_with_the_cpu_reference() {
         &device,
         &queue,
         &shader,
-        "march",
+        "march_identity",
         world_from_clip,
         eye,
         &tree,

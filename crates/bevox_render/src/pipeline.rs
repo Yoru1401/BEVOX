@@ -4,7 +4,7 @@ use crate::upload::{ExtractedMarchCamera, GpuSceneData, MarchTarget, MarchUnifor
 use bevy::prelude::*;
 use bevy::material::bind_group_layout_entries::BindGroupLayoutEntries;
 use bevy::material::bind_group_layout_entries::binding_types::{
-    storage_buffer_read_only, texture_storage_2d, uniform_buffer_sized,
+    storage_buffer_read_only_sized, texture_storage_2d, uniform_buffer_sized,
 };
 use bevy::material::descriptor::BindGroupLayoutDescriptor;
 use bevy::render::render_asset::RenderAssets;
@@ -45,8 +45,12 @@ pub fn init_march_pipeline(
         ShaderStages::COMPUTE,
         (
             uniform_buffer_sized(false, NonZero::new(size_of::<MarchUniform>() as u64)),
-            storage_buffer_read_only::<Vec<u32>>(false),
-            storage_buffer_read_only::<Vec<u32>>(false),
+            // The shader declares these as array<vec4<u32>> and array<u32>, so
+            // the minimum binding sizes are one element of each: 16 and 4. A
+            // smaller minimum is rejected as "shader requirements against the
+            // pipeline" at dispatch time, not at layout creation.
+            storage_buffer_read_only_sized(false, NonZero::new(16)),
+            storage_buffer_read_only_sized(false, NonZero::new(4)),
             texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
         ),
     );

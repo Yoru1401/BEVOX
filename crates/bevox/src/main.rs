@@ -1,6 +1,10 @@
 use bevy::prelude::*;
+use bevox_core::contree::Contree;
+use bevox_core::dense::DenseVolume;
+use bevox_core::material::MaterialId;
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::FlyCamera;
+use bevox_render::upload::VoxelScene;
 
 fn main() {
     App::new()
@@ -41,4 +45,29 @@ fn setup(mut commands: Commands) {
         Transform::from_xyz(-30.0, 40.0, -30.0).looking_at(Vec3::new(32.0, 12.0, 32.0), Vec3::Y),
         FlyCamera::default(),
     ));
+
+    commands.insert_resource(VoxelScene { tree: demo_scene(), generation: 1 });
+}
+
+/// The same floor, column and carved sphere the parity test uses, so what is on
+/// screen is what the test proved correct.
+fn demo_scene() -> Contree {
+    let mut dense = DenseVolume::new(64).unwrap();
+    for z in 0..64 {
+        for x in 0..64 {
+            for y in 0..6 {
+                dense.set(UVec3::new(x, y, z), MaterialId(1));
+            }
+        }
+    }
+    for z in 28..36 {
+        for y in 6..26 {
+            for x in 28..36 {
+                dense.set(UVec3::new(x, y, z), MaterialId(2));
+            }
+        }
+    }
+    let mut tree = dense.into_contree();
+    tree.apply_sphere(Vec3::new(32.0, 18.0, 32.0), 5.0, MaterialId::EMPTY);
+    tree
 }

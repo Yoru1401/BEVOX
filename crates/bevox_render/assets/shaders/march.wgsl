@@ -224,6 +224,30 @@ fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
     return normalize(far.xyz / far.w - view.camera_position.xyz);
 }
 
+/// Material identity in red, hit flag in green. Read by the parity test only.
+@compute @workgroup_size(8, 8, 1)
+fn march_identity(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(output);
+    if id.x >= size.x || id.y >= size.y { return; }
+
+    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), 1000.0);
+
+    var colour = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    if hit.hit {
+        colour = vec4<f32>(f32(hit.material) / 255.0, 1.0, 0.0, 1.0);
+    }
+    textureStore(output, vec2<i32>(id.xy), colour);
+}
+
+/// Palette lookup. A real material table arrives with milestone 5; two colours
+/// are enough to prove the scene reads correctly.
+fn material_colour(material: u32) -> vec3<f32> {
+    if material == 1u { return vec3<f32>(0.55, 0.55, 0.58); }
+    if material == 2u { return vec3<f32>(0.70, 0.35, 0.27); }
+    return vec3<f32>(1.0, 0.0, 1.0);  // unmapped materials are obvious
+}
+
+/// What the window shows.
 @compute @workgroup_size(8, 8, 1)
 fn march(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
@@ -231,10 +255,12 @@ fn march(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let hit = traverse(view.camera_position.xyz, primary_ray(id, size), 1000.0);
 
-    // Material identity in red, hit flag in green: what the parity test reads.
-    var colour = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    var colour = vec3<f32>(0.35, 0.47, 0.70);  // sky
     if hit.hit {
-        colour = vec4<f32>(f32(hit.material) / 255.0, 1.0, 0.0, 1.0);
+        // Distance falloff only. This is deliberately not lighting: normals and
+        // shadows are milestone 5, and faking them here would hide their absence.
+        let fade = clamp(1.0 - hit.t / 160.0, 0.25, 1.0);
+        colour = material_colour(hit.material) * fade;
     }
-    textureStore(output, vec2<i32>(id.xy), colour);
+    textureStore(output, vec2<i32>(id.xy), vec4<f32>(colour, 1.0));
 }
