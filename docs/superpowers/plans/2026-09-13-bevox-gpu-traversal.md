@@ -133,7 +133,7 @@ fn main() {
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "BEVOX".into(),
-                resolution: (1280.0, 720.0).into(),
+                resolution: (1280u32, 720u32).into(),
                 ..default()
             }),
             ..default()
@@ -1968,7 +1968,7 @@ fn main() {
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "BEVOX".into(),
-                resolution: (1280.0, 720.0).into(),
+                resolution: (1280u32, 720u32).into(),
                 ..default()
             }),
             ..default()

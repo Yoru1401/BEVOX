@@ -1,0 +1,10 @@
+[package]
+name = "bevox"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bevox_core = { version = "0.1.0", path = "../bevox_core" }
+bevox_render = { version = "0.1.0", path = "../bevox_render" }
+bevy = "0.19.1"
