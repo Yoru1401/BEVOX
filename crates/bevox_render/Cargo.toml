@@ -10,5 +10,6 @@ bevy = "0.19.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 
 [dev-dependencies]
+glam = "0.32"
 pollster = "1.0.1"
 wgpu = "29.0.4"

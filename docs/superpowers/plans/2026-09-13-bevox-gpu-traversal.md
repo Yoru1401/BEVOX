@@ -31,6 +31,7 @@ Recorded here because several differ from what this plan originally assumed.
 - `GlobalTransform::compute_matrix` is now `to_matrix`.
 - `WindowResolution` implements `From<(u32, u32)>`, not `From<(f32, f32)>`.
 - `EventReader` is gone; 0.19 uses `MessageReader`.
+- `active` is a reserved keyword in WGSL. The traversal loop flag is `running`.
 - `GpuSceneData` must be registered with `init_resource` and default to a single
   empty root node. Gating the dispatch on a scene existing makes an empty world
   render black instead of sky, and Task 4's own deliverable check failed on
@@ -1714,7 +1715,7 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
     // slot n lives at index n + 1.
     var stack: array<Frame, MAX_DEPTH>;
     var sp: u32 = 0u;
-    var active: bool = true;
+    var running: bool = true;
     stack[0] = Frame(
         nodes[0],
         vec3<u32>(0u),
@@ -1728,14 +1729,14 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
     var steps: u32 = 0u;
 
     loop {
-        if !active { break; }
+        if !running { break; }
         steps = steps + 1u;
         if steps > MAX_STEPS { break; }
 
         let frame = stack[sp];
 
         if is_empty(frame.node) {
-            if sp == 0u { active = false; } else { sp = sp - 1u; }
+            if sp == 0u { running = false; } else { sp = sp - 1u; }
             continue;
         }
         if is_uniform_solid(frame.node) {
@@ -1786,7 +1787,7 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
         }
 
         if best_i == CHILDREN || best_t > max_dist {
-            if sp == 0u { active = false; } else { sp = sp - 1u; }
+            if sp == 0u { running = false; } else { sp = sp - 1u; }
             continue;
         }
 

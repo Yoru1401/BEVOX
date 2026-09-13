@@ -485,6 +485,7 @@ dependencies = [
  "bevox_core",
  "bevy",
  "bytemuck",
+ "glam",
  "pollster",
  "wgpu",
 ]
