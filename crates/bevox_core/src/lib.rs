@@ -3,6 +3,7 @@ pub mod arena;
 pub mod contree;
 pub mod dense;
 pub mod edit;
+pub mod march;
 pub mod mask_table;
 pub mod material;
 pub mod node;
