@@ -1,6 +1,6 @@
 //! Bind group layout, compute pipeline and the dispatch that runs it.
 
-use crate::upload::{ExtractedMarchCamera, GpuSceneData, MarchTarget, MarchUniform};
+use crate::upload::{ExtractedMarchCamera, GpuSceneData, MarchTarget, MarchUniform, march_flags};
 use bevy::prelude::*;
 use bevy::material::bind_group_layout_entries::BindGroupLayoutEntries;
 use bevy::material::bind_group_layout_entries::binding_types::{
@@ -15,12 +15,21 @@ use bevy::render::texture::GpuImage;
 
 pub const SHADER_PATH: &str = "shaders/march.wgsl";
 pub const WORKGROUP: u32 = 8;
+/// Full-resolution pixels per beam sample, per axis. Must match BEAM_SCALE in
+/// the shader.
+pub const BEAM_SCALE: u32 = 8;
+/// Coarse pixels the beam buffer holds: enough for 7680x4320. The buffer is
+/// built once with the scene, while the window size is only known later, so it
+/// is sized for the largest window rather than resized. 2 MB.
+pub const BEAM_CAPACITY: u32 = (7680 / BEAM_SCALE) * (4320 / BEAM_SCALE);
 
 #[derive(Resource)]
 pub struct MarchPipeline {
     /// The created layout, used when building bind groups.
     pub layout: BindGroupLayout,
     pub pipeline: CachedComputePipelineId,
+    /// Coarse pass, dispatched before the main one when the beam flag is set.
+    pub beam: CachedComputePipelineId,
 }
 
 /// GPU-side buffers for the current scene.
@@ -31,6 +40,7 @@ pub struct MarchBuffers {
     pub voxels: Buffer,
     pub palette: Buffer,
     pub direction_masks: Buffer,
+    pub beam: Buffer,
     pub generation: u32,
 }
 
@@ -66,6 +76,8 @@ pub fn init_march_pipeline(
     let layout_descriptor = BindGroupLayoutDescriptor::new("bevox_march_layout", &entries);
 
     let shader = asset_server.load(SHADER_PATH);
+    let shader_beam = shader.clone();
+    let layout_descriptor_beam = BindGroupLayoutDescriptor::new("bevox_march_layout", &entries);
     let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("bevox_march".into()),
         layout: vec![layout_descriptor],
@@ -74,7 +86,15 @@ pub fn init_march_pipeline(
         ..default()
     });
 
-    commands.insert_resource(MarchPipeline { layout, pipeline });
+    let beam = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("bevox_beam_prepass".into()),
+        layout: vec![layout_descriptor_beam],
+        shader: shader_beam,
+        entry_point: Some("beam_prepass".into()),
+        ..default()
+    });
+
+    commands.insert_resource(MarchPipeline { layout, pipeline, beam });
 }
 
 /// Uploads scene buffers and the per-frame uniform into the render world.
@@ -134,6 +154,14 @@ pub fn prepare_march_buffers(
             contents: &voxel_bytes,
             usage: BufferUsages::STORAGE,
         }),
+        beam: device.create_buffer(&BufferDescriptor {
+            label: Some("bevox_beam"),
+            // One distance per coarse pixel. Sized for the largest target the
+            // window can be, because it is built once and the window is not.
+            size: u64::from(BEAM_CAPACITY) * 4,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        }),
         direction_masks: device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("bevox_direction_masks"),
             contents: bytemuck::cast_slice(&scene.direction_masks),
@@ -179,12 +207,31 @@ pub fn dispatch_march(
             buffers.palette.as_entire_binding(),
             &gpu_image.texture_view,
             buffers.direction_masks.as_entire_binding(),
+            buffers.beam.as_entire_binding(),
         )),
     );
 
     let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("bevox_march_encoder"),
     });
+    // Separate passes, so the prepass writes are visible to the reads that
+    // follow. Skipped entirely when the flag is off: at one pixel in 64 it is
+    // cheap, but not free.
+    if march_flags::DEFAULT & march_flags::BEAM != 0
+        && let Some(beam) = pipeline_cache.get_compute_pipeline(pipeline.beam)
+    {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some("bevox_beam_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(beam);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(
+            target.width.div_ceil(BEAM_SCALE).max(1).div_ceil(WORKGROUP),
+            target.height.div_ceil(BEAM_SCALE).max(1).div_ceil(WORKGROUP),
+            1,
+        );
+    }
     {
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("bevox_march_pass"),

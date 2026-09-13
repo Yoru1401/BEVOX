@@ -132,8 +132,14 @@ pub fn read_texture(
 ///
 /// Built once and reused, so a timed loop measures the shader rather than
 /// resource creation.
+/// Full-resolution pixels per beam sample, per axis. Must match BEAM_SCALE.
+pub const BEAM_SCALE: u32 = 8;
+
 pub struct Prepared {
     pipeline: wgpu::ComputePipeline,
+    /// Present only when the beam flag is set, so the suite does not compile a
+    /// prepass for the hundred dispatches that never run one.
+    beam_pipeline: Option<wgpu::ComputePipeline>,
     bind_group: wgpu::BindGroup,
     texture: wgpu::Texture,
     width: u32,
@@ -194,6 +200,13 @@ impl Prepared {
             usage: wgpu::BufferUsages::STORAGE,
         });
         let palette = parity_materials().to_gpu();
+        let beam_dims = (width.div_ceil(BEAM_SCALE).max(1), height.div_ceil(BEAM_SCALE).max(1));
+        let beam_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("beam"),
+            size: u64::from(beam_dims.0 * beam_dims.1) * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let mask_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("masks"),
             contents: bytemuck::cast_slice(&bevox_render::upload::gpu_direction_masks()),
@@ -235,6 +248,16 @@ impl Prepared {
                 },
                 storage_entry(5, 8),
                 wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(4),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
@@ -260,6 +283,16 @@ impl Prepared {
             compilation_options: Default::default(),
             cache: None,
         });
+        let beam_pipeline = (flags & bevox_render::upload::march_flags::BEAM != 0).then(|| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("beam_prepass_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some("beam_prepass"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &layout,
@@ -269,6 +302,7 @@ impl Prepared {
                 wgpu::BindGroupEntry { binding: 2, resource: voxel_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: palette_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: mask_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: beam_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&view),
@@ -276,30 +310,39 @@ impl Prepared {
             ],
         });
 
-        Self { pipeline, bind_group, texture, width, height }
+        Self { pipeline, beam_pipeline, bind_group, texture, width, height }
+    }
+
+    /// The prepass, when there is one, then the main pass. Separate passes, so
+    /// the beam writes are visible to the reads that follow.
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        if let Some(beam) = &self.beam_pipeline {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(beam);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.width.div_ceil(BEAM_SCALE).max(1).div_ceil(8),
+                self.height.div_ceil(BEAM_SCALE).max(1).div_ceil(8),
+                1,
+            );
+        }
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
     }
 
     /// Submits one dispatch without waiting; the caller polls once per batch.
     pub fn dispatch(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let mut encoder = device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
-        }
+        self.encode(&mut encoder);
         queue.submit([encoder.finish()]);
     }
 
     /// Dispatches once and reads the result back as RGBA bytes.
     pub fn read_back(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u8> {
         let mut encoder = device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
-        }
+        self.encode(&mut encoder);
         read_texture(device, queue, encoder, &self.texture, self.width, self.height)
     }
 }

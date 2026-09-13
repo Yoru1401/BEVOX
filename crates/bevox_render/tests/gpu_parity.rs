@@ -734,3 +734,150 @@ fn the_mask_filter_leaves_output_bit_identical() {
         }
     }
 }
+
+/// Thin geometry is what a too-aggressive seed eats first: single-voxel walls
+/// and isolated voxels, which can hide between beam samples.
+fn thin_scene() -> Contree {
+    let extent = 64u32;
+    let mut voxels = Vec::new();
+    // Single-voxel-thick walls on two axes.
+    for a in 0..extent {
+        for b in 0..extent {
+            voxels.push((UVec3::new(a, b, 32), MaterialId(1)));
+            voxels.push((UVec3::new(32, a, b), MaterialId(2)));
+        }
+    }
+    // Isolated voxels scattered off the walls.
+    let mut rng = bevox_core::testing::XorShift64::new(4242);
+    for _ in 0..200 {
+        voxels.push((
+            UVec3::new(rng.next_below(extent), rng.next_below(extent), rng.next_below(extent)),
+            MaterialId(1),
+        ));
+    }
+    Contree::from_voxels(extent, &voxels)
+}
+
+/// A beam prepass seeds full-resolution rays with a distance a coarse pass
+/// proved empty. Seeding even slightly too far skips thin geometry, and the
+/// symptom is holes that appear from some angles and not others — so this
+/// sweeps angles rather than trusting one view.
+///
+/// The combination is tested alongside it because that is what ships: the seed
+/// changes where a ray starts, and both other optimisations change how it walks
+/// from there.
+///
+/// Primary-ray output is exact. Shaded output is allowed a couple of pixels,
+/// and only because of one characterised difference: the scan's slab test is
+/// inclusive, so a ray touching a cell at exactly one point still descends into
+/// it, while a walk can only visit cells it passes through. Shadow rays all
+/// share one direction, so grid-locked origins reach those exact boundaries
+/// systematically where an arbitrary camera direction never does. It is a
+/// convention difference at a zero-measure graze, not lost geometry — which is
+/// what `dda_matches_the_scan_from_inside_the_volume` exists to show.
+#[test]
+fn the_beam_prepass_never_skips_geometry() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let tree = thin_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (128u32, 128u32);
+    let centre = Vec3::splat(32.0);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    for step in 0..8u32 {
+        let angle = step as f32 * std::f32::consts::TAU / 8.0;
+        let eye = centre + Vec3::new(angle.cos() * 90.0, 30.0, angle.sin() * 90.0);
+        let view = Mat4::look_at_rh(eye, centre, Vec3::Y);
+        let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+        let world_from_clip = (projection * view).inverse();
+
+        for entry in ["march_identity", "march_voxel_id", "march_normal", "march_shadow", "march"]
+        {
+            let reference = run_march_flagged(
+                &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume, width,
+                height, march_flags::NONE,
+            );
+            for flags in [
+                march_flags::BEAM,
+                march_flags::DDA | march_flags::MASK_FILTER | march_flags::BEAM,
+            ] {
+                let seeded = run_march_flagged(
+                    &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume,
+                    width, height, flags,
+                );
+                let differing =
+                    reference.chunks(4).zip(seeded.chunks(4)).filter(|(a, b)| a != b).count();
+                // Shadow rays are the only place the graze convention shows.
+                let allowed = if entry == "march" || entry == "march_shadow" { 4 } else { 0 };
+                assert!(
+                    differing <= allowed,
+                    "angle {step}, {entry}, flags {flags:#b}: {differing} of {} pixels differ,                      more than the {allowed} a grazing shadow ray explains",
+                    width * height
+                );
+            }
+        }
+    }
+}
+
+/// Rays that start inside the volume, among voxels with nothing adjacent.
+///
+/// A shadow ray is a primary ray with its origin on a voxel surface, and that
+/// is the one input the outside-the-volume cameras never produce. An isolated
+/// voxel is the hardest thing for a walk to catch: it occupies one cell of one
+/// brick, and missing the cell means missing the voxel entirely.
+#[test]
+fn dda_matches_the_scan_from_inside_the_volume() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let mut voxels = Vec::new();
+    let mut rng = bevox_core::testing::XorShift64::new(99);
+    for _ in 0..400 {
+        voxels.push((
+            UVec3::new(rng.next_below(64), rng.next_below(64), rng.next_below(64)),
+            MaterialId(1),
+        ));
+    }
+    let tree = Contree::from_voxels(64, &voxels);
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (128u32, 128u32);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    // Origins offset from voxel centres the way a shadow ray's is.
+    let eyes = [
+        Vec3::new(32.5, 32.5, 31.75),
+        Vec3::new(20.5, 8.5, 44.25),
+        Vec3::new(5.25, 40.5, 40.5),
+    ];
+    let mut total = 0usize;
+    for (i, eye) in eyes.iter().enumerate() {
+        for step in 0..4u32 {
+            let angle = step as f32 * std::f32::consts::TAU / 4.0;
+            let target = *eye + Vec3::new(angle.cos(), 0.6, angle.sin()) * 20.0;
+            let view = Mat4::look_at_rh(*eye, target, Vec3::Y);
+            let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+            let world_from_clip = (projection * view).inverse();
+            for entry in ["march_identity", "march_voxel_id"] {
+                let scan = run_march_flagged(
+                    &device, &queue, &shader, entry, world_from_clip, *eye, &tree, &gpu_volume,
+                    width, height, march_flags::NONE,
+                );
+                let dda = run_march_flagged(
+                    &device, &queue, &shader, entry, world_from_clip, *eye, &tree, &gpu_volume,
+                    width, height, march_flags::DDA,
+                );
+                let differing =
+                    scan.chunks(4).zip(dda.chunks(4)).filter(|(a, b)| a != b).count();
+                if differing != 0 {
+                    println!("eye {i} step {step} {entry}: {differing} differ");
+                }
+                total += differing;
+            }
+        }
+    }
+    assert_eq!(total, 0, "DDA lost {total} pixels among isolated voxels");
+}

@@ -27,11 +27,17 @@ const FLAG_BEAM: u32 = 4u;
 // Reachability masks as low/high halves, indexed cell * 8 + octant. WGSL has no
 // 64-bit integer, so the u64 table is split rather than reshaped.
 @group(0) @binding(5) var<storage, read> direction_masks: array<vec2<u32>>;
+// Beam prepass results, one distance per coarse pixel, row major. A buffer
+// rather than a second storage texture: one binding instead of two, and no
+// read-access storage texture to negotiate with the adapter.
+@group(0) @binding(6) var<storage, read_write> beam: array<f32>;
 
 const BRICK_EDGE: u32 = 4u;
 const CHILDREN: u32 = 64u;
 const MAX_STEPS: u32 = 4096u;
 const MAX_DEPTH: u32 = 8u;
+/// Full-resolution pixels per beam sample, per axis.
+const BEAM_SCALE: u32 = 8u;
 
 fn flag_enabled(bit: u32) -> bool {
     return (view.volume_params.z & bit) != 0u;
@@ -136,11 +142,20 @@ fn cell_exits(
     );
 }
 
-/// Index of the smallest component: the axis the ray leaves through first.
-fn min_axis(t: vec3<f32>) -> u32 {
-    if t.x <= t.y && t.x <= t.z { return 0u; }
-    if t.y <= t.z { return 1u; }
-    return 2u;
+/// Distance at which the ray leaves this cell: the first exit plane it reaches.
+fn cell_exit(t: vec3<f32>) -> f32 {
+    return min(t.x, min(t.y, t.z));
+}
+
+/// The next cell along, stepping every axis whose exit plane is reached at the
+/// same distance.
+///
+/// At an exact corner or edge crossing, stepping one axis at a time lands in a
+/// cell the ray only touches and reaches the diagonal neighbour a step later.
+/// Moving diagonally is both cheaper (no branches) and closer to what the ray
+/// does; no test distinguishes the two, so this is robustness, not a fix.
+fn step_cell(cell: vec3<i32>, t: vec3<f32>, t_out: f32, stepv: vec3<i32>) -> vec3<i32> {
+    return cell + select(vec3<i32>(0), stepv, t == vec3<f32>(t_out));
 }
 
 fn index_of_cell(c: vec3<i32>) -> u32 {
@@ -336,12 +351,10 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
                 );
             } else {
                 // Resuming: step past the cell already descended into.
-                cell = cell_of_index(frame.cursor);
-                let tm = cell_exits(origin, dir, inv_dir, node_lo, cell_size, cell, stepv);
-                let axis = min_axis(tm);
-                if axis == 0u { t_cur = tm.x; cell.x = cell.x + stepv.x; }
-                else if axis == 1u { t_cur = tm.y; cell.y = cell.y + stepv.y; }
-                else { t_cur = tm.z; cell.z = cell.z + stepv.z; }
+                let resume = cell_of_index(frame.cursor);
+                let tm = cell_exits(origin, dir, inv_dir, node_lo, cell_size, resume, stepv);
+                t_cur = cell_exit(tm);
+                cell = step_cell(resume, tm, t_cur, stepv);
             }
 
             // A ray crosses at most a handful of cells in a 4x4x4 grid; the
@@ -356,11 +369,7 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
 
                 let i = index_of_cell(cell);
                 let tm = cell_exits(origin, dir, inv_dir, node_lo, cell_size, cell, stepv);
-                let axis = min_axis(tm);
-                var t_out: f32;
-                if axis == 0u { t_out = tm.x; }
-                else if axis == 1u { t_out = tm.y; }
-                else { t_out = tm.z; }
+                let t_out = cell_exit(tm);
 
                 if has_child(frame.node, i) {
                     best_i = i;
@@ -373,9 +382,7 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
                 }
 
                 t_cur = t_out;
-                if axis == 0u { cell.x = cell.x + stepv.x; }
-                else if axis == 1u { cell.y = cell.y + stepv.y; }
-                else { cell.z = cell.z + stepv.z; }
+                cell = step_cell(cell, tm, t_out, stepv);
             }
         }
 
@@ -538,13 +545,87 @@ fn traverse_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
     return traverse(origin, dir, max_dist).hit;
 }
 
+fn beam_dims(size: vec2<u32>) -> vec2<u32> {
+    return max((size + vec2<u32>(BEAM_SCALE - 1u)) / BEAM_SCALE, vec2<u32>(1u));
+}
+
+/// Distance at which one voxel shrinks to the spacing between beam rays.
+///
+/// Past this a voxel can sit entirely between two beams and be missed, so the
+/// seed is capped here whatever the beam actually found. Two adjacent beam
+/// directions give the spacing directly, which avoids passing a field of view
+/// through the uniform and going stale when the projection changes.
+fn beam_safe_distance(bd: vec2<u32>) -> f32 {
+    let a = primary_ray(vec3<u32>(0u, 0u, 0u), bd);
+    let b = primary_ray(vec3<u32>(1u, 0u, 0u), bd);
+    let spread = length(b - a);
+    if spread <= 1e-9 {
+        return 1e30;
+    }
+    return 1.0 / spread;
+}
+
+/// Coarse pass: how far each beam travelled before meeting anything.
+@compute @workgroup_size(8, 8, 1)
+fn beam_prepass(@builtin(global_invocation_id) id: vec3<u32>) {
+    let bd = beam_dims(textureDimensions(output));
+    if id.x >= bd.x || id.y >= bd.y { return; }
+
+    let hit = traverse(view.camera_position.xyz, primary_ray(id, bd), max_ray_distance());
+    let cap = beam_safe_distance(bd);
+    var seed = cap;
+    if hit.hit {
+        seed = min(hit.t, cap);
+    }
+    beam[id.y * bd.x + id.x] = seed;
+}
+
+/// Smallest distance any surrounding beam reported.
+///
+/// The minimum over a 3x3 neighbourhood is what makes this safe: a pixel sits
+/// anywhere inside its beam's cell, so the geometry it is about to hit may have
+/// been seen by the beam on either side, not only by its own or the next one.
+fn beam_seed(id: vec3<u32>, size: vec2<u32>) -> f32 {
+    let bd = beam_dims(size);
+    let centre = vec2<i32>(id.xy / BEAM_SCALE);
+    var m = 1e30;
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            let s = clamp(centre + vec2<i32>(dx, dy), vec2<i32>(0), vec2<i32>(bd) - vec2<i32>(1));
+            m = min(m, beam[u32(s.y) * bd.x + u32(s.x)]);
+        }
+    }
+    return m;
+}
+
+/// The camera ray for this pixel, started wherever the prepass proved empty.
+///
+/// The seed offsets the ray origin rather than being threaded into `traverse`
+/// as a start parameter. `traverse` is the function every parity test pins;
+/// a seed inside it would put the optimisation within the thing being verified.
+fn primary_hit(id: vec3<u32>, size: vec2<u32>) -> Hit {
+    let dir = primary_ray(id, size);
+    var t_seed = 0.0;
+    if flag_enabled(FLAG_BEAM) {
+        t_seed = beam_seed(id, size);
+    }
+    var hit = traverse(
+        view.camera_position.xyz + dir * t_seed,
+        dir,
+        max_ray_distance() - t_seed,
+    );
+    // Measured from the offset origin; callers want it absolute.
+    hit.t = hit.t + t_seed;
+    return hit;
+}
+
 /// Shadow flag in red: 255 shadowed, 0 lit. Parity test only.
 @compute @workgroup_size(8, 8, 1)
 fn march_shadow(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
     if id.x >= size.x || id.y >= size.y { return; }
 
-    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), max_ray_distance());
+    let hit = primary_hit(id, size);
 
     var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if hit.hit {
@@ -567,7 +648,7 @@ fn march_normal(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
     if id.x >= size.x || id.y >= size.y { return; }
 
-    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), max_ray_distance());
+    let hit = primary_hit(id, size);
 
     var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if hit.hit {
@@ -583,7 +664,7 @@ fn march_voxel_id(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
     if id.x >= size.x || id.y >= size.y { return; }
 
-    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), max_ray_distance());
+    let hit = primary_hit(id, size);
 
     var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if hit.hit {
@@ -604,7 +685,7 @@ fn march_identity(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
     if id.x >= size.x || id.y >= size.y { return; }
 
-    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), max_ray_distance());
+    let hit = primary_hit(id, size);
 
     var colour = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     if hit.hit {
@@ -620,7 +701,7 @@ fn march(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
     if id.x >= size.x || id.y >= size.y { return; }
 
-    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), max_ray_distance());
+    let hit = primary_hit(id, size);
 
     var colour = vec3<f32>(0.35, 0.47, 0.70);  // sky
     if hit.hit {

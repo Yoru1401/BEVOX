@@ -185,6 +185,8 @@ fn optimisations_are_measured_against_the_baseline() {
         ("dda", march_flags::DDA),
         ("mask", march_flags::MASK_FILTER),
         ("dda+mask", march_flags::DDA | march_flags::MASK_FILTER),
+        ("beam", march_flags::BEAM),
+        ("all", march_flags::DDA | march_flags::MASK_FILTER | march_flags::BEAM),
     ] {
         let variant = make(flags);
         let (a1, b, a2) = compare_aba(&device, &queue, &baseline, &variant);
