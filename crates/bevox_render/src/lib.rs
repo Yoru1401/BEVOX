@@ -1,8 +1,13 @@
 //! Bevy plugin: uploads voxel data and ray marches it on the GPU.
 
 pub mod camera;
+pub mod pipeline;
+pub mod upload;
 
 use bevy::prelude::*;
+use bevy::render::extract_resource::ExtractResourcePlugin;
+use bevy::render::renderer::{RenderGraph, RenderGraphSystems};
+use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 
 /// Inserted by the plugin so tests can prove it built.
 #[derive(Resource, Debug, PartialEq, Eq)]
@@ -15,7 +20,37 @@ pub struct BevoxRenderPlugin;
 impl Plugin for BevoxRenderPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(BevoxReady)
-            .add_systems(Update, camera::fly_camera_system);
+            .add_plugins(ExtractResourcePlugin::<upload::MarchTarget>::default())
+            .add_plugins(ExtractResourcePlugin::<upload::GpuSceneData>::default())
+            .add_plugins(ExtractResourcePlugin::<upload::ExtractedMarchCamera>::default())
+            .add_systems(
+                Update,
+                (
+                    camera::fly_camera_system,
+                    upload::build_gpu_scene,
+                    upload::track_march_camera,
+                ),
+            );
+
+        // No RenderApp means no renderer, so there is nothing to draw into and
+        // nothing to dispatch. This is also what keeps the MinimalPlugins smoke
+        // test working.
+        if app.get_sub_app(RenderApp).is_none() {
+            return;
+        }
+        app.add_systems(Startup, upload::create_march_target);
+
+        let render_app = app.sub_app_mut(RenderApp);
+        render_app
+            .add_systems(RenderStartup, pipeline::init_march_pipeline)
+            .add_systems(
+                Render,
+                pipeline::prepare_march_buffers.in_set(RenderSystems::Prepare),
+            )
+            .add_systems(
+                RenderGraph,
+                pipeline::dispatch_march.in_set(RenderGraphSystems::Begin),
+            );
     }
 }
 

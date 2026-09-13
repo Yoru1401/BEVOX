@@ -484,6 +484,7 @@ version = "0.1.0"
 dependencies = [
  "bevox_core",
  "bevy",
+ "bytemuck",
 ]
 
 [[package]]

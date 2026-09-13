@@ -11,6 +11,30 @@
 **Spec:** `docs/superpowers/specs/2026-09-13-bevox-raymarcher-core-design.md`
 **Predecessor:** `docs/superpowers/plans/2026-09-13-bevox-core-and-reference-marcher.md` (milestones 1–2, complete)
 
+## API facts verified during Task 4
+
+Recorded here because several differ from what this plan originally assumed.
+
+- `RenderGraph` is a `ScheduleLabel` in `bevy::render::renderer`, with shipped
+  system sets `RenderGraphSystems::{Begin, Render, Submit, Finish}` chained in
+  that order. Bevy's own core pipeline uses
+  `camera_driver.in_set(RenderGraphSystems::Render)`; our compute dispatch goes
+  in `Begin`. `CameraDriverLabel` does not exist in `bevy_render`.
+- Bind-group helpers moved to the **`bevy_material`** crate:
+  `bevy::material::bind_group_layout_entries::{BindGroupLayoutEntries,
+  binding_types::*}` and `bevy::material::descriptor::BindGroupLayoutDescriptor`.
+- `ComputePipelineDescriptor.layout` takes `Vec<BindGroupLayoutDescriptor>`, not
+  created layouts. Building a bind group still needs a created `BindGroupLayout`,
+  so `init_march_pipeline` makes both from one set of entries.
+- `uniform_buffer::<T>()` requires `T: ShaderType`. `MarchUniform` is a plain
+  `Pod` struct, so it uses `uniform_buffer_sized(false, NonZero::new(size))`.
+- `GlobalTransform::compute_matrix` is now `to_matrix`.
+- `WindowResolution` implements `From<(u32, u32)>`, not `From<(f32, f32)>`.
+- `EventReader` is gone; 0.19 uses `MessageReader`.
+- `AssetPlugin::file_path` resolves relative to the **executable**, not the
+  workspace root, so the app sets it absolute via
+  `concat!(env!("CARGO_MANIFEST_DIR"), "/../bevox_render/assets")`.
+
 ## Global Constraints
 
 - Rust edition 2024, `rust-version = "1.95"`. Native desktop only; never add a `wasm32` path.
@@ -1028,8 +1052,7 @@ pub mod pipeline;
 pub mod upload;
 
 use bevy::render::extract_resource::ExtractResourcePlugin;
-use bevy::render::graph::CameraDriverLabel;
-use bevy::render::render_graph::RenderGraph;
+use bevy::render::renderer::{RenderGraph, RenderGraphSystems};
 use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 
 impl Plugin for BevoxRenderPlugin {
@@ -1059,16 +1082,22 @@ impl Plugin for BevoxRenderPlugin {
                 Render,
                 pipeline::prepare_march_buffers.in_set(RenderSystems::Prepare),
             )
-            .add_systems(RenderGraph, pipeline::dispatch_march.before(CameraDriverLabel));
+            .add_systems(
+                RenderGraph,
+                pipeline::dispatch_march.in_set(RenderGraphSystems::Begin),
+            );
     }
 }
 ```
 
-> **This is the line Step 1 exists for.** `add_systems(RenderGraph, ...)`
-> ordered before the camera driver matches a documented 0.19 example, but the
-> label type and import path (`RenderGraph` as a schedule label,
-> `CameraDriverLabel` as the ordering target) are the part not verified. If the
-> installed crate disagrees, use what it says and correct this plan.
+> **Step 1's discovery, recorded.** Verified against bevy_render 0.19.1:
+> `RenderGraph` is a `ScheduleLabel` in `bevy_render::renderer`, and ordering
+> uses the shipped system sets `RenderGraphSystems::{Begin, Render, Submit,
+> Finish}`, chained in that order. Bevy's own core pipeline registers
+> `camera_driver.in_set(RenderGraphSystems::Render)`, so our dispatch goes in
+> `Begin` — the texture must be written before the sprite that samples it is
+> drawn. The plan originally said `.before(CameraDriverLabel)`; that label does
+> not exist in bevy_render at all.
 
 - [ ] **Step 12: Point the app at a 3D camera**
 
