@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:www.youtube.com)",
+      "PowerShell($y = Get-Command yt-dlp -ErrorAction SilentlyContinue; if \\($y\\) { \"yt-dlp: \" + $y.Source } else { \"no yt-dlp\" }; $p = Get-Command python -ErrorAction SilentlyContinue; if \\($p\\) { \"python: \" + $p.Source } else { \"no python\" })",
+      "WebFetch(domain:github.com)",
+      "PowerShell($out = \"C:\\\\Users\\\\Flori\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Flori-Desktop-GameDev-BEVOX\\\\d62ce559-2fea-49c6-9202-7bb4b3694e5e\\\\scratchpad\\\\dd\"; New-Item -ItemType Directory -Force $out | Out-Null; python -m yt_dlp --flat-playlist --print \"%\\(id\\)s|%\\(upload_date\\)s|%\\(duration\\)s|%\\(title\\)s\" \"https://www.youtube.com/@DouglasDwyer/videos\" | Out-File -Encoding utf8 \"$out\\\\list.txt\"; Get-Content \"$out\\\\list.txt\")",
+      "PowerShell($s = \"C:\\\\Users\\\\Flori\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Flori-Desktop-GameDev-BEVOX\\\\d62ce559-2fea-49c6-9202-7bb4b3694e5e\\\\scratchpad\"; python \"$s\\\\vtt2txt.py\" \"$s\\\\dd\")",
+      "mcp__plugin_context7_context7__resolve-library-id"
+    ]
+  }
+}
