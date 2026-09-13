@@ -162,6 +162,17 @@ pub fn placed_models(data: &DotVoxData) -> Vec<PlacedModel> {
     out
 }
 
+/// Places one of a model's voxels into scene space, still Z-up.
+///
+/// MagicaVoxel's translations position the model's *centre*, not its corner, so
+/// the voxel is measured from that centre before being rotated and moved.
+/// Reversing the two shifts every model by half its own size, which reads as a
+/// scene that is slightly wrong rather than obviously broken.
+pub fn place_voxel(local: UVec3, size: UVec3, placed: &PlacedModel) -> IVec3 {
+    let centred = local.as_ivec3() - (size.as_ivec3() / 2);
+    placed.translation + apply(placed.rotation, centred)
+}
+
 fn identity_rotation() -> [[f32; 3]; 3] {
     [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
 }
@@ -288,6 +299,55 @@ mod tests {
         assert_eq!(placed.len(), 2);
         assert_eq!(placed[0].translation, IVec3::new(10, 0, 0));
         assert_eq!(placed[1].translation, IVec3::new(-10, 0, 0));
+    }
+
+    fn placed_at(t: (i32, i32, i32)) -> PlacedModel {
+        PlacedModel {
+            model_id: 0,
+            translation: IVec3::new(t.0, t.1, t.2),
+            rotation: identity_rotation(),
+        }
+    }
+
+    #[test]
+    fn an_untransformed_model_keeps_its_shape_around_the_origin() {
+        let size = UVec3::new(4, 4, 4);
+        // The centre voxel of a 4-cube sits at local (2,2,2), which maps to 0.
+        assert_eq!(place_voxel(UVec3::new(2, 2, 2), size, &placed_at((0, 0, 0))), IVec3::ZERO);
+        assert_eq!(
+            place_voxel(UVec3::new(0, 0, 0), size, &placed_at((0, 0, 0))),
+            IVec3::new(-2, -2, -2)
+        );
+    }
+
+    #[test]
+    fn translation_moves_the_whole_model() {
+        let size = UVec3::new(4, 4, 4);
+        assert_eq!(
+            place_voxel(UVec3::new(2, 2, 2), size, &placed_at((10, 20, 30))),
+            IVec3::new(10, 20, 30)
+        );
+    }
+
+    #[test]
+    fn a_quarter_turn_about_z_swaps_x_and_y() {
+        // Signed permutation: x <- -y, y <- x.
+        let rotation = [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let placed = PlacedModel { model_id: 0, translation: IVec3::ZERO, rotation };
+        let size = UVec3::new(4, 4, 4);
+
+        // Local (3,2,2) is +1 on x from the centre; after the turn it is +1 on y.
+        assert_eq!(place_voxel(UVec3::new(3, 2, 2), size, &placed), IVec3::new(0, 1, 0));
+    }
+
+    #[test]
+    fn rotation_happens_before_translation() {
+        let rotation = [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let placed = PlacedModel { model_id: 0, translation: IVec3::new(100, 0, 0), rotation };
+        let size = UVec3::new(4, 4, 4);
+        // Rotating first then translating puts this at (100, 1, 0); translating
+        // first would put it at (0, 101, 0).
+        assert_eq!(place_voxel(UVec3::new(3, 2, 2), size, &placed), IVec3::new(100, 1, 0));
     }
 
     #[test]
