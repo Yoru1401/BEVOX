@@ -22,9 +22,17 @@ pub struct VoxelScene {
 pub struct MarchUniform {
     pub world_from_clip: [[f32; 4]; 4],
     pub camera_position: [f32; 4],
+    /// Normalised direction *toward* the sun.
+    pub sun_direction: [f32; 4],
     /// `[depth, extent, 0, 0]`.
     pub volume_params: [u32; 4],
 }
+
+/// The sun direction the renderer and the parity tests share.
+///
+/// Shared rather than duplicated so a test can never pass by lighting the scene
+/// differently from the thing it is checking.
+pub const SUN_DIRECTION: Vec3 = Vec3::new(0.4, 1.0, 0.25);
 
 /// The storage texture the compute shader writes and a sprite displays.
 #[derive(Resource, Clone, ExtractResource)]
@@ -153,6 +161,7 @@ pub fn march_uniform(world_from_clip: Mat4, camera_position: Vec3, tree: &Contre
     MarchUniform {
         world_from_clip: world_from_clip.to_cols_array_2d(),
         camera_position: camera_position.extend(0.0).to_array(),
+        sun_direction: SUN_DIRECTION.normalize().extend(0.0).to_array(),
         volume_params: [tree.depth(), tree.extent(), 0, 0],
     }
 }
@@ -163,8 +172,8 @@ mod tests {
 
     #[test]
     fn the_uniform_is_the_size_the_shader_expects() {
-        // mat4x4 (64) + vec4 (16) + uvec4 (16)
-        assert_eq!(size_of::<MarchUniform>(), 96);
+        // mat4x4 (64) + vec4 (16) + vec4 sun (16) + uvec4 (16)
+        assert_eq!(size_of::<MarchUniform>(), 112);
         assert_eq!(align_of::<MarchUniform>(), 4);
     }
 

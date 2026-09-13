@@ -8,6 +8,7 @@
 struct MarchUniform {
     world_from_clip: mat4x4<f32>,
     camera_position: vec4<f32>,
+    sun_direction: vec4<f32>,
     volume_params: vec4<u32>,  // [depth, extent, 0, 0]
 };
 
@@ -330,6 +331,39 @@ fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
     );
     let far = view.world_from_clip * vec4<f32>(ndc, 1.0, 1.0);
     return normalize(far.xyz / far.w - view.camera_position.xyz);
+}
+
+/// Whether anything is hit within `max_dist`. Shadow rays do not care which
+/// voxel occludes them, only that one does.
+///
+/// A thin wrapper rather than a second traversal: duplicating the walk would let
+/// the two drift apart, and the shadow path would stop being covered by the
+/// parity test that guards the primary one.
+fn traverse_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
+    return traverse(origin, dir, max_dist).hit;
+}
+
+/// Shadow flag in red: 255 shadowed, 0 lit. Parity test only.
+@compute @workgroup_size(8, 8, 1)
+fn march_shadow(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(output);
+    if id.x >= size.x || id.y >= size.y { return; }
+
+    let hit = traverse(view.camera_position.xyz, primary_ray(id, size), 1000.0);
+
+    var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if hit.hit {
+        let n = implicit_normal(hit.voxel, hit.face_normal);
+        // Offset along the normal so the ray does not immediately re-hit its own
+        // voxel. 0.75 matches bevox_core's reference renderer.
+        let origin = vec3<f32>(hit.voxel) + vec3<f32>(0.5) + n * 0.75;
+        var shadowed = 0.0;
+        if traverse_any(origin, view.sun_direction.xyz, 500.0) {
+            shadowed = 1.0;
+        }
+        colour = vec4<f32>(shadowed, 0.0, 0.0, 1.0);
+    }
+    textureStore(output, vec2<i32>(id.xy), colour);
 }
 
 /// Normal encoded into unsigned bytes, hit flag in alpha. Parity test only.

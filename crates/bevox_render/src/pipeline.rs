@@ -88,6 +88,7 @@ pub fn prepare_march_buffers(
     let uniform_value = MarchUniform {
         world_from_clip: camera.world_from_clip.to_cols_array_2d(),
         camera_position: camera.position.extend(0.0).to_array(),
+        sun_direction: crate::upload::SUN_DIRECTION.normalize().extend(0.0).to_array(),
         volume_params: [scene.depth, scene.extent, 0, 0],
     };
 

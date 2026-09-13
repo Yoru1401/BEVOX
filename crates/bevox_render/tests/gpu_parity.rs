@@ -15,6 +15,7 @@ use wgpu::util::DeviceExt;
 struct TestUniform {
     world_from_clip: [[f32; 4]; 4],
     camera_position: [f32; 4],
+    sun_direction: [f32; 4],
     volume_params: [u32; 4],
 }
 
@@ -66,6 +67,10 @@ fn run_march(
     let uniform = TestUniform {
         world_from_clip: world_from_clip.to_cols_array_2d(),
         camera_position: eye.extend(0.0).to_array(),
+        sun_direction: bevox_render::upload::SUN_DIRECTION
+            .normalize()
+            .extend(0.0)
+            .to_array(),
         volume_params: [tree.depth(), tree.extent(), 0, 0],
     };
 
@@ -329,6 +334,80 @@ fn the_gpu_normals_match_the_cpu() {
 
     assert!(compared > 500, "only {compared} pixels hit geometry; the test is vacuous");
     assert_eq!(mismatches, 0, "{mismatches} normals disagreed (worst {worst}); first {first}");
+}
+
+/// Shadow rays start offset along the normal and stop at the first occluder, so
+/// they exercise the any-hit path and the self-intersection offset together.
+#[test]
+fn the_gpu_shadows_match_the_cpu() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+
+    let tree = parity_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (64u32, 64u32);
+    let eye = Vec3::new(-30.0, 40.0, -30.0);
+    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, width as f32 / height as f32, 0.1, 500.0);
+    let world_from_clip = (projection * view).inverse();
+    let sun = bevox_render::upload::SUN_DIRECTION.normalize();
+
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader file missing");
+    let pixels = run_march(
+        &device,
+        &queue,
+        &shader,
+        "march_shadow",
+        world_from_clip,
+        eye,
+        &tree,
+        &gpu_volume,
+        width,
+        height,
+    );
+
+    let mut stats = MarchStats::default();
+    let mut mismatches = 0usize;
+    let mut lit = 0usize;
+    let mut shadowed = 0usize;
+    let mut first = String::new();
+
+    for y in 0..height {
+        for x in 0..width {
+            let dir = ray_direction(world_from_clip, eye, x, y, width, height);
+            let Some(hit) = march(&tree, Affine3A::IDENTITY, eye, dir, 1000.0, false, &mut stats)
+            else {
+                continue;
+            };
+
+            let n = bevox_core::normal::implicit_normal(&tree, hit.voxel, hit.face_normal);
+            let origin = hit.voxel.as_vec3() + Vec3::splat(0.5) + n * 0.75;
+            let cpu_shadowed =
+                march(&tree, Affine3A::IDENTITY, origin, sun, 500.0, true, &mut stats).is_some();
+
+            let i = ((y * width + x) * 4) as usize;
+            let gpu_shadowed = pixels[i] > 127;
+
+            if cpu_shadowed {
+                shadowed += 1;
+            } else {
+                lit += 1;
+            }
+            if cpu_shadowed != gpu_shadowed {
+                if mismatches == 0 {
+                    first = format!("at ({x},{y}) cpu={cpu_shadowed} gpu={gpu_shadowed}");
+                }
+                mismatches += 1;
+            }
+        }
+    }
+
+    // A run where nothing is shadowed, or everything is, would pass trivially.
+    assert!(shadowed > 0, "no shadowed pixels; the scene or sun makes this test vacuous");
+    assert!(lit > 0, "every pixel shadowed; the scene or sun makes this test vacuous");
+    assert_eq!(mismatches, 0, "{mismatches} shadow decisions disagreed; first {first}");
 }
 
 #[test]
