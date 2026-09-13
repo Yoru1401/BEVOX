@@ -91,7 +91,11 @@ mod tests {
     #[test]
     fn the_plugin_builds_on_a_minimal_app() {
         let mut app = App::new();
-        app.add_plugins(MinimalPlugins).add_plugins(BevoxRenderPlugin);
+        // MinimalPlugins deliberately has no RenderApp, which is the point of
+        // this test. InputPlugin is added because the camera system needs it.
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(bevy::input::InputPlugin)
+            .add_plugins(BevoxRenderPlugin);
         app.update();
         assert!(app.world().get_resource::<BevoxReady>().is_some());
     }
@@ -425,7 +429,7 @@ mod tests {
     #[test]
     fn yaw_accumulates_and_is_unbounded() {
         let (yaw, _) = apply_look(1.0, 0.0, Vec2::new(100.0, 0.0), 0.01);
-        assert!((yaw - 0.0).abs() > 0.0);
+        assert!((yaw - 1.0).abs() > 1e-6, "yaw should have moved off its input");
         // Turning right then left returns to the start.
         let (back, _) = apply_look(yaw, 0.0, Vec2::new(-100.0, 0.0), 0.01);
         assert!((back - 1.0).abs() < 1e-5, "yaw did not return, got {back}");
