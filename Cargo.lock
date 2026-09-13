@@ -473,6 +473,7 @@ dependencies = [
 name = "bevox_core"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "glam",
  "image",
 ]

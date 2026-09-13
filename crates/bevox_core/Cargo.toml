@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
 glam = "0.32"
 
 [dev-dependencies]

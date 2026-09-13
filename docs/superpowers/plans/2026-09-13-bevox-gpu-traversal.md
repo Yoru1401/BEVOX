@@ -170,7 +170,7 @@ git commit -m "feat(render): add bevy plugin and binary crates" -m "Co-Authored-
 
 **Interfaces:**
 - Consumes: `Contree`, `Node`, `NodeArena` from Plan 1.
-- Produces: `GpuNode { mask_lo, mask_hi, child_base, material }` (16 bytes, `Pod`); `GpuVolume::from_contree(&Contree) -> GpuVolume` with fields `nodes: Vec<GpuNode>`, `voxels: Vec<u32>`, `root: GpuNode`, `depth: u32`; methods `node_bytes(&self) -> &[u8]`, `voxel_bytes(&self) -> &[u8]`; free functions `pack_voxels(&[u8]) -> Vec<u32>` and `unpack_voxel(&[u32], usize) -> u8`.
+- Produces: `GpuNode { mask_lo, mask_hi, child_base, material }` (16 bytes, `Pod`); `GpuVolume::from_contree(&Contree) -> GpuVolume` with fields `nodes: Vec<GpuNode>`, `voxels: Vec<u32>`, `root: GpuNode`, `depth: u32`; methods `node_bytes(&self) -> &[u8]`, `voxel_bytes(&self) -> &[u8]`, `buffer_nodes(&self) -> Vec<GpuNode>` (root first, arena shifted by one); free functions `pack_voxels(&[u8]) -> Vec<u32>` and `unpack_voxel(&[u32], usize) -> u8`.
 
 - [ ] **Step 1: Add bytemuck**
 
@@ -1810,44 +1810,15 @@ fn march(@builtin(global_invocation_id) id: vec3<u32>) {
 > this; if you would rather pass the root in the uniform, change both sides
 > together and keep the parity test green.
 
-- [ ] **Step 5: Make the uploader match, and add a test for it**
+- [ ] **Step 5: Upload the root-first buffer**
 
-Add to `crates/bevox_core/src/gpu.rs`:
+`GpuVolume::buffer_nodes()` and its test landed in Task 2 — this plan originally
+introduced them here, which was a forward reference, since Task 4's uploader
+already calls the method.
 
-```rust
-impl GpuVolume {
-    /// Root first, then the arena — the layout the shader expects, where slot
-    /// `n` of the arena lives at index `n + 1`.
-    pub fn buffer_nodes(&self) -> Vec<GpuNode> {
-        let mut out = Vec::with_capacity(self.nodes.len() + 1);
-        out.push(self.root);
-        out.extend_from_slice(&self.nodes);
-        out
-    }
-}
-```
-
-with the test:
-
-```rust
-    #[test]
-    fn buffer_layout_puts_the_root_first_and_shifts_the_arena_by_one() {
-        let mut dense = DenseVolume::new(16).unwrap();
-        dense.set(UVec3::new(1, 1, 1), MaterialId(2));
-        let tree = Contree::from_dense(&dense);
-        let gpu = GpuVolume::from_contree(&tree);
-        let buffer = gpu.buffer_nodes();
-
-        assert_eq!(buffer.len(), gpu.nodes.len() + 1);
-        assert_eq!(buffer[0], gpu.root);
-        for (i, n) in gpu.nodes.iter().enumerate() {
-            assert_eq!(buffer[i + 1], *n, "arena slot {i} should sit at index {}", i + 1);
-        }
-    }
-```
-
-Then change `run_march` in the parity test to upload `volume.buffer_nodes()`
-rather than `volume.nodes`, and change Task 4's uploader to do the same.
+Only the wiring remains: change `run_march` in the parity test to upload
+`volume.buffer_nodes()` rather than `volume.nodes`, and confirm Task 4's
+uploader does the same.
 
 - [ ] **Step 6: Run the parity test**
 
