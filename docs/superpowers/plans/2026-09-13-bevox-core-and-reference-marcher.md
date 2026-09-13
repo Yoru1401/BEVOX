@@ -395,7 +395,7 @@ impl Node {
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p bevox_core`
-Expected: PASS, 9 tests.
+Expected: PASS, 10 tests (3 material, 6 node, 1 address).
 
 - [ ] **Step 6: Commit**
 
