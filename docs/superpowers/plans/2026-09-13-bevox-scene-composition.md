@@ -1051,6 +1051,36 @@ git commit -m "feat: load whole MagicaVoxel scenes" -m "Co-Authored-By: Claude O
 
 ---
 
+## Measurements
+
+Composed on a GTX 1650, release build, from `vox_info`:
+
+| file | models | voxels | composed extent | arena nodes | voxel bytes | compose |
+|---|---|---|---|---|---|---|
+| Church_Of_St_Sophia | 571 | 14.3M | 4096 | 977k | 14.3 MB | 2.12s |
+| castle | 455 | 22.0M | 4096 | 712k | 18.3 MB | 2.06s |
+| custom | 50 | 2.6M | 256 | 60k | 3.5 MB | 0.24s |
+| nuke | 1193 | 27.7M | 4096 | 909k | 27.7 MB | 2.62s |
+| sponza | 64 | 5.1M | 1024 | 264k | 5.1 MB | 0.54s |
+
+Nothing was rejected, and three of five need the raised 4096 cap. A dense
+intermediate at extent 4096 would be 68 GB; the same scene is about 30 MB as a
+contree, which is what makes the sparse builder load-bearing rather than an
+optimisation.
+
+Frame times at 1280x720, Church at extent 4096:
+
+| camera | frame time | fps |
+|---|---|---|
+| framed at 1.1 extents | 16.6 ms | 60, vsync-locked |
+| close to geometry | 37-101 ms | 10-27 |
+
+This is milestone 8's argument. Cost rises sharply when geometry fills the
+screen: more pixels hit, every hit casts a shadow ray, and every ray descends
+through near-field nodes where the current shader linearly scans all 64 children
+of each node regardless of how few are occupied. DDA within bricks, the bitmask
+filter and the beam prepass all target exactly that case.
+
 ## What this plan deliberately does not do
 
 No animation: only the first frame of each transform is read. No layer
