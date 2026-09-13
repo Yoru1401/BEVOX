@@ -5,6 +5,7 @@
 //! arbitrary where our volumes are powers of four, and its in-memory palette
 //! indices are zero-based where ours reserve zero for empty space.
 
+use crate::contree::Contree;
 use crate::dense::DenseVolume;
 use crate::material::{Material, MaterialId, MaterialTable};
 use dot_vox::{DotVoxData, Frame, SceneNode};
@@ -29,7 +30,7 @@ impl core::fmt::Display for VoxError {
                 write!(f, "model {index} requested but the file has {count}")
             }
             VoxError::TooLarge { extent } => {
-                write!(f, "model needs an extent of {extent}, beyond the 1024 limit")
+                write!(f, "needs an extent of {extent}, beyond the {MAX_EXTENT} limit")
             }
         }
     }
@@ -37,16 +38,91 @@ impl core::fmt::Display for VoxError {
 
 impl core::error::Error for VoxError {}
 
-/// Smallest power of four that fits `size`, or `None` beyond 1024.
+/// The largest volume the engine will build. The shader's stack is eight deep,
+/// so depth six is within reach; VRAM is the practical limit beyond this.
+pub const MAX_EXTENT: u32 = 4096;
+
+/// Smallest power of four that fits `size`, or `None` past [`MAX_EXTENT`].
 pub fn fitting_extent(size: u32) -> Option<u32> {
     let mut extent = 4u32;
     while extent < size {
         extent *= 4;
-        if extent > 1024 {
+        if extent > MAX_EXTENT {
             return None;
         }
     }
     Some(extent)
+}
+
+/// Bounds of a composed scene, in our Y-up space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SceneBounds {
+    pub min: IVec3,
+    pub max: IVec3,
+}
+
+impl SceneBounds {
+    /// Smallest legal volume extent that holds these bounds.
+    pub fn extent(&self) -> Option<u32> {
+        let span = (self.max - self.min) + IVec3::ONE;
+        let longest = span.x.max(span.y).max(span.z).max(1) as u32;
+        fitting_extent(longest)
+    }
+}
+
+/// Composes every model in the file into one volume.
+///
+/// Two passes: place every voxel to measure the bounds, then shift into a volume
+/// that starts at the origin. Models sitting at negative scene coordinates are
+/// common, and clipping them instead of shifting would delete geometry silently.
+pub fn import_scene(data: &DotVoxData) -> Result<(Contree, MaterialTable), VoxError> {
+    if data.models.is_empty() {
+        return Err(VoxError::NoModels);
+    }
+
+    let placed = placed_models(data);
+    let mut points: Vec<(IVec3, MaterialId)> = Vec::new();
+    let mut min = IVec3::splat(i32::MAX);
+    let mut max = IVec3::splat(i32::MIN);
+
+    for p in &placed {
+        let Some(m) = data.models.get(p.model_id as usize) else {
+            continue;
+        };
+        let size = UVec3::new(m.size.x, m.size.y, m.size.z);
+        for v in &m.voxels {
+            let vox_space = place_voxel(UVec3::new(v.x as u32, v.y as u32, v.z as u32), size, p);
+            // Z-up to Y-up, the same swap single-model import performs.
+            let ours = IVec3::new(vox_space.x, vox_space.z, vox_space.y);
+            min = min.min(ours);
+            max = max.max(ours);
+            points.push((ours, MaterialId(v.i.saturating_add(1))));
+        }
+    }
+
+    if points.is_empty() {
+        return Err(VoxError::NoModels);
+    }
+
+    let bounds = SceneBounds { min, max };
+    let extent = bounds.extent().ok_or_else(|| {
+        let span = (max - min) + IVec3::ONE;
+        VoxError::TooLarge { extent: span.x.max(span.y).max(span.z) as u32 }
+    })?;
+
+    let shifted: Vec<(UVec3, MaterialId)> =
+        points.into_iter().map(|(p, m)| ((p - min).as_uvec3(), m)).collect();
+
+    let tree = Contree::from_voxels(extent, &shifted);
+
+    let mut materials = MaterialTable::new();
+    for c in data.palette.iter().take(255) {
+        materials
+            .push(Material { color: [c.r, c.g, c.b, c.a] })
+            .expect("at most 255 entries are pushed");
+    }
+
+    Ok((tree, materials))
 }
 
 /// Converts one model to a padded volume plus its palette.
@@ -404,7 +480,9 @@ mod tests {
         assert_eq!(fitting_extent(64), Some(64));
         assert_eq!(fitting_extent(126), Some(256));
         assert_eq!(fitting_extent(1024), Some(1024));
-        assert_eq!(fitting_extent(1025), None);
+        assert_eq!(fitting_extent(1025), Some(4096));
+        assert_eq!(fitting_extent(4096), Some(4096));
+        assert_eq!(fitting_extent(4097), None);
     }
 
     #[test]
@@ -465,7 +543,100 @@ mod tests {
 
     #[test]
     fn an_oversized_model_is_rejected() {
-        let data = model((2000, 4, 4), &[]);
-        assert_eq!(import_model(&data, 0).unwrap_err(), VoxError::TooLarge { extent: 2000 });
+        let data = model((5000, 4, 4), &[]);
+        assert_eq!(import_model(&data, 0).unwrap_err(), VoxError::TooLarge { extent: 5000 });
+    }
+
+    #[test]
+    fn an_empty_scene_is_an_error() {
+        let mut data = model((4, 4, 4), &[]);
+        data.models.clear();
+        data.scenes.clear();
+        assert!(matches!(import_scene(&data), Err(VoxError::NoModels)));
+    }
+
+    /// Counts the solid voxels of a composed scene.
+    fn solid_count(tree: &Contree) -> usize {
+        let dense = tree.to_dense();
+        let mut n = 0;
+        for z in 0..dense.extent() {
+            for y in 0..dense.extent() {
+                for x in 0..dense.extent() {
+                    if !dense.get(UVec3::new(x, y, z)).is_empty() {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn two_models_placed_apart_both_appear() {
+        let mut data = model((4, 4, 4), &[(0, 0, 0, 0), (3, 3, 3, 0)]);
+        data.models.push(vox_model((4, 4, 4), &[(0, 0, 0, 0), (3, 3, 3, 0)]));
+        data.scenes = vec![
+            group_node(vec![1, 3]),
+            transform_node(2, (0, 0, 0)),
+            shape_node(0),
+            transform_node(4, (40, 0, 0)),
+            shape_node(1),
+        ];
+
+        let (tree, _) = import_scene(&data).unwrap();
+        assert_eq!(solid_count(&tree), 4, "two models of two voxels each");
+    }
+
+    #[test]
+    fn the_composed_volume_starts_at_the_origin() {
+        // Models placed at negative coordinates must be shifted into range, not
+        // clipped away. Silent clipping reads as "the model failed to load".
+        let mut data = model((4, 4, 4), &[(0, 0, 0, 0)]);
+        data.scenes = vec![transform_node(1, (-500, -500, -500)), shape_node(0)];
+
+        let (tree, _) = import_scene(&data).unwrap();
+        assert_eq!(solid_count(&tree), 1, "the voxel was shifted out of existence");
+    }
+
+    #[test]
+    fn a_scene_spanning_too_far_is_rejected() {
+        let mut data = model((4, 4, 4), &[(0, 0, 0, 0)]);
+        data.models.push(vox_model((4, 4, 4), &[(0, 0, 0, 0)]));
+        data.scenes = vec![
+            group_node(vec![1, 3]),
+            transform_node(2, (0, 0, 0)),
+            shape_node(0),
+            transform_node(4, (9000, 0, 0)),
+            shape_node(1),
+        ];
+        assert!(matches!(import_scene(&data), Err(VoxError::TooLarge { .. })));
+    }
+
+    #[test]
+    fn composition_keeps_the_z_up_to_y_up_swap() {
+        // Two voxels differing only along MagicaVoxel's z. After the swap they
+        // must differ along our y and share our z. One voxel would prove
+        // nothing: it defines its own bounds and always lands at the origin.
+        let mut data = model((4, 4, 4), &[(0, 0, 0, 6), (0, 0, 3, 6)]);
+        data.scenes = vec![transform_node(1, (0, 0, 0)), shape_node(0)];
+
+        let (tree, _) = import_scene(&data).unwrap();
+        let dense = tree.to_dense();
+
+        let mut found = Vec::new();
+        for z in 0..dense.extent() {
+            for y in 0..dense.extent() {
+                for x in 0..dense.extent() {
+                    if !dense.get(UVec3::new(x, y, z)).is_empty() {
+                        found.push(UVec3::new(x, y, z));
+                    }
+                }
+            }
+        }
+
+        assert_eq!(found.len(), 2, "both voxels should survive: {found:?}");
+        assert_ne!(found[0].y, found[1].y, "vox z must become our y: {found:?}");
+        assert_eq!(found[0].z, found[1].z, "our z must be unchanged: {found:?}");
+        assert_eq!(found[0].x, found[1].x, "our x must be unchanged: {found:?}");
     }
 }
