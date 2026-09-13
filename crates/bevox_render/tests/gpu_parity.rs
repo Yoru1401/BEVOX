@@ -46,6 +46,27 @@ fn ray_direction(world_from_clip: Mat4, eye: Vec3, x: u32, y: u32, w: u32, h: u3
     (far.truncate() / far.w - eye).normalize()
 }
 
+/// Renders one frame with the given traversal flags and reads it back.
+#[allow(clippy::too_many_arguments)]
+fn run_march_flagged(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &str,
+    entry_point: &str,
+    world_from_clip: Mat4,
+    eye: Vec3,
+    tree: &Contree,
+    volume: &GpuVolume,
+    width: u32,
+    height: u32,
+    flags: u32,
+) -> Vec<u8> {
+    Prepared::new(
+        device, source, entry_point, tree, volume, world_from_clip, eye, width, height, flags,
+    )
+    .read_back(device, queue)
+}
+
 /// Renders one frame with the shared configuration and reads it back.
 #[allow(clippy::too_many_arguments)]
 fn run_march(
@@ -414,6 +435,38 @@ fn a_distant_camera_on_a_large_volume_still_reaches_the_geometry() {
         hits > 20,
         "GPU reached {hits} pixels but the CPU reached {cpu_hits}; the shader is at fault"
     );
+}
+
+/// Flags must reach the shader without disturbing it. With no optimisation
+/// implemented yet, setting every bit must change nothing — and this is the
+/// shape every later bit-identity test takes, so it is worth having green
+/// before anything depends on it.
+#[test]
+fn setting_flags_does_not_change_output_yet() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let tree = parity_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (64u32, 64u32);
+    let eye = Vec3::new(-30.0, 40.0, -30.0);
+    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+    let world_from_clip = (projection * view).inverse();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    for entry in ["march_identity", "march_normal", "march_shadow", "march"] {
+        let off = run_march_flagged(
+            &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume, width,
+            height, 0,
+        );
+        let on = run_march_flagged(
+            &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume, width,
+            height, 0b111,
+        );
+        assert_eq!(off, on, "{entry}: flags changed output before any optimisation exists");
+    }
 }
 
 #[test]

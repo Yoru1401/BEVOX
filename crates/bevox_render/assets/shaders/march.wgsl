@@ -9,8 +9,15 @@ struct MarchUniform {
     world_from_clip: mat4x4<f32>,
     camera_position: vec4<f32>,
     sun_direction: vec4<f32>,
-    volume_params: vec4<u32>,  // [depth, extent, 0, 0]
+    volume_params: vec4<u32>,  // [depth, extent, flags, 0]
 };
+
+// Traversal optimisations, matching bevox_render::upload::march_flags. One
+// binary renders both sides of every comparison, so a bit-identity test cannot
+// accidentally compare two different builds.
+const FLAG_DDA: u32 = 1u;
+const FLAG_MASK_FILTER: u32 = 2u;
+const FLAG_BEAM: u32 = 4u;
 
 @group(0) @binding(0) var<uniform> view: MarchUniform;
 @group(0) @binding(1) var<storage, read> nodes: array<vec4<u32>>;
@@ -22,6 +29,10 @@ const BRICK_EDGE: u32 = 4u;
 const CHILDREN: u32 = 64u;
 const MAX_STEPS: u32 = 4096u;
 const MAX_DEPTH: u32 = 8u;
+
+fn flag_enabled(bit: u32) -> bool {
+    return (view.volume_params.z & bit) != 0u;
+}
 
 fn node_mask_lo(n: vec4<u32>) -> u32 { return n.x; }
 fn node_mask_hi(n: vec4<u32>) -> u32 { return n.y; }

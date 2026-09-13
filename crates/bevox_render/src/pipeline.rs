@@ -92,7 +92,7 @@ pub fn prepare_march_buffers(
         world_from_clip: camera.world_from_clip.to_cols_array_2d(),
         camera_position: camera.position.extend(0.0).to_array(),
         sun_direction: crate::upload::SUN_DIRECTION.normalize().extend(0.0).to_array(),
-        volume_params: [scene.depth, scene.extent, 0, 0],
+        volume_params: [scene.depth, scene.extent, crate::upload::march_flags::DEFAULT, 0],
     };
 
     // Rebuild storage buffers only when the scene changes; the uniform is

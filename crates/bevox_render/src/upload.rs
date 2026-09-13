@@ -27,8 +27,22 @@ pub struct MarchUniform {
     pub camera_position: [f32; 4],
     /// Normalised direction *toward* the sun.
     pub sun_direction: [f32; 4],
-    /// `[depth, extent, 0, 0]`.
+    /// `[depth, extent, march_flags, 0]`.
     pub volume_params: [u32; 4],
+}
+
+/// Traversal optimisations, carried in `volume_params.z`.
+///
+/// One shader renders both sides of every comparison, so a bit-identity test
+/// cannot accidentally compare two different builds.
+pub mod march_flags {
+    pub const NONE: u32 = 0;
+    pub const DDA: u32 = 1;
+    pub const MASK_FILTER: u32 = 2;
+    pub const BEAM: u32 = 4;
+    /// What the app runs. Each optimisation joins this only once it has measured
+    /// faster while staying bit-identical.
+    pub const DEFAULT: u32 = NONE;
 }
 
 /// The sun direction the renderer and the parity tests share.
@@ -163,12 +177,17 @@ pub fn create_march_target(
 ///
 /// `world_from_clip` is the inverse view-projection: the shader multiplies a
 /// clip-space point by it to get a world-space ray target.
-pub fn march_uniform(world_from_clip: Mat4, camera_position: Vec3, tree: &Contree) -> MarchUniform {
+pub fn march_uniform(
+    world_from_clip: Mat4,
+    camera_position: Vec3,
+    tree: &Contree,
+    flags: u32,
+) -> MarchUniform {
     MarchUniform {
         world_from_clip: world_from_clip.to_cols_array_2d(),
         camera_position: camera_position.extend(0.0).to_array(),
         sun_direction: SUN_DIRECTION.normalize().extend(0.0).to_array(),
-        volume_params: [tree.depth(), tree.extent(), 0, 0],
+        volume_params: [tree.depth(), tree.extent(), flags, 0],
     }
 }
 
@@ -186,7 +205,7 @@ mod tests {
     #[test]
     fn volume_params_carry_depth_and_extent() {
         let tree = Contree::empty(3);
-        let u = march_uniform(Mat4::IDENTITY, Vec3::ZERO, &tree);
+        let u = march_uniform(Mat4::IDENTITY, Vec3::ZERO, &tree, march_flags::NONE);
         assert_eq!(u.volume_params[0], 3);
         assert_eq!(u.volume_params[1], 64);
     }
@@ -194,17 +213,29 @@ mod tests {
     #[test]
     fn the_camera_position_survives_into_the_uniform() {
         let tree = Contree::empty(2);
-        let u = march_uniform(Mat4::IDENTITY, Vec3::new(1.0, 2.0, 3.0), &tree);
+        let u = march_uniform(Mat4::IDENTITY, Vec3::new(1.0, 2.0, 3.0), &tree, march_flags::NONE);
         assert_eq!(u.camera_position[0], 1.0);
         assert_eq!(u.camera_position[1], 2.0);
         assert_eq!(u.camera_position[2], 3.0);
     }
 
     #[test]
+    fn flags_land_where_the_shader_reads_them() {
+        let tree = Contree::empty(2);
+        let u = march_uniform(
+            Mat4::IDENTITY,
+            Vec3::ZERO,
+            &tree,
+            march_flags::DDA | march_flags::BEAM,
+        );
+        assert_eq!(u.volume_params[2], 0b101);
+    }
+
+    #[test]
     fn the_matrix_is_stored_column_major_as_wgsl_expects() {
         let m = Mat4::from_translation(Vec3::new(5.0, 6.0, 7.0));
         let tree = Contree::empty(2);
-        let u = march_uniform(m, Vec3::ZERO, &tree);
+        let u = march_uniform(m, Vec3::ZERO, &tree, march_flags::NONE);
         // glam is column-major, and to_cols_array_2d yields columns.
         assert_eq!(u.world_from_clip[3][0], 5.0);
         assert_eq!(u.world_from_clip[3][1], 6.0);
