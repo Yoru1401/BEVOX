@@ -7,8 +7,8 @@
 
 use crate::dense::DenseVolume;
 use crate::material::{Material, MaterialId, MaterialTable};
-use dot_vox::DotVoxData;
-use glam::UVec3;
+use dot_vox::{DotVoxData, Frame, SceneNode};
+use glam::{IVec3, UVec3};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VoxError {
@@ -90,6 +90,112 @@ pub fn import_model(
     Ok((volume, materials))
 }
 
+/// One model, positioned by the scene graph.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlacedModel {
+    pub model_id: u32,
+    /// Translation in MagicaVoxel's Z-up space, of the model's centre.
+    pub translation: IVec3,
+    /// Signed permutation matrix, columns as dot_vox reports them.
+    pub rotation: [[f32; 3]; 3],
+}
+
+/// Upper bound on nodes visited, so a malformed or cyclic graph terminates.
+const MAX_SCENE_NODES: usize = 1 << 20;
+
+/// Flattens the scene graph into placed models.
+///
+/// A file with no graph yields every model at the origin, so single-model files
+/// travel the same path as scenes.
+pub fn placed_models(data: &DotVoxData) -> Vec<PlacedModel> {
+    if data.scenes.is_empty() {
+        return (0..data.models.len() as u32)
+            .map(|model_id| PlacedModel {
+                model_id,
+                translation: IVec3::ZERO,
+                rotation: identity_rotation(),
+            })
+            .collect();
+    }
+
+    let mut out = Vec::new();
+    // Explicit stack rather than recursion: these graphs are file data and can
+    // be deep or malformed.
+    let mut stack = vec![(0u32, IVec3::ZERO, identity_rotation())];
+    let mut visited = 0usize;
+
+    while let Some((index, translation, rotation)) = stack.pop() {
+        visited += 1;
+        if visited > MAX_SCENE_NODES {
+            break;
+        }
+        let Some(node) = data.scenes.get(index as usize) else {
+            continue;
+        };
+
+        match node {
+            SceneNode::Transform { frames, child, .. } => {
+                // Only the first frame is used: animation is out of scope, and a
+                // static import wants the model's resting position.
+                let (t, r) = frames
+                    .first()
+                    .map(frame_transform)
+                    .unwrap_or((IVec3::ZERO, identity_rotation()));
+                let combined_rotation = multiply(rotation, r);
+                let combined_translation = translation + apply(rotation, t);
+                stack.push((*child, combined_translation, combined_rotation));
+            }
+            SceneNode::Group { children, .. } => {
+                // Reversed so children are emitted in file order once popped.
+                for child in children.iter().rev() {
+                    stack.push((*child, translation, rotation));
+                }
+            }
+            SceneNode::Shape { models, .. } => {
+                for m in models {
+                    out.push(PlacedModel { model_id: m.model_id, translation, rotation });
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn identity_rotation() -> [[f32; 3]; 3] {
+    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+}
+
+fn frame_transform(frame: &Frame) -> (IVec3, [[f32; 3]; 3]) {
+    let t = frame.position().map(|p| IVec3::new(p.x, p.y, p.z)).unwrap_or(IVec3::ZERO);
+    let r = frame
+        .orientation()
+        .map(|o| o.to_cols_array_2d())
+        .unwrap_or_else(identity_rotation);
+    (t, r)
+}
+
+/// Column-major matrix product, matching dot_vox's column convention.
+fn multiply(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut out = [[0.0f32; 3]; 3];
+    for c in 0..3 {
+        for r in 0..3 {
+            out[c][r] = (0..3).map(|k| a[k][r] * b[c][k]).sum();
+        }
+    }
+    out
+}
+
+/// Applies a signed permutation matrix to an integer vector.
+fn apply(m: [[f32; 3]; 3], v: IVec3) -> IVec3 {
+    let f = v.as_vec3();
+    IVec3::new(
+        (m[0][0] * f.x + m[1][0] * f.y + m[2][0] * f.z).round() as i32,
+        (m[0][1] * f.x + m[1][1] * f.y + m[2][1] * f.z).round() as i32,
+        (m[0][2] * f.x + m[1][2] * f.y + m[2][2] * f.z).round() as i32,
+    )
+}
+
 /// Reads a `.vox` file and imports its first model.
 pub fn load_vox(path: &std::path::Path) -> Result<(DenseVolume, MaterialTable), VoxError> {
     // A missing file and a file with no models are different faults, and saying
@@ -102,6 +208,116 @@ pub fn load_vox(path: &std::path::Path) -> Result<(DenseVolume, MaterialTable), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dot_vox::{Dict, Frame, SceneNode, ShapeModel};
+    use glam::IVec3;
+
+    /// A transform node carrying a translation, wrapping `child`.
+    fn transform_node(child: u32, t: (i32, i32, i32)) -> SceneNode {
+        let mut attributes = Dict::new();
+        attributes.insert("_t".to_string(), format!("{} {} {}", t.0, t.1, t.2));
+        SceneNode::Transform {
+            attributes: Dict::new(),
+            frames: vec![Frame::new(attributes)],
+            child,
+            layer_id: 0,
+        }
+    }
+
+    fn group_node(children: Vec<u32>) -> SceneNode {
+        SceneNode::Group { attributes: Dict::new(), children }
+    }
+
+    fn shape_node(model_id: u32) -> SceneNode {
+        SceneNode::Shape {
+            attributes: Dict::new(),
+            models: vec![ShapeModel { model_id, attributes: Dict::new() }],
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_scene_graph_places_every_model_at_the_origin() {
+        let mut data = model((4, 4, 4), &[(0, 0, 0, 0)]);
+        data.models.push(vox_model((4, 4, 4), &[(0, 0, 0, 0)]));
+        data.scenes.clear();
+
+        let placed = placed_models(&data);
+        assert_eq!(placed.len(), 2, "both models should be placed");
+        assert!(placed.iter().all(|p| p.translation == IVec3::ZERO));
+    }
+
+    #[test]
+    fn a_transform_above_a_shape_places_that_model() {
+        let mut data = model((4, 4, 4), &[(0, 0, 0, 0)]);
+        data.scenes = vec![transform_node(1, (10, 20, 30)), shape_node(0)];
+
+        let placed = placed_models(&data);
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].model_id, 0);
+        assert_eq!(placed[0].translation, IVec3::new(10, 20, 30));
+    }
+
+    #[test]
+    fn nested_transforms_accumulate() {
+        let mut data = model((4, 4, 4), &[(0, 0, 0, 0)]);
+        // root transform -> group -> transform -> shape
+        data.scenes = vec![
+            transform_node(1, (100, 0, 0)),
+            group_node(vec![2]),
+            transform_node(3, (5, 7, 0)),
+            shape_node(0),
+        ];
+
+        let placed = placed_models(&data);
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].translation, IVec3::new(105, 7, 0));
+    }
+
+    #[test]
+    fn a_group_places_each_of_its_children() {
+        let mut data = model((4, 4, 4), &[(0, 0, 0, 0)]);
+        data.models.push(vox_model((4, 4, 4), &[(0, 0, 0, 0)]));
+        data.scenes = vec![
+            group_node(vec![1, 3]),
+            transform_node(2, (10, 0, 0)),
+            shape_node(0),
+            transform_node(4, (-10, 0, 0)),
+            shape_node(1),
+        ];
+
+        let placed = placed_models(&data);
+        assert_eq!(placed.len(), 2);
+        assert_eq!(placed[0].translation, IVec3::new(10, 0, 0));
+        assert_eq!(placed[1].translation, IVec3::new(-10, 0, 0));
+    }
+
+    #[test]
+    fn a_cycle_in_the_graph_terminates() {
+        // Malformed files exist. A child index pointing back at an ancestor must
+        // not hang the importer.
+        let mut data = model((4, 4, 4), &[(0, 0, 0, 0)]);
+        data.scenes = vec![transform_node(1, (1, 0, 0)), group_node(vec![0])];
+
+        let placed = placed_models(&data);
+        assert!(placed.len() < 100, "walk did not terminate, produced {}", placed.len());
+    }
+
+    #[test]
+    fn a_child_index_past_the_end_is_ignored() {
+        let mut data = model((4, 4, 4), &[(0, 0, 0, 0)]);
+        data.scenes = vec![transform_node(99, (1, 0, 0))];
+        assert!(placed_models(&data).is_empty());
+    }
+
+    /// dot_vox's Model does not implement Clone, so tests build their own.
+    fn vox_model(size: (u32, u32, u32), voxels: &[(u8, u8, u8, u8)]) -> dot_vox::Model {
+        dot_vox::Model {
+            size: dot_vox::Size { x: size.0, y: size.1, z: size.2 },
+            voxels: voxels
+                .iter()
+                .map(|(x, y, z, i)| dot_vox::Voxel { x: *x, y: *y, z: *z, i: *i })
+                .collect(),
+        }
+    }
 
     /// `i` here is dot_vox's in-memory palette index, which is already one less
     /// than the number stored in the file.
@@ -109,13 +325,7 @@ mod tests {
         DotVoxData {
             version: 150,
             index_map: Vec::new(),
-            models: vec![dot_vox::Model {
-                size: dot_vox::Size { x: size.0, y: size.1, z: size.2 },
-                voxels: voxels
-                    .iter()
-                    .map(|(x, y, z, i)| dot_vox::Voxel { x: *x, y: *y, z: *z, i: *i })
-                    .collect(),
-            }],
+            models: vec![vox_model(size, voxels)],
             // Palette entry k is identifiable by its red channel being k.
             palette: (0..256)
                 .map(|i| dot_vox::Color { r: i as u8, g: 0, b: 0, a: 255 })
