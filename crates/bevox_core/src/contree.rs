@@ -209,6 +209,11 @@ pub enum CanonicalError {
 }
 
 impl Contree {
+    /// Replaces the root. Used by the edit path.
+    pub(crate) fn set_root(&mut self, root: Node) {
+        self.root = root;
+    }
+
     /// Root replacement for tests that build deliberately invalid trees.
     /// Integration tests are separate crates, so this has to be public.
     #[doc(hidden)]
