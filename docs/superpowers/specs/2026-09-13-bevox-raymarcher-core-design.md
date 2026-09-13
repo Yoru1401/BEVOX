@@ -53,14 +53,26 @@ Contree storage with 64-bit occupancy masks; DDA traversal with a bitmask filter
 prepass; implicit per-voxel normals; directional sun with hard shadows; `.vox` loading;
 sphere-brush editing with incremental upload; a flying camera; measurement instrumentation.
 
-### Out of scope
+### Deferred, expected later
 
 Streaming or infinite worlds; levels of detail; physics; multiplayer; global illumination,
-ambient occlusion, and path tracing; transparency; modding; WebAssembly or browser builds;
-non-grid-aligned moving objects.
+ambient occlusion, and path tracing; transparency; modding; non-grid-aligned moving
+objects.
+
+These are out of scope for the core, but all are expected to be built afterwards. They are
+therefore treated as known direction rather than speculation — see "Design hedges for
+deferred work" below.
 
 Accepted consequence: with no LOD system, render distance is bounded by the fixed root
 volume extent.
+
+### Permanently excluded
+
+WebAssembly and browser builds. This is a settled decision, not a deferral.
+
+Native desktop may therefore be assumed everywhere: no WebGPU buffer-size ceilings, no
+SharedArrayBuffer threading constraints, and native-only wgpu backend features may be used
+without maintaining a browser fallback path.
 
 ## Architecture
 
@@ -78,6 +90,30 @@ algorithm in a crate that has no knowledge of Bevy means a future Bevy upgrade b
 plumbing rather than the engine, and means the algorithms can be tested without a GPU or a
 window.
 
+## Design hedges for deferred work
+
+Three deferred features would be expensive to retrofit and are nearly free to anticipate.
+In each case the hedge is the *shape* of a signature or the *meaning* of a field. No
+abstraction layer is built, no machinery is added, and no code exists to support a feature
+that does not exist.
+
+1. **Traversal takes a volume handle and a transform.** `traverse()` is defined over a
+   volume plus an object-to-world transform, even though the core always passes a single
+   volume and the identity transform. Adding non-grid-aligned moving objects later means
+   adding a list and a broad phase, not rewriting the shader's addressing.
+2. **World addressing is by chunk coordinate, never a hardcoded root node.** The core has
+   exactly one chunk, at the origin. Streaming and LODs later add chunks; they do not
+   change how a voxel address is expressed.
+3. **`material` is an index into a material table, not a colour.** In the core, the table
+   holds only a palette colour. Physics later adds density, friction, and restitution
+   columns; transparency adds opacity. Neither changes the node layout or any traversal
+   code.
+
+Deliberately not hedged, because they are additive passes or separate systems and building
+for them now would be speculation: LOD level selection, probe storage for global
+illumination, the corner/edge/face voxel classification that physics needs, and any
+networking structure.
+
 ## Data model
 
 ### Node layout
@@ -86,9 +122,9 @@ window.
 struct Node {          // 16 bytes, std430-compatible
     mask:       u64,   // which of the 64 children (4x4x4) exist
     child_base: u32,   // arena index of the first child; children are contiguous
-    material:   u32,   // meaningful only when mask == 0:
+    material:   u32,   // material table index; meaningful only when mask == 0:
                        //   0        => the region is empty
-                       //   non-zero => the region is solid, of that palette index
+                       //   non-zero => the region is solid, of that material
 }
 ```
 
@@ -113,10 +149,10 @@ The mask serves four purposes at once:
 ### Leaves
 
 Leaf bricks use the same 4x4x4 shape. The mask records which of the 64 voxels are solid,
-and the payload is `popcount(mask)` palette bytes. Memory works out to 16 bytes per node
-plus one byte per solid voxel. `.vox` files and Teardown maps are already
-palette-indexed, so per-voxel colour costs one byte rather than four, with a per-model
-palette of 256 entries.
+and the payload is `popcount(mask)` single-byte material table indices. Memory works out to
+16 bytes per node plus one byte per solid voxel. `.vox` files and Teardown maps are already
+palette-indexed, so per-voxel colour costs one byte rather than four, with up to 256
+materials per model. Index 0 is reserved for empty.
 
 ### Normals
 
