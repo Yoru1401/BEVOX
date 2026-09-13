@@ -37,18 +37,39 @@ fn setup(mut commands: Commands) {
     // 2D camera composites the sprite showing the marched image.
     commands.spawn(Camera2d);
 
+    let (tree, materials) = match std::env::args().nth(1) {
+        Some(path) => match bevox_core::vox::load_vox(std::path::Path::new(&path)) {
+            Ok((volume, materials)) => {
+                info!("loaded {path}: extent {}", volume.extent());
+                (volume.into_contree(), materials)
+            }
+            Err(e) => {
+                // A bad path is a typo, not a crash: say so and show the demo.
+                error!("could not load {path}: {e}");
+                demo_scene()
+            }
+        },
+        None => demo_scene(),
+    };
+
+    // Framed from the volume's extent rather than hardcoded: an imported model
+    // may be 16 or 1024 voxels across, and a fixed position would put the camera
+    // inside the geometry or leave it off screen.
+    let extent = tree.extent() as f32;
+    let centre = Vec3::splat(extent * 0.5);
+    let eye = centre + Vec3::new(-1.0, 1.2, -1.0).normalize() * extent * 1.1;
+
     // 3D camera exists only to supply view and projection matrices to the
     // shader; it renders nothing itself.
     commands.spawn((
         Camera3d::default(),
         Camera { order: -1, is_active: false, ..default() },
-        Transform::from_xyz(-30.0, 40.0, -30.0),
+        Transform::from_translation(eye),
         // Yaw and pitch must agree with the intended direction: the fly camera
         // rewrites the transform's rotation from them every frame.
-        FlyCamera::looking_at(Vec3::new(-30.0, 40.0, -30.0), Vec3::new(32.0, 12.0, 32.0)),
+        FlyCamera::looking_at(eye, centre),
     ));
 
-    let (tree, materials) = demo_scene();
     commands.insert_resource(VoxelScene { tree, materials, generation: 1 });
 }
 

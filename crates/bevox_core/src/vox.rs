@@ -12,6 +12,8 @@ use glam::UVec3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VoxError {
+    /// The file could not be read or parsed at all.
+    ReadFailed,
     NoModels,
     ModelOutOfRange { index: usize, count: usize },
     /// Larger than the biggest volume the engine addresses.
@@ -21,6 +23,7 @@ pub enum VoxError {
 impl core::fmt::Display for VoxError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            VoxError::ReadFailed => write!(f, "the file could not be read as MagicaVoxel data"),
             VoxError::NoModels => write!(f, "the file contains no models"),
             VoxError::ModelOutOfRange { index, count } => {
                 write!(f, "model {index} requested but the file has {count}")
@@ -89,10 +92,10 @@ pub fn import_model(
 
 /// Reads a `.vox` file and imports its first model.
 pub fn load_vox(path: &std::path::Path) -> Result<(DenseVolume, MaterialTable), VoxError> {
-    // The error mapping is deliberately coarse: a parse failure and an empty
-    // file are both "this gave us no model". Refine it when a caller needs to
-    // tell them apart.
-    let data = dot_vox::load(path.to_str().unwrap_or_default()).map_err(|_| VoxError::NoModels)?;
+    // A missing file and a file with no models are different faults, and saying
+    // "contains no models" about a path that does not exist sends the reader
+    // looking in the wrong place.
+    let data = dot_vox::load(path.to_str().unwrap_or_default()).map_err(|_| VoxError::ReadFailed)?;
     import_model(&data, 0)
 }
 
