@@ -7,7 +7,7 @@
 
 use crate::contree::{Contree, level_extent};
 use crate::material::MaterialId;
-use crate::node::{BRICK_EDGE, CHILDREN, Node, child_index};
+use crate::node::{BRICK_EDGE, Node, child_index};
 use glam::{Affine3A, IVec3, UVec3, Vec3};
 
 /// Upper bound on child visits for one ray. Exceeding it reports an overrun and
