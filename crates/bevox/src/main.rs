@@ -100,7 +100,12 @@ impl Default for BrushSettings {
     }
 }
 
-/// Left click paints, right click erases, the wheel resizes the brush.
+/// Left click paints, middle click erases, the wheel resizes the brush.
+///
+/// Erase is on middle, not right, because right-mouse is the exclusive look
+/// control for the fly camera: holding right-mouse rotates the view. A press
+/// on right-mouse that targets look must not also erase, or every camera
+/// rotation would destroy geometry at the crosshair.
 ///
 /// The pick runs against the same tree the renderer draws, so what is clicked
 /// is what was seen. Placing the sphere at the hit point rather than at the
@@ -118,7 +123,7 @@ fn brush_input(
     }
 
     let paint = buttons.just_pressed(MouseButton::Left);
-    let erase = buttons.just_pressed(MouseButton::Right);
+    let erase = buttons.just_pressed(MouseButton::Middle);
     if !paint && !erase {
         return;
     }
