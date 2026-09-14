@@ -116,13 +116,26 @@ pub fn gpu_direction_masks() -> Vec<[u32; 2]> {
         .collect()
 }
 
-/// Rebuilds the GPU-side representation whenever the scene changes.
-pub fn build_gpu_scene(mut commands: Commands, scene: Option<Res<VoxelScene>>) {
+/// Rebuilds the GPU-side representation whenever the scene is replaced.
+///
+/// Gated on `generation`, not on change-detection: `VoxelScene` is mutated by
+/// every brush edit, which would otherwise flag it as changed and trigger a
+/// full CPU rebuild of the whole volume on every click, defeating the dirty-
+/// range upload path entirely. An edit deliberately leaves `generation`
+/// alone; only a full scene load bumps it. Do not restore the `is_changed`
+/// guard here -- that is the bug this comment exists to prevent.
+pub fn build_gpu_scene(
+    mut commands: Commands,
+    scene: Option<Res<VoxelScene>>,
+    existing: Option<Res<GpuSceneData>>,
+) {
     // No scene inserted yet is a normal state, not an error.
     let Some(scene) = scene else {
         return;
     };
-    if !scene.is_changed() {
+    if let Some(existing) = &existing
+        && existing.generation == scene.generation
+    {
         return;
     }
     let volume = GpuVolume::from_contree(&scene.tree);
@@ -305,6 +318,20 @@ pub fn stage_scene_update(scene: &mut VoxelScene) -> SceneUpdate {
 
     scene.tree.arena_mut().clear_dirty();
     update
+}
+
+/// Drains the scene's dirty ranges once per frame.
+///
+/// Runs every frame, not only on edits: the resource it writes must be empty on
+/// a quiet frame, or the render world would rewrite the last edit forever.
+pub fn stage_scene_update_system(
+    mut commands: Commands,
+    scene: Option<ResMut<VoxelScene>>,
+) {
+    let Some(mut scene) = scene else {
+        return;
+    };
+    commands.insert_resource(stage_scene_update(&mut scene));
 }
 
 #[cfg(test)]

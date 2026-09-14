@@ -23,14 +23,17 @@ impl Plugin for BevoxRenderPlugin {
             // Always present, so the renderer draws an empty world rather than
             // going dark when no scene has been inserted.
             .init_resource::<upload::GpuSceneData>()
+            .init_resource::<upload::SceneUpdate>()
             .add_plugins(ExtractResourcePlugin::<upload::MarchTarget>::default())
             .add_plugins(ExtractResourcePlugin::<upload::GpuSceneData>::default())
+            .add_plugins(ExtractResourcePlugin::<upload::SceneUpdate>::default())
             .add_plugins(ExtractResourcePlugin::<upload::ExtractedMarchCamera>::default())
             .add_systems(
                 Update,
                 (
                     camera::fly_camera_system,
                     upload::build_gpu_scene,
+                    upload::stage_scene_update_system.after(upload::build_gpu_scene),
                     upload::track_march_camera,
                 ),
             );
