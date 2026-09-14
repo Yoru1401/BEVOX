@@ -3,7 +3,8 @@ use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
 use bevox_core::material::{Material, MaterialId, MaterialTable};
 use bevox_render::BevoxRenderPlugin;
-use bevox_render::camera::FlyCamera;
+use bevox_render::camera::{FlyCamera, fly_camera_system};
+use bevox_render::pick::pick_voxel;
 use bevox_render::upload::VoxelScene;
 
 fn main() {
@@ -36,7 +37,9 @@ fn main() {
             ..default()
         })
         .add_plugins(BevoxRenderPlugin)
+        .init_resource::<BrushSettings>()
         .add_systems(Startup, setup)
+        .add_systems(Update, brush_input.after(fly_camera_system))
         .run();
 }
 
@@ -82,6 +85,75 @@ fn setup(mut commands: Commands) {
     ));
 
     commands.insert_resource(VoxelScene { tree, materials, generation: 1 });
+}
+
+/// What the brush paints and how big it is.
+#[derive(Resource)]
+struct BrushSettings {
+    radius: f32,
+    material: MaterialId,
+}
+
+impl Default for BrushSettings {
+    fn default() -> Self {
+        Self { radius: 4.0, material: MaterialId(1) }
+    }
+}
+
+/// Left click paints, Ctrl+left click erases, the wheel resizes the brush.
+///
+/// Erase is not on right-click: right-mouse is the exclusive look control for
+/// the fly camera, and a press that targets look must not also erase, or
+/// every camera rotation would destroy geometry at the crosshair.
+///
+/// Erase is not on middle-click either: middle is the same physical component
+/// as the resize wheel, so a user scrolling to size the brush who presses
+/// slightly too hard would trigger an irreversible erase at the crosshair.
+///
+/// The pick runs against the same tree the renderer draws, so what is clicked
+/// is what was seen. Placing the sphere at the hit point rather than at the
+/// voxel centre keeps the brush from stepping in whole voxels as the camera
+/// turns.
+fn brush_input(
+    buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
+    mut brush: ResMut<BrushSettings>,
+    mut scene: ResMut<VoxelScene>,
+    camera: Query<(&GlobalTransform, &Projection), With<Camera3d>>,
+) {
+    for event in wheel.read() {
+        brush.radius = (brush.radius + event.y).clamp(1.0, 32.0);
+    }
+
+    if !buttons.just_pressed(MouseButton::Left) {
+        return;
+    }
+    let erase = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    let Ok((transform, projection)) = camera.single() else {
+        return;
+    };
+
+    let eye = transform.translation();
+    let world_from_clip =
+        (projection.get_clip_from_view() * transform.to_matrix().inverse()).inverse();
+    // The crosshair, not the cursor: the fly camera holds the pointer captive
+    // for looking, so the centre of the screen is where the user is aiming.
+    let Some(hit) = pick_voxel(&scene.tree, world_from_clip, eye, Vec2::ZERO) else {
+        return;
+    };
+
+    let material = if erase { MaterialId::EMPTY } else { brush.material };
+    // Paint on the near side of the surface so a click adds material in front
+    // of what was hit rather than burying it inside.
+    let centre = if erase {
+        hit.position
+    } else {
+        hit.position + hit.normal * brush.radius
+    };
+    scene.tree.apply_sphere(centre, brush.radius, material);
+    // Deliberately not bumped: an edit is uploaded by range, and bumping the
+    // generation is what asks for a full rebuild.
 }
 
 /// The same floor, column and carved sphere the parity test uses, so what is on

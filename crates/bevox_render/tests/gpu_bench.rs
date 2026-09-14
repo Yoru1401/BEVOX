@@ -305,3 +305,53 @@ fn close_camera(tree: &bevox_core::contree::Contree, extent: u32) -> (Vec3, Mat4
     let projection = Mat4::perspective_rh(0.9, 1280.0 / 720.0, 0.1, e * 8.0);
     (close, (projection * view).inverse())
 }
+
+/// What an edit actually costs: the CPU rewrite, and the bytes it uploads.
+///
+/// The claim this milestone makes is "editing without full re-upload", and the
+/// number that supports it is the ratio of bytes written to bytes the scene
+/// occupies. Wall-clock time for the write is dominated by queue submission at
+/// these sizes, so bytes are the honest measure and are reported as such.
+#[test]
+#[ignore]
+fn an_edit_uploads_a_fraction_of_the_scene() {
+    let (tree, extent) = bench_scene();
+    let mut scene = bevox_render::upload::VoxelScene {
+        tree,
+        materials: bevox_core::material::MaterialTable::new(),
+        generation: 1,
+    };
+    scene.tree.arena_mut().clear_dirty();
+
+    let whole_nodes = scene.tree.arena().nodes().len() * 16;
+    let whole_voxels = scene.tree.arena().voxels().len();
+    println!(
+        "scene: extent {extent}, {} node bytes, {} voxel bytes",
+        whole_nodes, whole_voxels
+    );
+
+    for radius in [2.0f32, 8.0, 32.0] {
+        let centre = Vec3::splat(extent as f32 * 0.5);
+        let started = std::time::Instant::now();
+        scene.tree.apply_sphere(centre, radius, bevox_core::material::MaterialId(3));
+        let edit_ms = started.elapsed().as_secs_f32() * 1000.0;
+
+        let staged = std::time::Instant::now();
+        let update = bevox_render::upload::stage_scene_update(&mut scene);
+        let stage_ms = staged.elapsed().as_secs_f32() * 1000.0;
+
+        let node_bytes: usize = update.nodes.iter().map(|w| w.nodes.len() * 16).sum();
+        let voxel_bytes: usize = update.voxels.iter().map(|w| w.words.len() * 4).sum();
+        let total = node_bytes + voxel_bytes;
+        println!(
+            "radius {radius:>5}: edit {edit_ms:6.2} ms, stage {stage_ms:5.2} ms, \
+             upload {total:>9} bytes ({:.3}% of the scene) in {} ranges",
+            total as f64 / (whole_nodes + whole_voxels) as f64 * 100.0,
+            update.nodes.len() + update.voxels.len()
+        );
+        assert!(
+            total < whole_nodes + whole_voxels,
+            "radius {radius} uploaded the whole scene; the dirty ranges are not narrowing anything"
+        );
+    }
+}

@@ -1,6 +1,8 @@
 //! Bind group layout, compute pipeline and the dispatch that runs it.
 
-use crate::upload::{ExtractedMarchCamera, GpuSceneData, MarchTarget, MarchUniform, march_flags};
+use crate::upload::{
+    ExtractedMarchCamera, GpuSceneData, MarchTarget, MarchUniform, SceneUpdate, march_flags,
+};
 use bevy::prelude::*;
 use bevy::material::bind_group_layout_entries::BindGroupLayoutEntries;
 use bevy::material::bind_group_layout_entries::binding_types::{
@@ -12,6 +14,7 @@ use bevy::render::render_resource::*;
 use core::num::NonZero;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::texture::GpuImage;
+use bevox_core::gpu::GpuNode;
 
 pub const SHADER_PATH: &str = "shaders/march.wgsl";
 pub const WORKGROUP: u32 = 8;
@@ -22,6 +25,24 @@ pub const BEAM_SCALE: u32 = 8;
 /// built once with the scene, while the window size is only known later, so it
 /// is sized for the largest window rather than resized. 2 MB.
 pub const BEAM_CAPACITY: u32 = (7680 / BEAM_SCALE) * (4320 / BEAM_SCALE);
+
+/// Voxel data budget on the GPU. Checked at upload; exceeding it is an error,
+/// never an allocation attempt.
+pub const VOXEL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Entries to allocate for a scene currently using `high_water` of them.
+///
+/// The headroom is what lets an edit allocate new nodes without forcing the
+/// whole volume to be rebuilt. Doubling is bounded and monotonic; growing by a
+/// fixed slack would stop helping once scenes got large.
+pub fn buffer_capacity_for(high_water: u32) -> u32 {
+    high_water.saturating_mul(2).max(1024)
+}
+
+/// Whether a voxel-word capacity fits the budget.
+pub fn within_voxel_budget(word_capacity: u32) -> bool {
+    u64::from(word_capacity) * 4 <= VOXEL_BUDGET_BYTES
+}
 
 #[derive(Resource)]
 pub struct MarchPipeline {
@@ -42,6 +63,8 @@ pub struct MarchBuffers {
     pub direction_masks: Buffer,
     pub beam: Buffer,
     pub generation: u32,
+    pub node_capacity: u32,
+    pub voxel_word_capacity: u32,
 }
 
 pub fn init_march_pipeline(
@@ -103,6 +126,7 @@ pub fn prepare_march_buffers(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     scene: Option<Res<GpuSceneData>>,
+    update: Option<Res<SceneUpdate>>,
     camera: Option<Res<ExtractedMarchCamera>>,
     existing: Option<Res<MarchBuffers>>,
 ) {
@@ -117,26 +141,48 @@ pub fn prepare_march_buffers(
         volume_params: [scene.depth, scene.extent, crate::upload::march_flags::DEFAULT, 0],
     };
 
-    // Rebuild storage buffers only when the scene changes; the uniform is
-    // rewritten every frame because the camera moves every frame.
+    // Reuse the buffers unless the scene was replaced outright or an edit grew
+    // past the room they have. Both fall through to the rebuild below.
     if let Some(buffers) = existing
         && buffers.generation == scene.generation
+        && update.as_ref().is_none_or(|u| {
+            u.node_high_water < buffers.node_capacity
+                && u.voxel_word_high_water <= buffers.voxel_word_capacity
+        })
     {
         queue.write_buffer(&buffers.uniform, 0, bytemuck::bytes_of(&uniform_value));
+
+        if let Some(update) = update {
+            // Index 0 is the root, which lives outside the arena and so appears
+            // in no dirty range. Arena slot n is therefore at index n + 1.
+            queue.write_buffer(&buffers.nodes, 0, bytemuck::bytes_of(&update.root));
+            for write in &update.nodes {
+                let offset = u64::from(write.start + 1) * size_of::<GpuNode>() as u64;
+                queue.write_buffer(&buffers.nodes, offset, bytemuck::cast_slice(&write.nodes));
+            }
+            for write in &update.voxels {
+                let offset = u64::from(write.start_word) * 4;
+                queue.write_buffer(&buffers.voxels, offset, bytemuck::cast_slice(&write.words));
+            }
+        }
         return;
     }
 
-    // A zero-length storage buffer is invalid, so an empty scene gets padding.
-    let node_bytes = if scene.nodes.is_empty() {
-        vec![0u8; 16]
-    } else {
-        bytemuck::cast_slice(&scene.nodes).to_vec()
-    };
-    let voxel_bytes = if scene.voxels.is_empty() {
-        vec![0u8; 4]
-    } else {
-        bytemuck::cast_slice(&scene.voxels).to_vec()
-    };
+    let node_capacity = buffer_capacity_for(scene.nodes.len() as u32);
+    let voxel_word_capacity = buffer_capacity_for(scene.voxels.len() as u32);
+    if !within_voxel_budget(voxel_word_capacity) {
+        error!(
+            "voxel data needs {} MB, over the {} MB budget; scene not uploaded",
+            u64::from(voxel_word_capacity) * 4 / (1024 * 1024),
+            VOXEL_BUDGET_BYTES / (1024 * 1024)
+        );
+        return;
+    }
+
+    let mut node_bytes = bytemuck::cast_slice(&scene.nodes).to_vec();
+    node_bytes.resize(node_capacity as usize * size_of::<GpuNode>(), 0);
+    let mut voxel_bytes = bytemuck::cast_slice(&scene.voxels).to_vec();
+    voxel_bytes.resize(voxel_word_capacity as usize * 4, 0);
 
     commands.insert_resource(MarchBuffers {
         uniform: device.create_buffer_with_data(&BufferInitDescriptor {
@@ -147,12 +193,12 @@ pub fn prepare_march_buffers(
         nodes: device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("bevox_nodes"),
             contents: &node_bytes,
-            usage: BufferUsages::STORAGE,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         }),
         voxels: device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("bevox_voxels"),
             contents: &voxel_bytes,
-            usage: BufferUsages::STORAGE,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         }),
         beam: device.create_buffer(&BufferDescriptor {
             label: Some("bevox_beam"),
@@ -179,6 +225,8 @@ pub fn prepare_march_buffers(
             usage: BufferUsages::STORAGE,
         }),
         generation: scene.generation,
+        node_capacity,
+        voxel_word_capacity,
     });
 }
 
@@ -252,4 +300,49 @@ pub fn dispatch_march(
         );
     }
     queue.submit([encoder.finish()]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_leaves_room_to_grow() {
+        // Growth headroom exists so that a small edit does not force a full
+        // rebuild; the factor is arbitrary but the property is not.
+        assert!(buffer_capacity_for(1000) > 1000);
+        assert!(buffer_capacity_for(1000) <= 4000, "headroom should be bounded, not unbounded");
+    }
+
+    #[test]
+    fn capacity_is_never_zero() {
+        // A zero-length storage buffer is invalid, so an empty scene still gets
+        // room for something.
+        assert!(buffer_capacity_for(0) >= 1);
+    }
+
+    #[test]
+    fn capacity_is_monotonic() {
+        let mut last = 0;
+        for hw in [0u32, 1, 10, 1_000, 100_000, 1_000_000] {
+            let c = buffer_capacity_for(hw);
+            assert!(c >= hw, "capacity {c} cannot hold {hw} entries");
+            assert!(c >= last, "capacity went backwards as the scene grew");
+            last = c;
+        }
+    }
+
+    #[test]
+    fn the_voxel_budget_is_the_number_the_spec_states() {
+        assert_eq!(VOXEL_BUDGET_BYTES, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_scene_over_the_budget_is_rejected_rather_than_allocated() {
+        // Checked at upload and exceeding it is an error, never an allocation
+        // attempt -- so the check must be on the capacity actually requested.
+        let over = (VOXEL_BUDGET_BYTES / 4) as u32 + 1;
+        assert!(!within_voxel_budget(buffer_capacity_for(over)));
+        assert!(within_voxel_budget(buffer_capacity_for(1000)));
+    }
 }

@@ -6,7 +6,7 @@ use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
 use bevox_core::gpu::GpuVolume;
 use bevox_core::march::{MarchStats, march};
-use bevox_render::upload::march_flags;
+use bevox_render::upload::{VoxelScene, march_flags};
 use bevox_core::material::MaterialId;
 use glam::{Affine3A, Mat4, UVec3, Vec3, Vec4};
 
@@ -880,4 +880,79 @@ fn dda_matches_the_scan_from_inside_the_volume() {
         }
     }
     assert_eq!(total, 0, "DDA lost {total} pixels among isolated voxels");
+}
+
+/// An edited scene uploaded by ranges must render exactly like the same scene
+/// uploaded whole.
+///
+/// This is the milestone's gate. A partial upload that misses a range produces
+/// a scene that is *nearly* right, which is the hardest kind of wrong to see by
+/// eye -- so it is checked pixel for pixel rather than looked at. Several edits
+/// run in sequence because the second one rewrites nodes the first allocated,
+/// which is where a stale offset shows up.
+#[test]
+fn an_incrementally_uploaded_edit_renders_identically() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let (width, height) = (96u32, 96u32);
+    let eye = Vec3::new(-30.0, 40.0, -30.0);
+    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+    let world_from_clip = (projection * view).inverse();
+
+    let edits = [
+        (Vec3::new(32.0, 20.0, 32.0), 7.0, MaterialId(2)),
+        (Vec3::new(20.0, 10.0, 40.0), 5.0, MaterialId(3)),
+        // Erasing is the case that frees nodes rather than allocating them.
+        (Vec3::new(32.0, 20.0, 32.0), 4.0, MaterialId::EMPTY),
+        (Vec3::new(45.0, 14.0, 20.0), 9.0, MaterialId(1)),
+    ];
+
+    // One tree is edited and uploaded incrementally; the other is edited the
+    // same way and uploaded from scratch each time.
+    let mut incremental = VoxelScene {
+        tree: parity_scene(),
+        materials: parity_materials(),
+        generation: 1,
+    };
+    incremental.tree.arena_mut().clear_dirty();
+    let mut whole = parity_scene();
+
+    let volume = GpuVolume::from_contree(&incremental.tree);
+    let prepared = Prepared::new(
+        &device, &shader, "march_identity", &incremental.tree, &volume, world_from_clip, eye,
+        width, height, march_flags::DEFAULT,
+    );
+
+    for (i, (centre, radius, material)) in edits.iter().enumerate() {
+        incremental.tree.apply_sphere(*centre, *radius, *material);
+        whole.apply_sphere(*centre, *radius, *material);
+
+        let update = bevox_render::upload::stage_scene_update(&mut incremental);
+        assert!(
+            update.node_high_water < bevox_render::pipeline::buffer_capacity_for(
+                volume.nodes.len() as u32
+            ),
+            "edit {i} outgrew the buffers; the test needs a bigger starting capacity"
+        );
+        prepared.apply_update(&queue, &update);
+        let got = prepared.read_back(&device, &queue);
+
+        let whole_volume = GpuVolume::from_contree(&whole);
+        let reference = run_march_flagged(
+            &device, &queue, &shader, "march_identity", world_from_clip, eye, &whole,
+            &whole_volume, width, height, march_flags::DEFAULT,
+        );
+
+        let differing = reference.chunks(4).zip(got.chunks(4)).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            differing, 0,
+            "after edit {i}, {differing} of {} pixels differ between the incremental \
+             upload and a full one",
+            width * height
+        );
+    }
 }

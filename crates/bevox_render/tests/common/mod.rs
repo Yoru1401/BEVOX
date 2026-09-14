@@ -142,6 +142,9 @@ pub struct Prepared {
     beam_pipeline: Option<wgpu::ComputePipeline>,
     bind_group: wgpu::BindGroup,
     texture: wgpu::Texture,
+    /// Kept so a test can apply an incremental update the way the app does.
+    node_buffer: wgpu::Buffer,
+    voxel_buffer: wgpu::Buffer,
     width: u32,
     height: u32,
 }
@@ -184,6 +187,15 @@ impl Prepared {
             bytemuck::cast_slice(&volume.voxels).to_vec()
         };
 
+        let node_capacity = bevox_render::pipeline::buffer_capacity_for(nodes.len() as u32);
+        let mut node_bytes = node_bytes;
+        node_bytes.resize(node_capacity as usize * 16, 0);
+
+        let voxel_capacity =
+            bevox_render::pipeline::buffer_capacity_for(volume.voxels.len() as u32);
+        let mut voxel_bytes = voxel_bytes;
+        voxel_bytes.resize(voxel_capacity as usize * 4, 0);
+
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniform"),
             contents: bytemuck::bytes_of(&uniform),
@@ -192,12 +204,12 @@ impl Prepared {
         let node_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("nodes"),
             contents: &node_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let voxel_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("voxels"),
             contents: &voxel_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let palette = parity_materials().to_gpu();
         let beam_dims = (width.div_ceil(BEAM_SCALE).max(1), height.div_ceil(BEAM_SCALE).max(1));
@@ -310,7 +322,7 @@ impl Prepared {
             ],
         });
 
-        Self { pipeline, beam_pipeline, bind_group, texture, width, height }
+        Self { pipeline, beam_pipeline, bind_group, texture, node_buffer, voxel_buffer, width, height }
     }
 
     /// The prepass, when there is one, then the main pass. Separate passes, so
@@ -344,5 +356,26 @@ impl Prepared {
         let mut encoder = device.create_command_encoder(&Default::default());
         self.encode(&mut encoder);
         read_texture(device, queue, encoder, &self.texture, self.width, self.height)
+    }
+
+    /// Writes a staged update exactly the way `prepare_march_buffers` does.
+    ///
+    /// Duplicating the offset arithmetic here would let the test agree with a
+    /// bug, so this mirrors the app's rule explicitly: index 0 is the root,
+    /// arena slot n is at index n + 1.
+    pub fn apply_update(
+        &self,
+        queue: &wgpu::Queue,
+        update: &bevox_render::upload::SceneUpdate,
+    ) {
+        queue.write_buffer(&self.node_buffer, 0, bytemuck::bytes_of(&update.root));
+        for write in &update.nodes {
+            let offset = u64::from(write.start + 1) * 16;
+            queue.write_buffer(&self.node_buffer, offset, bytemuck::cast_slice(&write.nodes));
+        }
+        for write in &update.voxels {
+            let offset = u64::from(write.start_word) * 4;
+            queue.write_buffer(&self.voxel_buffer, offset, bytemuck::cast_slice(&write.words));
+        }
     }
 }
