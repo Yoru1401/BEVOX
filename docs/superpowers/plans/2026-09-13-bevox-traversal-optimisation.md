@@ -279,6 +279,18 @@ Expected: a printed baseline. Record the number in this plan before continuing â
 every later task compares against a baseline measured in the same run, but the
 recorded figure is what says whether the work was worth doing at all.
 
+**Recorded baseline**, GTX 1650, release, 1280x720, camera close to geometry:
+
+| | |
+|---|---|
+| scene | extent 1024, 72,424 arena nodes, 2.1 MB voxel bytes, built in 0.16s |
+| baseline | **36.70 ms per frame**, about 27 fps |
+
+That matches the app's measured 37-101 ms close to geometry, so the synthetic
+scene reproduces the symptom rather than an artificial one. Every later task
+compares against a baseline measured in the same run; this figure is what says
+whether the work was worth doing at all.
+
 - [ ] **Step 4: Commit**
 
 ```bash

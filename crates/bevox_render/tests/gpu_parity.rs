@@ -6,18 +6,13 @@ use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
 use bevox_core::gpu::GpuVolume;
 use bevox_core::march::{MarchStats, march};
+use bevox_render::upload::march_flags;
 use bevox_core::material::MaterialId;
 use glam::{Affine3A, Mat4, UVec3, Vec3, Vec4};
-use wgpu::util::DeviceExt;
 
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct TestUniform {
-    world_from_clip: [[f32; 4]; 4],
-    camera_position: [f32; 4],
-    sun_direction: [f32; 4],
-    volume_params: [u32; 4],
-}
+mod common;
+use common::*;
+
 
 /// Small scene with a floor, a column and a carved sphere: collapsed uniform
 /// regions, subdivided nodes and empty space all in one.
@@ -42,30 +37,7 @@ fn parity_scene() -> Contree {
     tree
 }
 
-/// Colours for `parity_scene`'s two materials. A zeroed palette would make the
-/// display entry point render every surface black, which is indistinguishable
-/// from a broken traversal.
-fn parity_materials() -> bevox_core::material::MaterialTable {
-    use bevox_core::material::{Material, MaterialTable};
-    let mut table = MaterialTable::new();
-    table.push(Material { color: [140, 140, 150, 255] }).unwrap(); // 1: stone
-    table.push(Material { color: [180, 90, 70, 255] }).unwrap(); // 2: brick
-    table
-}
 
-/// One read-only storage binding of the given minimum element size.
-fn storage_entry(binding: u32, min_size: u64) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
-            min_binding_size: wgpu::BufferSize::new(min_size),
-        },
-        count: None,
-    }
-}
 
 /// Same ray construction the shader performs, so both sides march the same rays.
 fn ray_direction(world_from_clip: Mat4, eye: Vec3, x: u32, y: u32, w: u32, h: u32) -> Vec3 {
@@ -75,7 +47,28 @@ fn ray_direction(world_from_clip: Mat4, eye: Vec3, x: u32, y: u32, w: u32, h: u3
     (far.truncate() / far.w - eye).normalize()
 }
 
-/// Binds the full four-resource layout the real shader declares.
+/// Renders one frame with the given traversal flags and reads it back.
+#[allow(clippy::too_many_arguments)]
+fn run_march_flagged(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &str,
+    entry_point: &str,
+    world_from_clip: Mat4,
+    eye: Vec3,
+    tree: &Contree,
+    volume: &GpuVolume,
+    width: u32,
+    height: u32,
+    flags: u32,
+) -> Vec<u8> {
+    Prepared::new(
+        device, source, entry_point, tree, volume, world_from_clip, eye, width, height, flags,
+    )
+    .read_back(device, queue)
+}
+
+/// Renders one frame with the shared configuration and reads it back.
 #[allow(clippy::too_many_arguments)]
 fn run_march(
     device: &wgpu::Device,
@@ -89,130 +82,10 @@ fn run_march(
     width: u32,
     height: u32,
 ) -> Vec<u8> {
-    let uniform = TestUniform {
-        world_from_clip: world_from_clip.to_cols_array_2d(),
-        camera_position: eye.extend(0.0).to_array(),
-        sun_direction: bevox_render::upload::SUN_DIRECTION
-            .normalize()
-            .extend(0.0)
-            .to_array(),
-        volume_params: [tree.depth(), tree.extent(), 0, 0],
-    };
-
-    // Root first, arena shifted by one: the layout the shader indexes.
-    let nodes = volume.buffer_nodes();
-    let node_bytes: Vec<u8> = if nodes.is_empty() {
-        vec![0u8; 16]
-    } else {
-        bytemuck::cast_slice(&nodes).to_vec()
-    };
-    // A zero-length storage buffer is invalid, so an empty volume gets padding.
-    let voxel_bytes: Vec<u8> = if volume.voxels.is_empty() {
-        vec![0u8; 4]
-    } else {
-        bytemuck::cast_slice(&volume.voxels).to_vec()
-    };
-
-    let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("uniform"),
-        contents: bytemuck::bytes_of(&uniform),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
-    let node_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("nodes"),
-        contents: &node_bytes,
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let voxel_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("voxels"),
-        contents: &voxel_bytes,
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let palette = parity_materials().to_gpu();
-    let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("palette"),
-        contents: bytemuck::cast_slice(&palette),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("march"),
-        source: wgpu::ShaderSource::Wgsl(source.into()),
-    });
-    let texture = storage_target(device, width, height);
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-    // An explicit layout, not an auto-derived one. With `layout: None` naga
-    // derives the layout from the bindings an entry point actually uses, so an
-    // entry point that ignores the palette gets four bindings while one that
-    // reads it gets five. Declaring it here mirrors init_march_pipeline, so the
-    // harness tests the layout the app really ships.
-    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("march_layout"),
-        entries: &[
-            storage_entry(1, 16),
-            storage_entry(2, 4),
-            storage_entry(3, 16),
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(size_of::<TestUniform>() as u64),
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 4,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture {
-                    access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            },
-        ],
-    });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("march_pipeline_layout"),
-        bind_group_layouts: &[Some(&layout)],
-        immediate_size: 0,
-    });
-
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("march_pipeline"),
-        layout: Some(&pipeline_layout),
-        module: &module,
-        entry_point: Some(entry_point),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: node_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: voxel_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: palette_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-        ],
-    });
-
-    let mut encoder = device.create_command_encoder(&Default::default());
-    {
-        let mut pass = encoder.begin_compute_pass(&Default::default());
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
-    }
-
-    read_texture(device, queue, encoder, &texture, width, height)
+    Prepared::new(
+        device, source, entry_point, tree, volume, world_from_clip, eye, width, height, 0,
+    )
+    .read_back(device, queue)
 }
 
 /// The display entry point shares `traverse` with `march_identity`, but writes
@@ -565,6 +438,41 @@ fn a_distant_camera_on_a_large_volume_still_reaches_the_geometry() {
     );
 }
 
+/// Flags must reach the shader without disturbing it. With no optimisation
+/// implemented yet, setting every bit must change nothing — and this is the
+/// shape every later bit-identity test takes, so it is worth having green
+/// before anything depends on it.
+#[test]
+fn the_mask_filter_and_beam_together_leave_output_identical() {
+    // MASK_FILTER | BEAM: the one pairing the other two identity tests do not
+    // cover between them. Neither touches shadow rays, so this one can stay
+    // exact where the beam test has to allow a grazing pixel.
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let tree = parity_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (64u32, 64u32);
+    let eye = Vec3::new(-30.0, 40.0, -30.0);
+    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+    let world_from_clip = (projection * view).inverse();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    for entry in ["march_identity", "march_normal", "march_shadow", "march"] {
+        let off = run_march_flagged(
+            &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume, width,
+            height, 0,
+        );
+        let on = run_march_flagged(
+            &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume, width,
+            height, 0b110,
+        );
+        assert_eq!(off, on, "{entry}: the mask filter and beam together changed output");
+    }
+}
+
 #[test]
 fn the_gpu_traversal_agrees_with_the_cpu_reference() {
     let Some((device, queue)) = gpu_device() else {
@@ -648,88 +556,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-fn gpu_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    pollster::block_on(async {
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .ok()?;
-        adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("bevox_test_device"),
-                ..Default::default()
-            })
-            .await
-            .ok()
-    })
-}
 
-/// Copies a texture back as tightly packed RGBA bytes.
-///
-/// Readback rows must be padded to 256 bytes, so the padding is stripped here
-/// rather than leaking into every comparison.
-fn read_texture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    encoder: wgpu::CommandEncoder,
-    texture: &wgpu::Texture,
-    width: u32,
-    height: u32,
-) -> Vec<u8> {
-    let unpadded = width * 4;
-    let padded = unpadded.div_ceil(256) * 256;
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback"),
-        size: (padded * height) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
 
-    let mut encoder = encoder;
-    encoder.copy_texture_to_buffer(
-        texture.as_image_copy(),
-        wgpu::TexelCopyBufferInfo {
-            buffer: &readback,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(padded),
-                rows_per_image: Some(height),
-            },
-        },
-        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-    );
-    queue.submit([encoder.finish()]);
-
-    let slice = readback.slice(..);
-    slice.map_async(wgpu::MapMode::Read, |_| {});
-    device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("device poll failed");
-
-    let data = slice.get_mapped_range();
-    let mut out = Vec::with_capacity((unpadded * height) as usize);
-    for row in 0..height {
-        let start = (row * padded) as usize;
-        out.extend_from_slice(&data[start..start + unpadded as usize]);
-    }
-    drop(data);
-    readback.unmap();
-    out
-}
-
-fn storage_target(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
-    device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("test_target"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    })
-}
 
 /// Runs a shader whose only binding is the output storage texture.
 fn run_flat(
@@ -788,4 +616,268 @@ fn the_harness_can_run_a_trivial_shader() {
     for px in pixels.chunks_exact(4) {
         assert_eq!(px, [255, 0, 0, 255], "unexpected pixel");
     }
+}
+
+/// The whole point of DDA: fewer child tests, byte-for-byte the same image.
+///
+/// Stepping emits cells in ray order; the scan emitted them in nearest-entry
+/// order. Those agree only while cells are equal sized and disjoint — true
+/// within one node, which is why this can be an identity and not a tolerance.
+/// The cameras are chosen to attack that: axis-aligned directions put the ray
+/// exactly on cell boundaries, where `floor` can pick the neighbour the scan
+/// would not have, and a zero direction component makes an exit distance
+/// undefined unless it is special-cased.
+#[test]
+fn dda_leaves_output_bit_identical() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let tree = parity_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (96u32, 96u32);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    let cameras = [
+        // Oblique: the ordinary case, every direction component non-zero.
+        (Vec3::new(-30.0, 40.0, -30.0), Vec3::new(32.0, 12.0, 32.0)),
+        // Straight down one axis: two direction components are exactly zero.
+        (Vec3::new(32.0, 18.0, -40.0), Vec3::new(32.0, 18.0, 32.0)),
+        // Straight down, through the sphere the scene carves out.
+        (Vec3::new(32.0, 90.0, 32.0001), Vec3::new(32.0, 0.0, 32.0)),
+        // Negative direction on every axis, so the DDA steps backwards.
+        (Vec3::new(96.0, 60.0, 96.0), Vec3::new(32.0, 12.0, 32.0)),
+        // Inside the volume, grazing the floor: rays start mid-node, so most
+        // frames are entered somewhere other than at a corner.
+        (Vec3::new(10.0, 7.0, 10.0), Vec3::new(60.0, 7.5, 60.0)),
+    ];
+
+    for (i, (eye, target)) in cameras.iter().enumerate() {
+        let view = Mat4::look_at_rh(*eye, *target, Vec3::Y);
+        let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+        let world_from_clip = (projection * view).inverse();
+
+        for entry in ["march_identity", "march_normal", "march_shadow", "march"] {
+            let off = run_march_flagged(
+                &device, &queue, &shader, entry, world_from_clip, *eye, &tree, &gpu_volume, width,
+                height, march_flags::NONE,
+            );
+            let on = run_march_flagged(
+                &device, &queue, &shader, entry, world_from_clip, *eye, &tree, &gpu_volume, width,
+                height, march_flags::DDA,
+            );
+            let differing = off
+                .chunks(4)
+                .zip(on.chunks(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                differing, 0,
+                "camera {i}, {entry}: DDA changed {differing} of {} pixels",
+                width * height
+            );
+        }
+    }
+}
+
+/// The filter decides which bricks are entered, never what is found inside one.
+///
+/// Combinations are tested too: an optimisation can be individually sound and
+/// wrong in company, and the app runs them together. The cameras are the same
+/// awkward set the DDA test uses, for the same reason — the filter reads the
+/// cell a ray enters a child at, so it inherits every boundary case DDA has.
+#[test]
+fn the_mask_filter_leaves_output_bit_identical() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let tree = parity_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (96u32, 96u32);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    let cameras = [
+        (Vec3::new(-30.0, 40.0, -30.0), Vec3::new(32.0, 12.0, 32.0)),
+        (Vec3::new(32.0, 18.0, -40.0), Vec3::new(32.0, 18.0, 32.0)),
+        (Vec3::new(32.0, 90.0, 32.0001), Vec3::new(32.0, 0.0, 32.0)),
+        (Vec3::new(96.0, 60.0, 96.0), Vec3::new(32.0, 12.0, 32.0)),
+        (Vec3::new(10.0, 7.0, 10.0), Vec3::new(60.0, 7.5, 60.0)),
+    ];
+
+    for (i, (eye, target)) in cameras.iter().enumerate() {
+        let view = Mat4::look_at_rh(*eye, *target, Vec3::Y);
+        let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+        let world_from_clip = (projection * view).inverse();
+
+        for entry in ["march_identity", "march_normal", "march_shadow", "march"] {
+            let reference = run_march_flagged(
+                &device, &queue, &shader, entry, world_from_clip, *eye, &tree, &gpu_volume, width,
+                height, march_flags::NONE,
+            );
+            for flags in [
+                march_flags::MASK_FILTER,
+                march_flags::DDA | march_flags::MASK_FILTER,
+            ] {
+                let got = run_march_flagged(
+                    &device, &queue, &shader, entry, world_from_clip, *eye, &tree, &gpu_volume,
+                    width, height, flags,
+                );
+                let differing =
+                    reference.chunks(4).zip(got.chunks(4)).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differing, 0,
+                    "camera {i}, {entry}, flags {flags:#b}: {differing} of {} pixels differ",
+                    width * height
+                );
+            }
+        }
+    }
+}
+
+/// Thin geometry is what a too-aggressive seed eats first: single-voxel walls
+/// and isolated voxels, which can hide between beam samples.
+fn thin_scene() -> Contree {
+    let extent = 64u32;
+    let mut voxels = Vec::new();
+    // Single-voxel-thick walls on two axes.
+    for a in 0..extent {
+        for b in 0..extent {
+            voxels.push((UVec3::new(a, b, 32), MaterialId(1)));
+            voxels.push((UVec3::new(32, a, b), MaterialId(2)));
+        }
+    }
+    // Isolated voxels scattered off the walls.
+    let mut rng = bevox_core::testing::XorShift64::new(4242);
+    for _ in 0..200 {
+        voxels.push((
+            UVec3::new(rng.next_below(extent), rng.next_below(extent), rng.next_below(extent)),
+            MaterialId(1),
+        ));
+    }
+    Contree::from_voxels(extent, &voxels)
+}
+
+/// A beam prepass seeds full-resolution rays with a distance a coarse pass
+/// proved empty. Seeding even slightly too far skips thin geometry, and the
+/// symptom is holes that appear from some angles and not others — so this
+/// sweeps angles rather than trusting one view.
+///
+/// The combination is tested alongside it because that is what ships: the seed
+/// changes where a ray starts, and both other optimisations change how it walks
+/// from there.
+///
+/// Primary-ray output is exact. Shaded output is allowed a couple of pixels,
+/// and only because of one characterised difference: the scan's slab test is
+/// inclusive, so a ray touching a cell at exactly one point still descends into
+/// it, while a walk can only visit cells it passes through. Shadow rays all
+/// share one direction, so grid-locked origins reach those exact boundaries
+/// systematically where an arbitrary camera direction never does. It is a
+/// convention difference at a zero-measure graze, not lost geometry — which is
+/// what `dda_matches_the_scan_from_inside_the_volume` exists to show.
+#[test]
+fn the_beam_prepass_never_skips_geometry() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let tree = thin_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (128u32, 128u32);
+    let centre = Vec3::splat(32.0);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    for step in 0..8u32 {
+        let angle = step as f32 * std::f32::consts::TAU / 8.0;
+        let eye = centre + Vec3::new(angle.cos() * 90.0, 30.0, angle.sin() * 90.0);
+        let view = Mat4::look_at_rh(eye, centre, Vec3::Y);
+        let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+        let world_from_clip = (projection * view).inverse();
+
+        for entry in ["march_identity", "march_voxel_id", "march_normal", "march_shadow", "march"]
+        {
+            let reference = run_march_flagged(
+                &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume, width,
+                height, march_flags::NONE,
+            );
+            for flags in [
+                march_flags::BEAM,
+                march_flags::DDA | march_flags::MASK_FILTER | march_flags::BEAM,
+            ] {
+                let seeded = run_march_flagged(
+                    &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume,
+                    width, height, flags,
+                );
+                let differing =
+                    reference.chunks(4).zip(seeded.chunks(4)).filter(|(a, b)| a != b).count();
+                // Shadow rays are the only place the graze convention shows.
+                let allowed = if entry == "march" || entry == "march_shadow" { 4 } else { 0 };
+                assert!(
+                    differing <= allowed,
+                    "angle {step}, {entry}, flags {flags:#b}: {differing} of {} pixels differ,                      more than the {allowed} a grazing shadow ray explains",
+                    width * height
+                );
+            }
+        }
+    }
+}
+
+/// Rays that start inside the volume, among voxels with nothing adjacent.
+///
+/// A shadow ray is a primary ray with its origin on a voxel surface, and that
+/// is the one input the outside-the-volume cameras never produce. An isolated
+/// voxel is the hardest thing for a walk to catch: it occupies one cell of one
+/// brick, and missing the cell means missing the voxel entirely.
+#[test]
+fn dda_matches_the_scan_from_inside_the_volume() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let mut voxels = Vec::new();
+    let mut rng = bevox_core::testing::XorShift64::new(99);
+    for _ in 0..400 {
+        voxels.push((
+            UVec3::new(rng.next_below(64), rng.next_below(64), rng.next_below(64)),
+            MaterialId(1),
+        ));
+    }
+    let tree = Contree::from_voxels(64, &voxels);
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (128u32, 128u32);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    // Origins offset from voxel centres the way a shadow ray's is.
+    let eyes = [
+        Vec3::new(32.5, 32.5, 31.75),
+        Vec3::new(20.5, 8.5, 44.25),
+        Vec3::new(5.25, 40.5, 40.5),
+    ];
+    let mut total = 0usize;
+    for (i, eye) in eyes.iter().enumerate() {
+        for step in 0..4u32 {
+            let angle = step as f32 * std::f32::consts::TAU / 4.0;
+            let target = *eye + Vec3::new(angle.cos(), 0.6, angle.sin()) * 20.0;
+            let view = Mat4::look_at_rh(*eye, target, Vec3::Y);
+            let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+            let world_from_clip = (projection * view).inverse();
+            for entry in ["march_identity", "march_voxel_id"] {
+                let scan = run_march_flagged(
+                    &device, &queue, &shader, entry, world_from_clip, *eye, &tree, &gpu_volume,
+                    width, height, march_flags::NONE,
+                );
+                let dda = run_march_flagged(
+                    &device, &queue, &shader, entry, world_from_clip, *eye, &tree, &gpu_volume,
+                    width, height, march_flags::DDA,
+                );
+                let differing =
+                    scan.chunks(4).zip(dda.chunks(4)).filter(|(a, b)| a != b).count();
+                if differing != 0 {
+                    println!("eye {i} step {step} {entry}: {differing} differ");
+                }
+                total += differing;
+            }
+        }
+    }
+    assert_eq!(total, 0, "DDA lost {total} pixels among isolated voxels");
 }
