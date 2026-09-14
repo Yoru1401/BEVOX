@@ -187,6 +187,8 @@ fn optimisations_are_measured_against_the_baseline() {
         ("dda+mask", march_flags::DDA | march_flags::MASK_FILTER),
         ("beam", march_flags::BEAM),
         ("all", march_flags::DDA | march_flags::MASK_FILTER | march_flags::BEAM),
+        ("field", march_flags::DISTANCE_FIELD),
+        ("all+field", march_flags::DEFAULT | march_flags::DISTANCE_FIELD),
     ] {
         let variant = make(flags);
         let (a1, b, a2) = compare_aba(&device, &queue, &baseline, &variant);
@@ -547,6 +549,8 @@ fn the_dispatches_are_timed_by_the_gpu() {
         ("mask", march_flags::MASK_FILTER),
         ("beam", march_flags::BEAM),
         ("all", march_flags::DEFAULT),
+        ("field", march_flags::DISTANCE_FIELD),
+        ("all+field", march_flags::DEFAULT | march_flags::DISTANCE_FIELD),
     ] {
         let prepared = Prepared::new(
             &device, &shader, "march", &tree, &volume, world_from_clip, eye, 1280, 720, flags,
@@ -571,5 +575,44 @@ fn the_dispatches_are_timed_by_the_gpu() {
         } else {
             println!("{name:>6}: {total:7.3} ms total");
         }
+    }
+}
+
+/// What building the distance field costs at load.
+///
+/// The sweep is 13 neighbours x 2 passes over every cell, and at extent 4096
+/// that is 16.7M cells. Scenes already take seconds to compose, so this is
+/// worth knowing rather than assuming: it runs once per load and again on any
+/// rebuild that outgrows the buffers.
+#[test]
+#[ignore]
+fn building_the_field_is_timed() {
+    let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        eprintln!("no assets directory, skipping");
+        return;
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("vox")))
+        .collect();
+    files.sort();
+
+    for path in files {
+        let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let Ok((tree, _)) = bevox_core::vox::load_scene(&path) else {
+            continue;
+        };
+        let started = std::time::Instant::now();
+        let field = bevox_core::distance_field::DistanceField::build(&tree);
+        let ms = started.elapsed().as_secs_f32() * 1000.0;
+        let edge = field.edge();
+        println!(
+            "{name:>22} (extent {:>4}): field {edge}^3 = {:>9} cells, built in {ms:8.1} ms, \
+             {:.1} MB",
+            tree.extent(),
+            field.cells().len(),
+            field.cells().len() as f64 / (1024.0 * 1024.0),
+        );
     }
 }

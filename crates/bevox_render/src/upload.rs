@@ -60,10 +60,12 @@ pub mod march_flags {
     /// What the app runs. Each optimisation joins this only once it has measured
     /// faster while staying bit-identical.
     ///
-    /// All three earned it. A/B/A at 1280x720, extent 1024, close to geometry:
-    /// scan 44.5 ms, mask 39.1, beam 31.2, DDA 22.3, all three 16.1 -- a 63.8%
-    /// gain against 0.2 ms of drift.
-    pub const DEFAULT: u32 = DDA | MASK_FILTER | BEAM;
+    /// All four earned it. A/B/A at 1280x720, extent 1024, close to geometry:
+    /// scan 34.6 ms, mask 30.0, field 22.0, beam 24.5, DDA 19.7, the first
+    /// three 14.0, all four 12.25 -- a 64.6% gain against 0.01 ms of drift.
+    /// The field is worth 12.8% on top of the other three, which is why it is
+    /// here rather than reverted.
+    pub const DEFAULT: u32 = DDA | MASK_FILTER | BEAM | DISTANCE_FIELD;
 }
 
 /// The sun direction the renderer and the parity tests share.
@@ -226,7 +228,10 @@ pub fn build_gpu_scene(
         }
     }
     let volume = GpuVolume::from_contree(&scene.tree);
-    let field = bevox_core::distance_field::DistanceField::build(&scene.tree);
+    // The scene's own field, not a fresh build. `VoxelScene` builds it once at
+    // load and `apply_brush` keeps it current, so rebuilding here would both
+    // discard that work and stall: 930 ms at extent 4096, on a path that also
+    // runs when an edit outgrows the buffers mid-session.
     commands.insert_resource(GpuSceneData {
         nodes: volume.buffer_nodes(),
         voxels: volume.voxels,
@@ -234,8 +239,8 @@ pub fn build_gpu_scene(
         direction_masks: gpu_direction_masks(),
         depth: scene.tree.depth(),
         extent: scene.tree.extent(),
-        field_edge: field.edge(),
-        distance_field: pack_field(&field),
+        field_edge: scene.field.edge(),
+        distance_field: pack_field(&scene.field),
         generation: scene.generation,
     });
 }
