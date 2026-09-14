@@ -264,11 +264,16 @@ mod tests {
     fn the_field_never_over_estimates() {
         let mut rng = crate::testing::XorShift64::new(20260914);
         // 128 is not a legal extent for this 4-ary tree (a power of four is
-        // required); 64 is the nearest valid size and keeps the O(cells x
-        // claimed^3) exhaustive check below fast.
-        let extent = 64u32;
+        // required). 256 is the nearest valid size large enough that most
+        // cells end up genuinely far from a voxel -- a smaller grid packed
+        // with geometry would make every `claimed` zero and the cube check
+        // below a no-op.
+        let extent = 256u32;
         let mut dense = DenseVolume::new(extent).unwrap();
-        for _ in 0..300 {
+        // Forty voxels scattered across 4096 cells, not three hundred: sparse
+        // enough that most cells claim a real, non-zero distance instead of
+        // already holding geometry themselves.
+        for _ in 0..40 {
             dense.set(
                 UVec3::new(
                     rng.next_below(extent),
@@ -282,6 +287,32 @@ mod tests {
         let field = DistanceField::build(&tree);
 
         let cells = extent / CELL_VOXELS;
+        // Precomputed once: `cell_is_empty` walks 4096 voxels per call, and
+        // the exhaustive loop below would otherwise call it millions of
+        // times.
+        let occupied: Vec<bool> = {
+            let mut v = Vec::with_capacity((cells * cells * cells) as usize);
+            for cz in 0..cells {
+                for cy in 0..cells {
+                    for cx in 0..cells {
+                        v.push(!cell_is_empty(&tree, UVec3::new(cx, cy, cz)));
+                    }
+                }
+            }
+            v
+        };
+        let is_occupied = |c: UVec3| occupied[(c.x + c.y * cells + c.z * cells * cells) as usize];
+
+        // The exhaustive check below only means something if some cell
+        // actually claims a non-trivial distance; otherwise every cube is
+        // empty by construction and nothing is verified.
+        let max_claimed = field.cells().iter().copied().max().unwrap_or(0);
+        assert!(
+            max_claimed >= 4,
+            "no cell claims more than {max_claimed}, so the cube check below does almost nothing \
+             -- the scene is too dense or too small for this test to mean anything"
+        );
+
         for cz in 0..cells {
             for cy in 0..cells {
                 for cx in 0..cells {
@@ -297,7 +328,7 @@ mod tests {
                                     continue;
                                 }
                                 assert!(
-                                    cell_is_empty(&tree, n),
+                                    !is_occupied(n),
                                     "cell {c:?} claims {claimed} but {n:?} holds geometry"
                                 );
                             }
@@ -341,7 +372,10 @@ mod tests {
     /// against the tree the paint actually produced.
     #[test]
     fn the_field_is_still_conservative_after_a_paint() {
-        let mut tree = Contree::empty(3);
+        // Extent 256 (`Contree::empty(4)` is 4^4 = 256), for the same reason
+        // as `the_field_never_over_estimates`: a small volume dominated by
+        // the sphere would make the cube check below trivial.
+        let mut tree = Contree::empty(4);
         let mut field = DistanceField::build(&tree);
 
         let centre = Vec3::new(30.0, 30.0, 30.0);
@@ -349,6 +383,31 @@ mod tests {
         field.lower_around(centre, 5.0);
 
         let cells = tree.extent() / CELL_VOXELS;
+        // Precomputed once, after the paint: `cell_is_empty` walks 4096
+        // voxels per call, and the exhaustive loop below would otherwise call
+        // it millions of times.
+        let occupied: Vec<bool> = {
+            let mut v = Vec::with_capacity((cells * cells * cells) as usize);
+            for cz in 0..cells {
+                for cy in 0..cells {
+                    for cx in 0..cells {
+                        v.push(!cell_is_empty(&tree, UVec3::new(cx, cy, cz)));
+                    }
+                }
+            }
+            v
+        };
+        let is_occupied = |c: UVec3| occupied[(c.x + c.y * cells + c.z * cells * cells) as usize];
+
+        // As above: the exhaustive check only means something if some cell
+        // actually claims a non-trivial distance.
+        let max_claimed = field.cells().iter().copied().max().unwrap_or(0);
+        assert!(
+            max_claimed >= 4,
+            "no cell claims more than {max_claimed}, so the cube check below does almost nothing \
+             -- the scene is too dense or too small for this test to mean anything"
+        );
+
         for cz in 0..cells {
             for cy in 0..cells {
                 for cx in 0..cells {
@@ -362,7 +421,7 @@ mod tests {
                                     continue;
                                 }
                                 assert!(
-                                    cell_is_empty(&tree, n),
+                                    !is_occupied(n),
                                     "after painting, cell {c:?} claims {claimed} but {n:?} is solid"
                                 );
                             }
