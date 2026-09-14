@@ -6,7 +6,7 @@ use bevox_core::material::{Material, MaterialId, MaterialTable};
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system};
 use bevox_render::pick::pick_voxel;
-use bevox_render::upload::VoxelScene;
+use bevox_render::upload::{VoxelScene, apply_brush};
 
 fn main() {
     App::new()
@@ -176,15 +176,7 @@ fn brush_input(
     } else {
         hit.position + hit.normal * brush.radius
     };
-    scene.tree.apply_sphere(centre, brush.radius, material);
-    // Only painting needs the field touched: it adds geometry, which lowers
-    // true distances, and a stale field would then over-estimate and let a
-    // ray skip the new geometry. Erasing only raises true distances, so a
-    // stale field merely under-estimates -- costing speed, never correctness
-    // -- and is left alone.
-    if !erase {
-        scene.field_dirty = Some(scene.field.lower_around(centre, brush.radius));
-    }
+    apply_brush(&mut scene, centre, brush.radius, material);
     // Deliberately not bumped: an edit is uploaded by range, and bumping the
     // generation is what asks for a full rebuild.
 }

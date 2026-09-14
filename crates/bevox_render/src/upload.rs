@@ -10,7 +10,7 @@ use bevox_core::contree::Contree;
 use bevox_core::distance_field::DistanceField;
 use bevox_core::gpu::{GpuNode, GpuVolume};
 use bevox_core::mask_table::build_direction_masks;
-use bevox_core::material::MaterialTable;
+use bevox_core::material::{MaterialId, MaterialTable};
 use bytemuck::{Pod, Zeroable};
 use std::ops::Range;
 
@@ -374,6 +374,20 @@ impl Default for SceneUpdate {
     }
 }
 
+/// Applies one brush stroke, updating the distance field only when it must.
+///
+/// This is where the paint/erase asymmetry lives, and it lives here rather
+/// than in the app so it can be tested. Painting adds geometry and lowers true
+/// distances, so a field left stale would over-estimate and rays would skip
+/// the new geometry. Erasing only raises true distances, leaving the field
+/// under-estimating, which costs a little speed and nothing else.
+pub fn apply_brush(scene: &mut VoxelScene, centre: Vec3, radius: f32, material: MaterialId) {
+    scene.tree.apply_sphere(centre, radius, material);
+    if !material.is_empty() {
+        scene.field_dirty = Some(scene.field.lower_around(centre, radius));
+    }
+}
+
 /// Drains the arena's dirty ranges into a delta the render world can write.
 ///
 /// Reads the current arena rather than remembering old values, which is what
@@ -578,10 +592,7 @@ mod tests {
     #[test]
     fn a_paint_stages_the_field_cells_it_lowered() {
         let mut scene = edit_scene();
-        scene.tree.apply_sphere(Vec3::splat(32.0), 6.0, MaterialId(2));
-        // What `brush_input` does: lower the field, then record the range
-        // `lower_around` returned so `stage_scene_update` knows to stage it.
-        scene.field_dirty = Some(scene.field.lower_around(Vec3::splat(32.0), 6.0));
+        apply_brush(&mut scene, Vec3::splat(32.0), 6.0, MaterialId(2));
 
         let update = stage_scene_update(&mut scene);
         assert!(!update.field.is_empty(), "a paint staged no field cells");
@@ -601,7 +612,7 @@ mod tests {
     #[test]
     fn erasing_stages_no_field_cells() {
         let mut scene = edit_scene();
-        scene.tree.apply_sphere(Vec3::splat(32.0), 6.0, MaterialId::EMPTY);
+        apply_brush(&mut scene, Vec3::splat(32.0), 6.0, MaterialId::EMPTY);
         let update = stage_scene_update(&mut scene);
         assert!(update.field.is_empty(), "an erase staged field cells it did not need to");
     }
