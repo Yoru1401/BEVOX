@@ -5,3 +5,20 @@ members = ["crates/bevox_core", "crates/bevox_render", "crates/bevox"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.95"
+
+# Debug info is the reason `cargo test --workspace` was unreliable on a 16 GB
+# machine. It links several large Bevy test binaries at once, each one carrying
+# full debug info for the whole dependency tree, and link.exe runs out of memory
+# (LNK1102, reported by cargo as "linking with `link.exe` failed: exit code:
+# 1102"). A link killed that way leaves a truncated artifact behind, so the NEXT
+# build fails with "can't find crate for bevy" or "only metadata stub found for
+# rlib dependency core" -- errors that point nowhere near the real cause.
+#
+# Dependencies keep no debug info; our own crates keep line tables, which is
+# what a backtrace needs. To step through Bevy itself, raise the package
+# override back to 2 and expect the linker trouble to come with it.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

@@ -19,7 +19,7 @@
 - No new dependencies in any crate.
 - Tests use a seeded `bevox_core::testing::XorShift64`, never a random seed and never an added test framework.
 - Every performance claim comes from interleaved A/B/A runs within a single session. A number measured today is never compared against one recorded yesterday.
-- `cargo test --workspace` is currently broken in this repo for reasons unrelated to any change here: under `resolver = "3"` it unifies `bevox_render`'s `wgpu`/`glam` dev-dependencies differently from a per-crate build and then fails to load the bevy artifact it asks for. **Verify with `cargo test -p bevox_core && cargo test -p bevox_render && cargo test -p bevox`.** Every "Run:" step below uses the per-crate form.
+- ~~`cargo test --workspace` is currently broken in this repo: under `resolver = "3"` it unifies `bevox_render`'s `wgpu`/`glam` dev-dependencies differently from a per-crate build and then fails to load the bevy artifact it asks for.~~ **That diagnosis was wrong and is superseded.** The real cause was `link.exe` running out of memory (LNK1102) while linking several large Bevy test binaries at once, each carrying full debug info; an OOM-killed link left a truncated artifact, and the *next* build reported "can't find crate for bevy", which is what sent the diagnosis down the wrong path. Fixed by cutting debug info in `Cargo.toml`'s dev profile. `cargo test --workspace` works. The per-crate `Run:` steps below still work and were how this plan was executed.
 
 ## Facts the implementer needs that are not obvious from the code
 
@@ -1171,7 +1171,7 @@ No GPU-side picking. A CPU ray per click costs nothing next to a frame of them, 
 
 No change to the arena's allocator. The spec is explicit that the free list per size class is to be replaced "only if fragmentation is demonstrated by measurement", and nothing here measures it. If Task 6 shows an edit uploading far more than it should, that is a finding to record, not licence to rewrite the allocator.
 
-No fix for `cargo test --workspace`. It is broken for reasons that predate this work and it deserves its own task; the per-crate form is the workaround throughout.
+No fix for `cargo test --workspace`. It is broken for reasons that predate this work and it deserves its own task; the per-crate form is the workaround throughout. *(Done afterwards: the cause was linker memory, not feature resolution. See the dev-profile comment in `Cargo.toml`.)*
 
 ## Subsequent work
 

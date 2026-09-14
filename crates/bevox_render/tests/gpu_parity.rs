@@ -326,7 +326,6 @@ fn the_gpu_shadows_match_the_cpu() {
                 continue;
             };
 
-            let n = bevox_core::normal::implicit_normal(&tree, hit.voxel, hit.face_normal);
             // Face normal, matching the shader: a blended corner normal is
             // shorter than the voxel's half-extent on every axis.
             let origin = hit.voxel.as_vec3() + Vec3::splat(0.5) + hit.face_normal * 0.75;
