@@ -45,6 +45,8 @@ pub mod march_flags {
     pub const DDA: u32 = 1;
     pub const MASK_FILTER: u32 = 2;
     pub const BEAM: u32 = 4;
+    /// Advance the ray through empty space the distance field can prove clear.
+    pub const DISTANCE_FIELD: u32 = 8;
     /// What the app runs. Each optimisation joins this only once it has measured
     /// faster while staying bit-identical.
     ///

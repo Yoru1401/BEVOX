@@ -823,6 +823,59 @@ fn the_beam_prepass_never_skips_geometry() {
     }
 }
 
+/// Skipping empty space must not change what is hit.
+///
+/// The field promises a cube of emptiness around each cell; a ray that jumps
+/// further than the promise passes through geometry, and the symptom is holes
+/// that open from some angles and not others. This sweeps angles, and runs the
+/// thin scene, whose single-voxel walls are the thinnest thing a jump can
+/// straddle.
+#[test]
+fn the_distance_field_leaves_output_bit_identical() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let tree = thin_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (96u32, 96u32);
+    let centre = Vec3::splat(32.0);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    for step in 0..8u32 {
+        let angle = step as f32 * std::f32::consts::TAU / 8.0;
+        let eye = centre + Vec3::new(angle.cos() * 90.0, 30.0, angle.sin() * 90.0);
+        let view = Mat4::look_at_rh(eye, centre, Vec3::Y);
+        let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+        let world_from_clip = (projection * view).inverse();
+
+        for entry in ["march_identity", "march_voxel_id", "march_normal", "march"] {
+            let reference = run_march_flagged(
+                &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume, width,
+                height, march_flags::NONE,
+            );
+            for flags in [
+                march_flags::DISTANCE_FIELD,
+                march_flags::DEFAULT | march_flags::DISTANCE_FIELD,
+            ] {
+                let got = run_march_flagged(
+                    &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume,
+                    width, height, flags,
+                );
+                let differing =
+                    reference.chunks(4).zip(got.chunks(4)).filter(|(a, b)| a != b).count();
+                // Shaded output is allowed the documented grazing-shadow pixels.
+                let allowed = if entry == "march" { 4 } else { 0 };
+                assert!(
+                    differing <= allowed,
+                    "angle {step}, {entry}, flags {flags:#b}: {differing} of {} pixels differ",
+                    width * height
+                );
+            }
+        }
+    }
+}
+
 /// Rays that start inside the volume, among voxels with nothing adjacent.
 ///
 /// A shadow ray is a primary ray with its origin on a voxel surface, and that

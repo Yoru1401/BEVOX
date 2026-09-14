@@ -19,6 +19,7 @@ struct MarchUniform {
 const FLAG_DDA: u32 = 1u;
 const FLAG_MASK_FILTER: u32 = 2u;
 const FLAG_BEAM: u32 = 4u;
+const FLAG_DISTANCE_FIELD: u32 = 8u;
 
 @group(0) @binding(0) var<uniform> view: MarchUniform;
 @group(0) @binding(1) var<storage, read> nodes: array<vec4<u32>>;
@@ -33,9 +34,7 @@ const FLAG_BEAM: u32 = 4u;
 // read-access storage texture to negotiate with the adapter.
 @group(0) @binding(6) var<storage, read_write> beam: array<f32>;
 // Distance field: Chebyshev distance to the nearest solid voxel per coarse
-// cell, four cells packed per word. Not read yet -- the traversal does not
-// use it until a later task -- but declared now so this binding is part of
-// the layout the moment it exists, matching MARCH_BINDING_COUNT.
+// cell, four cells packed per word.
 @group(0) @binding(7) var<storage, read> distance_field: array<u32>;
 
 const BRICK_EDGE: u32 = 4u;
@@ -541,6 +540,54 @@ fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
     return normalize(far.xyz / far.w - view.camera_position.xyz);
 }
 
+/// Voxels per field cell, per axis. Must match bevox_core's CELL_VOXELS.
+const FIELD_CELL: f32 = 16.0;
+
+fn field_at(cell: vec3<i32>) -> u32 {
+    let edge = i32(view.field_params.x);
+    if cell.x < 0 || cell.y < 0 || cell.z < 0
+        || cell.x >= edge || cell.y >= edge || cell.z >= edge {
+        return 0u;
+    }
+    let i = u32(cell.x + cell.y * edge + cell.z * edge * edge);
+    return (distance_field[i / 4u] >> ((i % 4u) * 8u)) & 0xFFu;
+}
+
+/// Advances `t` past empty space the field can prove is empty.
+///
+/// The field holds a Chebyshev distance, so a value of `d` at the ray's cell
+/// promises the whole cube of `d` cells around it is empty. Advancing to that
+/// cube's exit plane is therefore safe in any direction, which is the property
+/// a Euclidean field would not give.
+///
+/// Conservative by construction: it never advances past the cube the field
+/// promised, so it cannot skip geometry unless the field itself lied.
+fn skip_empty_space(origin: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, start: f32, max_dist: f32) -> f32 {
+    var t = start;
+    // A ray crosses a bounded number of cubes before it either hits something
+    // or leaves; the bound stops a degenerate direction spinning here.
+    for (var i = 0u; i < 64u; i = i + 1u) {
+        if t > max_dist { return t; }
+        let p = origin + dir * t;
+        let cell = vec3<i32>(floor(p / FIELD_CELL));
+        let d = field_at(cell);
+        if d == 0u { return t; }
+
+        // Exit plane of the cube of `d` cells around this one.
+        let lo = (vec3<f32>(cell) - vec3<f32>(f32(d) - 1.0)) * FIELD_CELL;
+        let hi = (vec3<f32>(cell) + vec3<f32>(f32(d))) * FIELD_CELL;
+        let t0 = (lo - origin) * inv_dir;
+        let t1 = (hi - origin) * inv_dir;
+        let far = max(t0, t1);
+        let exit = min(min(far.x, far.y), far.z);
+        // Nudge past the boundary, or the next sample lands on the same cell
+        // and the loop makes no progress.
+        if exit <= t { return t; }
+        t = exit + 1e-3;
+    }
+    return t;
+}
+
 /// Whether anything is hit within `max_dist`. Shadow rays do not care which
 /// voxel occludes them, only that one does.
 ///
@@ -548,7 +595,11 @@ fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
 /// the two drift apart, and the shadow path would stop being covered by the
 /// parity test that guards the primary one.
 fn traverse_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
-    return traverse(origin, dir, max_dist).hit;
+    var t_seed = 0.0;
+    if flag_enabled(FLAG_DISTANCE_FIELD) {
+        t_seed = skip_empty_space(origin, dir, vec3<f32>(1.0) / dir, 0.0, max_dist);
+    }
+    return traverse(origin + dir * t_seed, dir, max_dist - t_seed).hit;
 }
 
 fn beam_dims(size: vec2<u32>) -> vec2<u32> {
@@ -614,6 +665,9 @@ fn primary_hit(id: vec3<u32>, size: vec2<u32>) -> Hit {
     var t_seed = 0.0;
     if flag_enabled(FLAG_BEAM) {
         t_seed = beam_seed(id, size);
+    }
+    if flag_enabled(FLAG_DISTANCE_FIELD) {
+        t_seed = skip_empty_space(view.camera_position.xyz, dir, vec3<f32>(1.0) / dir, t_seed, max_ray_distance());
     }
     var hit = traverse(
         view.camera_position.xyz + dir * t_seed,
