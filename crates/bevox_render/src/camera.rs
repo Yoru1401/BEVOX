@@ -79,7 +79,9 @@ pub fn fly_camera_system(
     }
 
     for (mut transform, mut cam) in &mut query {
-        if mouse.pressed(MouseButton::Right) {
+        // Middle drag looks. Right is the brush's erase button, and left its
+        // paint button, so look takes the one control neither edits with.
+        if mouse.pressed(MouseButton::Middle) {
             let (yaw, pitch) = apply_look(cam.yaw, cam.pitch, delta, cam.sensitivity);
             cam.yaw = yaw;
             cam.pitch = pitch;

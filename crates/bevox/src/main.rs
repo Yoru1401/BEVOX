@@ -100,15 +100,13 @@ impl Default for BrushSettings {
     }
 }
 
-/// Left click paints, Ctrl+left click erases, the wheel resizes the brush.
+/// Left click paints, right click erases, the wheel resizes the brush.
 ///
-/// Erase is not on right-click: right-mouse is the exclusive look control for
-/// the fly camera, and a press that targets look must not also erase, or
-/// every camera rotation would destroy geometry at the crosshair.
-///
-/// Erase is not on middle-click either: middle is the same physical component
-/// as the resize wheel, so a user scrolling to size the brush who presses
-/// slightly too hard would trigger an irreversible erase at the crosshair.
+/// Camera look is on middle-drag, which is what frees both other buttons for
+/// editing. Two earlier arrangements were bugs: erase on right-click when look
+/// was also on right-click destroyed geometry on every camera rotation, and
+/// erase on middle-click shared a physical control with the resize wheel. Ctrl
+/// is the movement-speed boost and nothing else.
 ///
 /// The pick runs against the same tree the renderer draws, so what is clicked
 /// is what was seen. Placing the sphere at the hit point rather than at the
@@ -116,7 +114,6 @@ impl Default for BrushSettings {
 /// turns.
 fn brush_input(
     buttons: Res<ButtonInput<MouseButton>>,
-    keys: Res<ButtonInput<KeyCode>>,
     mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
     mut brush: ResMut<BrushSettings>,
     mut scene: ResMut<VoxelScene>,
@@ -126,10 +123,11 @@ fn brush_input(
         brush.radius = (brush.radius + event.y).clamp(1.0, 32.0);
     }
 
-    if !buttons.just_pressed(MouseButton::Left) {
+    let paint = buttons.just_pressed(MouseButton::Left);
+    let erase = buttons.just_pressed(MouseButton::Right);
+    if !paint && !erase {
         return;
     }
-    let erase = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let Ok((transform, projection)) = camera.single() else {
         return;
     };
