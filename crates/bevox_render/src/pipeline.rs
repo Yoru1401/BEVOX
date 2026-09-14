@@ -49,9 +49,19 @@ pub fn buffer_capacity_for(high_water: u32) -> u32 {
     high_water.saturating_mul(2).max(1024)
 }
 
-/// Whether a voxel-word capacity fits the budget.
-pub fn within_voxel_budget(word_capacity: u32) -> bool {
-    u64::from(word_capacity) * 4 <= VOXEL_BUDGET_BYTES
+/// Whether the volume's GPU arrays fit the budget.
+///
+/// Both arrays, not only the voxels: the node arena is as much of the volume's
+/// data as the voxel bytes are, and at 16 bytes an entry it is usually the
+/// larger of the two. Checking voxels alone left a scene free to allocate an
+/// unbounded node buffer.
+pub fn within_budget(node_capacity: u32, voxel_word_capacity: u32) -> bool {
+    budget_bytes(node_capacity, voxel_word_capacity) <= VOXEL_BUDGET_BYTES
+}
+
+/// Bytes the two storage buffers would occupy at these capacities.
+pub fn budget_bytes(node_capacity: u32, voxel_word_capacity: u32) -> u64 {
+    u64::from(node_capacity) * size_of::<GpuNode>() as u64 + u64::from(voxel_word_capacity) * 4
 }
 
 #[derive(Resource)]
@@ -183,9 +193,14 @@ pub fn prepare_march_buffers(
 
     let node_capacity = buffer_capacity_for(scene.nodes.len() as u32);
     let voxel_word_capacity = buffer_capacity_for(scene.voxels.len() as u32);
-    if !within_voxel_budget(voxel_word_capacity) {
-        error!(
-            "voxel data needs {} MB, over the {} MB budget; scene not uploaded",
+    if !within_budget(node_capacity, voxel_word_capacity) {
+        // Once, not every frame. The rejection returns without replacing the
+        // buffers, so the condition holds again next frame and an `error!`
+        // here would repeat at frame rate until the scene changed.
+        error_once!(
+            "volume needs {} MB ({} MB of nodes, {} MB of voxels), over the {} MB budget;              scene not uploaded",
+            budget_bytes(node_capacity, voxel_word_capacity) / (1024 * 1024),
+            u64::from(node_capacity) * size_of::<GpuNode>() as u64 / (1024 * 1024),
             u64::from(voxel_word_capacity) * 4 / (1024 * 1024),
             VOXEL_BUDGET_BYTES / (1024 * 1024)
         );
@@ -388,8 +403,27 @@ mod tests {
     fn a_scene_over_the_budget_is_rejected_rather_than_allocated() {
         // Checked at upload and exceeding it is an error, never an allocation
         // attempt -- so the check must be on the capacity actually requested.
-        let over = (VOXEL_BUDGET_BYTES / 4) as u32 + 1;
-        assert!(!within_voxel_budget(buffer_capacity_for(over)));
-        assert!(within_voxel_budget(buffer_capacity_for(1000)));
+        let over_on_voxels = (VOXEL_BUDGET_BYTES / 4) as u32 + 1;
+        assert!(!within_budget(1, buffer_capacity_for(over_on_voxels)));
+        assert!(within_budget(buffer_capacity_for(1000), buffer_capacity_for(1000)));
+    }
+
+    #[test]
+    fn nodes_count_against_the_budget_too() {
+        // A node is 16 bytes, so the node arena is usually the larger array.
+        // Budgeting only the voxels let it grow without a bound.
+        let over_on_nodes = (VOXEL_BUDGET_BYTES / size_of::<GpuNode>() as u64) as u32 + 1;
+        assert!(!within_budget(buffer_capacity_for(over_on_nodes), 1));
+    }
+
+    #[test]
+    fn the_budget_counts_both_arrays_together() {
+        // Each half fits on its own; together they do not.
+        let half = (VOXEL_BUDGET_BYTES / 2) as u32;
+        let nodes = half / size_of::<GpuNode>() as u32;
+        let words = half / 4;
+        assert!(within_budget(nodes, 1));
+        assert!(within_budget(1, words));
+        assert!(!within_budget(nodes + 1, words + 1));
     }
 }

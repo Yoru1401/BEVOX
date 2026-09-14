@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use bevox_core::contree::Contree;
-use bevox_core::gpu::GpuVolume;
+use bevox_core::gpu::{GpuNode, GpuVolume};
 use bevox_core::material::{Material, MaterialTable};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
@@ -189,7 +189,7 @@ impl Prepared {
 
         let node_capacity = bevox_render::pipeline::buffer_capacity_for(nodes.len() as u32);
         let mut node_bytes = node_bytes;
-        node_bytes.resize(node_capacity as usize * 16, 0);
+        node_bytes.resize(node_capacity as usize * size_of::<GpuNode>(), 0);
 
         let voxel_capacity =
             bevox_render::pipeline::buffer_capacity_for(volume.voxels.len() as u32);
@@ -370,7 +370,7 @@ impl Prepared {
     ) {
         queue.write_buffer(&self.node_buffer, 0, bytemuck::bytes_of(&update.root));
         for write in &update.nodes {
-            let offset = u64::from(write.start + 1) * 16;
+            let offset = u64::from(write.start + 1) * size_of::<GpuNode>() as u64;
             queue.write_buffer(&self.node_buffer, offset, bytemuck::cast_slice(&write.nodes));
         }
         for write in &update.voxels {
