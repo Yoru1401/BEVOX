@@ -355,3 +355,129 @@ fn an_edit_uploads_a_fraction_of_the_scene() {
         );
     }
 }
+
+/// One scene's clone cost, A/B/A interleaved, printed as a row.
+fn measure_clone(name: &str, scene: &bevox_render::upload::GpuSceneData) {
+    use bevox_render::upload::scene_copy_is_stale;
+
+    let payload = scene.nodes.len() * size_of::<bevox_core::gpu::GpuNode>()
+        + scene.voxels.len() * 4
+        + scene.palette.len() * 16
+        + scene.direction_masks.len() * 8;
+
+    // Enough iterations to be stable, few enough that a 30 MB payload does not
+    // turn one row into a minute.
+    let iterations = if payload > 8 * 1024 * 1024 { 60 } else { 400 };
+
+    let mut a1 = Vec::new();
+    let mut b = Vec::new();
+    let mut a2 = Vec::new();
+    for _ in 0..3 {
+        a1.push(time_calls(iterations, || {
+            std::hint::black_box(scene.clone());
+        }));
+        b.push(time_calls(iterations, || {
+            // The new path on a quiet frame: ask whether the copy is stale,
+            // find that it is not, and return without touching the payload.
+            std::hint::black_box(scene_copy_is_stale(false, Some(1), 1));
+        }));
+        a2.push(time_calls(iterations, || {
+            std::hint::black_box(scene.clone());
+        }));
+    }
+
+    let a1 = median_of(&mut a1);
+    let b = median_of(&mut b);
+    let a2 = median_of(&mut a2);
+    let drift = (a1 - a2).abs();
+    let saved = (a1 + a2) * 0.5 - b;
+
+    println!(
+        "{name:>22} (extent {:>4}, {:>8.2} MB): clone {a1:6.3}/{a2:6.3} ms  skip {b:.4} ms  saved {saved:6.3} ms ({:5.1}% of a 16.7 ms frame, drift {drift:.3}) {}",
+        scene.extent,
+        payload as f64 / (1024.0 * 1024.0),
+        saved / 16.667 * 100.0,
+        if saved > drift { "" } else { "<- within drift" }
+    );
+}
+
+/// Milliseconds per call, averaged over a batch.
+fn time_calls(iterations: u32, mut f: impl FnMut()) -> f32 {
+    let started = std::time::Instant::now();
+    for _ in 0..iterations {
+        f();
+    }
+    started.elapsed().as_secs_f32() * 1000.0 / iterations as f32
+}
+
+fn median_of(v: &mut [f32]) -> f32 {
+    v.sort_by(f32::total_cmp);
+    v[v.len() / 2]
+}
+
+/// What the per-frame scene clone cost, and what skipping it saves.
+///
+/// `ExtractResourcePlugin` copied the whole `GpuSceneData` into the render
+/// world every frame; `extract_gpu_scene` copies it only when it changed. This
+/// measures the two sides of that on a quiet frame -- one where nothing was
+/// edited, which is almost every frame.
+///
+/// It measures the clone in isolation, NOT end-to-end frame time. That is a
+/// deliberate limit and the number should not be read as a frame-rate claim:
+/// the app is vsync-capped at 60, and this project has already been burned once
+/// by a frame counter that read a healthy 60 while the renderer drew nothing.
+/// What this does show is the CPU work the extract schedule no longer does.
+///
+/// A/B/A interleaved in one process, medians reported with the drift between
+/// the two baseline readings, per this project's measurement rule.
+#[test]
+#[ignore]
+fn the_scene_clone_is_measured_against_not_cloning() {
+    use bevox_core::material::MaterialTable;
+    use bevox_render::upload::{GpuSceneData, gpu_direction_masks};
+
+    let (tree, extent) = bench_scene();
+    let volume = GpuVolume::from_contree(&tree);
+    let scene = GpuSceneData {
+        nodes: volume.buffer_nodes(),
+        voxels: volume.voxels,
+        palette: MaterialTable::new().to_gpu(),
+        direction_masks: gpu_direction_masks(),
+        depth: tree.depth(),
+        extent,
+        generation: 1,
+    };
+
+    measure_clone("bench_scene", &scene);
+
+    // The composed scenes are where this actually bites: an order of magnitude
+    // more payload than the generated benchmark. Skipped when assets/ is absent,
+    // which is normal -- it is gitignored.
+    let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut files: Vec<_> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("vox")))
+            .collect();
+        files.sort();
+        for path in files {
+            let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let Ok((tree, materials)) = bevox_core::vox::load_scene(&path) else {
+                continue;
+            };
+            let volume = GpuVolume::from_contree(&tree);
+            let real = GpuSceneData {
+                nodes: volume.buffer_nodes(),
+                voxels: volume.voxels,
+                palette: materials.to_gpu(),
+                direction_masks: gpu_direction_masks(),
+                depth: tree.depth(),
+                extent: tree.extent(),
+                generation: 1,
+            };
+            measure_clone(&name, &real);
+        }
+    }
+
+    assert!(scene.nodes.len() > 1, "the benchmark scene is empty");
+}

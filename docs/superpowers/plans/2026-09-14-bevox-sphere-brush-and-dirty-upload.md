@@ -1159,6 +1159,33 @@ fraction growing sensibly with edit size while staying well under the
 scene total, so the dirty-range mechanism is not merging ranges into
 something coarser than the edit.
 
+### Render-world extraction, measured after the fact
+
+`ExtractResourcePlugin::<GpuSceneData>` cloned the whole payload into the render
+world every frame. `extract_gpu_scene` clones only when the scene actually
+changed. A/B/A interleaved in one process, release build, 2026-09-14:
+
+```
+          bench_scene (extent 1024,     3.15 MB): clone  0.860/ 0.869 ms  saved  0.865 ms (  5.2% of a 16.7 ms frame, drift 0.010)
+  Church_Of_St_Sophia (extent 4096,    28.55 MB): clone  7.611/ 7.369 ms  saved  7.490 ms ( 44.9%, drift 0.242)
+               castle (extent 4096,    28.29 MB): clone  7.663/ 7.650 ms  saved  7.657 ms ( 45.9%, drift 0.013)
+               custom (extent  256,     4.28 MB): clone  0.958/ 0.939 ms  saved  0.948 ms (  5.7%, drift 0.019)
+                 nuke (extent 4096,    40.32 MB): clone 10.818/11.042 ms  saved 10.930 ms ( 65.6%, drift 0.224)
+               sponza (extent 1024,     8.91 MB): clone  2.314/ 2.465 ms  saved  2.390 ms ( 14.3%, drift 0.152)
+```
+
+Every row beats its drift by more than an order of magnitude. `nuke` was
+spending two thirds of a 60 Hz frame budget copying a scene that had not
+changed, and the render world reads only `depth`, `extent` and `generation`
+from that copy on a frame with no edit.
+
+This measures the clone in isolation, **not** end-to-end frame time, and the
+saving should not be read as a frame-rate claim. The clone sat in the extract
+schedule between the main world and the render world, so the time is genuinely
+off the frame -- but nothing here measured what the frame does with it. The app
+is vsync-capped at 60, and this project has already been burned by a frame
+counter reading a healthy 60 while the renderer drew nothing.
+
 ## Milestone check
 
 **Milestone 7** — a sphere brush adds and removes voxels at runtime, and only the affected GPU buffer ranges are re-uploaded. The gate is Task 3: an incrementally uploaded edit renders bit-identically to the same scene uploaded whole, across a sequence of edits including one that erases.
