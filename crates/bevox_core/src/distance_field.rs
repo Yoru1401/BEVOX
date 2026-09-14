@@ -10,7 +10,6 @@
 //! over geometry. Every operation here preserves that.
 
 use crate::contree::Contree;
-use crate::material::MaterialId;
 use glam::{UVec3, Vec3};
 use std::ops::Range;
 
@@ -30,6 +29,41 @@ pub const CELL_VOXELS: u32 = 16;
 /// cap is what turns invalidation from a whole-field walk into a bounded box,
 /// and the box grows with its cube.
 pub const MAX_DISTANCE: u8 = 16;
+
+/// Neighbours already finalised when the forward raster pass reaches a cell,
+/// in `(z, then y, then x)` order: the whole `z - 1` plane, then the `y - 1`
+/// row of this plane, then the one cell to the left.
+///
+/// This is thirteen neighbours, not seven, on purpose. A cell reachable in one
+/// king move -- including a mixed-sign diagonal like `(+1, -1, 0)` -- has true
+/// Chebyshev distance 1 from it. Relaxing from only the seven same-sign
+/// neighbours omits that move, so the only path the sweep can find is an
+/// L-shaped detour counted at +1 per hop, which inflates the stored distance
+/// above the true one -- exactly the over-estimate this field must never
+/// produce. All thirteen neighbours already finalised in raster order must be
+/// used, or the two-pass sweep is not the Chebyshev (chessboard) transform.
+const FORWARD: [(i32, i32, i32); 13] = [
+    // The whole z-1 plane is finished.
+    (-1, -1, -1), (0, -1, -1), (1, -1, -1),
+    (-1, 0, -1), (0, 0, -1), (1, 0, -1),
+    (-1, 1, -1), (0, 1, -1), (1, 1, -1),
+    // In this z plane, the whole y-1 row is finished.
+    (-1, -1, 0), (0, -1, 0), (1, -1, 0),
+    // And the cell to the left.
+    (-1, 0, 0),
+];
+
+/// The backward pass's finalised neighbours: exactly `FORWARD` negated, since
+/// it walks the grid in the opposite raster order. Kept as a separate table
+/// rather than derived, so a change to one is never applied without the
+/// other. See `FORWARD` for why this is thirteen entries and not seven.
+const BACKWARD: [(i32, i32, i32); 13] = [
+    (1, 1, 1), (0, 1, 1), (-1, 1, 1),
+    (1, 0, 1), (0, 0, 1), (-1, 0, 1),
+    (1, -1, 1), (0, -1, 1), (-1, -1, 1),
+    (1, 1, 0), (0, 1, 0), (-1, 1, 0),
+    (1, 0, 0),
+];
 
 /// Chebyshev distance to the nearest solid voxel, per coarse cell.
 #[derive(Clone, Debug)]
@@ -72,7 +106,7 @@ impl DistanceField {
     /// already-computed neighbours below, then backward taking those above.
     pub fn build(tree: &Contree) -> Self {
         let edge = (tree.extent() / CELL_VOXELS).max(1);
-        let mut cells = vec![MAX_DISTANCE; (edge * edge * edge) as usize];
+        let cells = vec![MAX_DISTANCE; (edge * edge * edge) as usize];
 
         let mut field = Self { cells, edge };
         mark_solid(tree, tree.root(), tree.depth() - 1, UVec3::ZERO, &mut field);
@@ -87,8 +121,7 @@ impl DistanceField {
         for z in 0..edge {
             for y in 0..edge {
                 for x in 0..edge {
-                    self.relax(x, y, z, &[(-1, 0, 0), (0, -1, 0), (0, 0, -1),
-                        (-1, -1, 0), (-1, 0, -1), (0, -1, -1), (-1, -1, -1)]);
+                    self.relax(x, y, z, &FORWARD);
                 }
             }
         }
@@ -96,8 +129,7 @@ impl DistanceField {
         for z in (0..edge).rev() {
             for y in (0..edge).rev() {
                 for x in (0..edge).rev() {
-                    self.relax(x, y, z, &[(1, 0, 0), (0, 1, 0), (0, 0, 1),
-                        (1, 1, 0), (1, 0, 1), (0, 1, 1), (1, 1, 1)]);
+                    self.relax(x, y, z, &BACKWARD);
                 }
             }
         }
@@ -318,15 +350,28 @@ mod tests {
                 for cx in 0..cells {
                     let c = UVec3::new(cx, cy, cz);
                     let claimed = field.get(c);
-                    // Every cell strictly inside the claimed cube must be
-                    // empty, or the claim is a lie a ray would act on.
-                    for dz in 0..claimed as u32 {
-                        for dy in 0..claimed as u32 {
-                            for dx in 0..claimed as u32 {
-                                let n = c + UVec3::new(dx, dy, dz);
-                                if n.x >= cells || n.y >= cells || n.z >= cells {
+                    // The promise is symmetric: every cell within Chebyshev
+                    // distance `claimed - 1` of `c`, in *every* direction,
+                    // must be empty, or the claim is a lie a ray would act
+                    // on. A one-octant sweep (all-non-negative offsets) would
+                    // miss every violation on the negative side of an axis.
+                    let r = claimed as i32 - 1;
+                    for dz in -r..=r {
+                        for dy in -r..=r {
+                            for dx in -r..=r {
+                                let nx = c.x as i32 + dx;
+                                let ny = c.y as i32 + dy;
+                                let nz = c.z as i32 + dz;
+                                if nx < 0
+                                    || ny < 0
+                                    || nz < 0
+                                    || nx >= cells as i32
+                                    || ny >= cells as i32
+                                    || nz >= cells as i32
+                                {
                                     continue;
                                 }
+                                let n = UVec3::new(nx as u32, ny as u32, nz as u32);
                                 assert!(
                                     !is_occupied(n),
                                     "cell {c:?} claims {claimed} but {n:?} holds geometry"
@@ -412,14 +457,27 @@ mod tests {
             for cy in 0..cells {
                 for cx in 0..cells {
                     let c = UVec3::new(cx, cy, cz);
-                    let claimed = field.get(c) as u32;
-                    for dz in 0..claimed {
-                        for dy in 0..claimed {
-                            for dx in 0..claimed {
-                                let n = c + UVec3::new(dx, dy, dz);
-                                if n.x >= cells || n.y >= cells || n.z >= cells {
+                    let claimed = field.get(c);
+                    // Symmetric, as in `the_field_never_over_estimates`: a
+                    // one-octant sweep would miss any violation on the
+                    // negative side of an axis.
+                    let r = claimed as i32 - 1;
+                    for dz in -r..=r {
+                        for dy in -r..=r {
+                            for dx in -r..=r {
+                                let nx = c.x as i32 + dx;
+                                let ny = c.y as i32 + dy;
+                                let nz = c.z as i32 + dz;
+                                if nx < 0
+                                    || ny < 0
+                                    || nz < 0
+                                    || nx >= cells as i32
+                                    || ny >= cells as i32
+                                    || nz >= cells as i32
+                                {
                                     continue;
                                 }
+                                let n = UVec3::new(nx as u32, ny as u32, nz as u32);
                                 assert!(
                                     !is_occupied(n),
                                     "after painting, cell {c:?} claims {claimed} but {n:?} is solid"
