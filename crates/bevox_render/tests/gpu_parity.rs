@@ -823,28 +823,65 @@ fn the_beam_prepass_never_skips_geometry() {
     }
 }
 
+/// A floor and a few columns at extent 256, leaving large open volumes.
+///
+/// The distance field is coarse -- one cell per 16 voxels -- so a scene with
+/// scattered isolated voxels saturates it to zero and the skip never runs.
+/// This one has genuine emptiness for the field to find.
+fn open_scene() -> Contree {
+    let extent = 256u32;
+    let mut voxels = Vec::new();
+    for z in 0..extent {
+        for x in 0..extent {
+            for y in 0..4 {
+                voxels.push((UVec3::new(x, y, z), MaterialId(1)));
+            }
+        }
+    }
+    for (cx, cz) in [(60u32, 60u32), (180, 70), (100, 190)] {
+        for y in 4..90 {
+            for dz in 0..24 {
+                for dx in 0..24 {
+                    voxels.push((UVec3::new(cx + dx, y, cz + dz), MaterialId(2)));
+                }
+            }
+        }
+    }
+    Contree::from_voxels(extent, &voxels)
+}
+
 /// Skipping empty space must not change what is hit.
 ///
 /// The field promises a cube of emptiness around each cell; a ray that jumps
 /// further than the promise passes through geometry, and the symptom is holes
-/// that open from some angles and not others. This sweeps angles, and runs the
-/// thin scene, whose single-voxel walls are the thinnest thing a jump can
-/// straddle.
+/// that open from some angles and not others. This sweeps angles over a scene
+/// with large open volumes -- a scene of only scattered single voxels
+/// saturates the coarse field to zero everywhere and would exercise none of
+/// the jump arithmetic, which is why the non-vacuity guard below exists.
 #[test]
 fn the_distance_field_leaves_output_bit_identical() {
     let Some((device, queue)) = gpu_device() else {
         eprintln!("no GPU adapter available, skipping");
         return;
     };
-    let tree = thin_scene();
+    let tree = open_scene();
+    let field = bevox_core::distance_field::DistanceField::build(&tree);
+    let max_claimed = field.cells().iter().copied().max().unwrap_or(0);
+    assert!(
+        max_claimed >= 4,
+        "the field's largest value is {max_claimed}, so skip_empty_space returns on its \
+         first iteration and this test exercises none of the jump arithmetic"
+    );
+    eprintln!("distance field max claimed: {max_claimed}");
     let gpu_volume = GpuVolume::from_contree(&tree);
     let (width, height) = (96u32, 96u32);
-    let centre = Vec3::splat(32.0);
+    let centre = Vec3::splat(128.0);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
     for step in 0..8u32 {
         let angle = step as f32 * std::f32::consts::TAU / 8.0;
-        let eye = centre + Vec3::new(angle.cos() * 90.0, 30.0, angle.sin() * 90.0);
+        // centre.y is 128; -8 puts the eye at y = 120 as asked.
+        let eye = centre + Vec3::new(angle.cos() * 360.0, -8.0, angle.sin() * 360.0);
         let view = Mat4::look_at_rh(eye, centre, Vec3::Y);
         let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
         let world_from_clip = (projection * view).inverse();

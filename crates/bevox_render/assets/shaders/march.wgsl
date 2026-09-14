@@ -583,7 +583,11 @@ fn skip_empty_space(origin: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, start
         // Nudge past the boundary, or the next sample lands on the same cell
         // and the loop makes no progress.
         if exit <= t { return t; }
-        t = exit + 1e-3;
+        // Relative, not fixed: at t in the thousands a 1e-3 nudge is below
+        // float32's ULP and rounds straight back to `exit`, so the walk stops
+        // early on exactly the large scenes this is meant to help. Kept well
+        // under one cell so it can never step past the cube just cleared.
+        t = exit + max(1e-3, exit * 1e-5);
     }
     return t;
 }
