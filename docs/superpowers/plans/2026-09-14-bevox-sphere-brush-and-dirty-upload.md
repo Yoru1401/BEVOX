@@ -1120,6 +1120,45 @@ git commit -m "test(render): measure what an edit uploads" -m "Co-Authored-By: C
 
 ---
 
+## Measurements
+
+Ran 2026-09-14 on the GTX 1650 (the machine's recorded GPU for this project's
+other measurements). This particular test touches no GPU and no device -- it
+stages updates on the CPU and counts bytes -- so the byte counts themselves are
+hardware-independent; the machine is noted for the record, not because it
+could have changed the result.
+
+`cargo test --release -p bevox_render --test gpu_bench an_edit_uploads -- --ignored --nocapture`:
+
+```
+scene: extent 1024, 1158784 node bytes, 2134016 voxel bytes
+radius     2: edit   0.06 ms, stage  0.02 ms, upload       800 bytes (0.024% of the scene) in 2 ranges
+radius     8: edit   0.08 ms, stage  0.07 ms, upload      3328 bytes (0.101% of the scene) in 9 ranges
+radius    32: edit   0.98 ms, stage  0.43 ms, upload     60960 bytes (1.851% of the scene) in 10 ranges
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.18s
+```
+
+(Edits are cumulative: each radius is applied to the scene the previous one
+left behind, so the byte counts are not three independent measurements of the
+same starting state.)
+
+This is a byte count, not a timing: it shows what fraction of the scene's
+node and voxel storage a `stage_scene_update` call actually serialises after
+an edit, measured once in a single process. It does not show frame time,
+GPU upload latency, or anything about the render path. The `edit_ms` and
+`stage_ms` figures printed alongside it are single-shot CPU wall-clock
+readings from one process, not the interleaved A/B/A comparisons this
+project otherwise requires for a performance claim -- treat them as
+indicative only, not as a benchmark result.
+
+The radius-2 line is the strongest evidence for the milestone's "editing
+without full re-upload" claim: a minimal edit stages 800 bytes against a
+3.2 MB scene (0.024%), in only 2 ranges, which is what "not a full
+re-upload" has to mean in bytes. The radius-32 line (1.851%) shows the
+fraction growing sensibly with edit size while staying well under the
+scene total, so the dirty-range mechanism is not merging ranges into
+something coarser than the edit.
+
 ## Milestone check
 
 **Milestone 7** — a sphere brush adds and removes voxels at runtime, and only the affected GPU buffer ranges are re-uploaded. The gate is Task 3: an incrementally uploaded edit renders bit-identically to the same scene uploaded whole, across a sequence of edits including one that erases.
