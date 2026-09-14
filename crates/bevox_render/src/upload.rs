@@ -32,6 +32,8 @@ pub struct MarchUniform {
     pub sun_direction: [f32; 4],
     /// `[depth, extent, march_flags, 0]`.
     pub volume_params: [u32; 4],
+    /// `[field_edge, 0, 0, 0]`.
+    pub field_params: [u32; 4],
 }
 
 /// Traversal optimisations, carried in `volume_params.z`.
@@ -81,6 +83,11 @@ pub struct GpuSceneData {
     pub direction_masks: Vec<[u32; 2]>,
     pub depth: u32,
     pub extent: u32,
+    /// Chebyshev distance to the nearest solid voxel per coarse cell, packed
+    /// four to a word.
+    pub distance_field: Vec<u32>,
+    /// Cells per axis, so the shader can index the grid.
+    pub field_edge: u32,
     pub generation: u32,
 }
 
@@ -98,6 +105,10 @@ impl Default for GpuSceneData {
             // Depth must be at least 1: the shader starts at level `depth - 1`.
             depth: 1,
             extent: 4,
+            // A single zero cell claims no empty space anywhere, the safe
+            // value for an empty scene.
+            distance_field: vec![0],
+            field_edge: 1,
             generation: 0,
         }
     }
@@ -203,6 +214,7 @@ pub fn build_gpu_scene(
         }
     }
     let volume = GpuVolume::from_contree(&scene.tree);
+    let field = bevox_core::distance_field::DistanceField::build(&scene.tree);
     commands.insert_resource(GpuSceneData {
         nodes: volume.buffer_nodes(),
         voxels: volume.voxels,
@@ -210,8 +222,15 @@ pub fn build_gpu_scene(
         direction_masks: gpu_direction_masks(),
         depth: scene.tree.depth(),
         extent: scene.tree.extent(),
+        field_edge: field.edge(),
+        distance_field: pack_field(&field),
         generation: scene.generation,
     });
+}
+
+/// The field packed four cells to a word, matching `pack_voxels`.
+pub fn pack_field(field: &bevox_core::distance_field::DistanceField) -> Vec<u32> {
+    bevox_core::gpu::pack_voxels(field.cells())
 }
 
 /// Reads the active 3D camera in the main world so it can be extracted.
@@ -278,11 +297,13 @@ pub fn march_uniform(
     tree: &Contree,
     flags: u32,
 ) -> MarchUniform {
+    let field_edge = (tree.extent() / bevox_core::distance_field::CELL_VOXELS).max(1);
     MarchUniform {
         world_from_clip: world_from_clip.to_cols_array_2d(),
         camera_position: camera_position.extend(0.0).to_array(),
         sun_direction: SUN_DIRECTION.normalize().extend(0.0).to_array(),
         volume_params: [tree.depth(), tree.extent(), flags, 0],
+        field_params: [field_edge, 0, 0, 0],
     }
 }
 
@@ -432,9 +453,25 @@ mod tests {
     }
 
     #[test]
+    fn the_field_packs_four_cells_to_a_word() {
+        let field = bevox_core::distance_field::DistanceField::build(&Contree::empty(3));
+        let packed = pack_field(&field);
+        assert_eq!(packed.len(), field.cells().len().div_ceil(4));
+        // Little-endian within the word, matching pack_voxels.
+        let first = packed[0];
+        for i in 0..4 {
+            assert_eq!(
+                ((first >> (i * 8)) & 0xFF) as u8,
+                field.cells()[i as usize],
+                "cell {i} is not in byte {i} of word 0"
+            );
+        }
+    }
+
+    #[test]
     fn the_uniform_is_the_size_the_shader_expects() {
-        // mat4x4 (64) + vec4 (16) + vec4 sun (16) + uvec4 (16)
-        assert_eq!(size_of::<MarchUniform>(), 112);
+        // mat4x4 (64) + vec4 (16) + vec4 sun (16) + uvec4 (16) + uvec4 field (16)
+        assert_eq!(size_of::<MarchUniform>(), 128);
         assert_eq!(align_of::<MarchUniform>(), 4);
     }
 

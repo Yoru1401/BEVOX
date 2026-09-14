@@ -10,6 +10,7 @@ struct MarchUniform {
     camera_position: vec4<f32>,
     sun_direction: vec4<f32>,
     volume_params: vec4<u32>,  // [depth, extent, flags, 0]
+    field_params: vec4<u32>,  // [field_edge, 0, 0, 0]
 };
 
 // Traversal optimisations, matching bevox_render::upload::march_flags. One
@@ -31,6 +32,11 @@ const FLAG_BEAM: u32 = 4u;
 // rather than a second storage texture: one binding instead of two, and no
 // read-access storage texture to negotiate with the adapter.
 @group(0) @binding(6) var<storage, read_write> beam: array<f32>;
+// Distance field: Chebyshev distance to the nearest solid voxel per coarse
+// cell, four cells packed per word. Not read yet -- the traversal does not
+// use it until a later task -- but declared now so this binding is part of
+// the layout the moment it exists, matching MARCH_BINDING_COUNT.
+@group(0) @binding(7) var<storage, read> distance_field: array<u32>;
 
 const BRICK_EDGE: u32 = 4u;
 const CHILDREN: u32 = 64u;

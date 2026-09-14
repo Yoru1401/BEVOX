@@ -439,6 +439,7 @@ fn the_scene_clone_is_measured_against_not_cloning() {
 
     let (tree, extent) = bench_scene();
     let volume = GpuVolume::from_contree(&tree);
+    let field = bevox_core::distance_field::DistanceField::build(&tree);
     let scene = GpuSceneData {
         nodes: volume.buffer_nodes(),
         voxels: volume.voxels,
@@ -446,6 +447,8 @@ fn the_scene_clone_is_measured_against_not_cloning() {
         direction_masks: gpu_direction_masks(),
         depth: tree.depth(),
         extent,
+        field_edge: field.edge(),
+        distance_field: bevox_render::upload::pack_field(&field),
         generation: 1,
     };
 
@@ -467,6 +470,7 @@ fn the_scene_clone_is_measured_against_not_cloning() {
                 continue;
             };
             let volume = GpuVolume::from_contree(&tree);
+            let field = bevox_core::distance_field::DistanceField::build(&tree);
             let real = GpuSceneData {
                 nodes: volume.buffer_nodes(),
                 voxels: volume.voxels,
@@ -474,6 +478,8 @@ fn the_scene_clone_is_measured_against_not_cloning() {
                 direction_masks: gpu_direction_masks(),
                 depth: tree.depth(),
                 extent: tree.extent(),
+                field_edge: field.edge(),
+                distance_field: bevox_render::upload::pack_field(&field),
                 generation: 1,
             };
             measure_clone(&name, &real);
