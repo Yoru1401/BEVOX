@@ -194,9 +194,10 @@ fn optimisations_are_measured_against_the_baseline() {
         let scan = (a1 + a2) * 0.5;
         let gain = scan - b;
         println!(
-            "{name:>9}: {b:6.2} ms vs scan {a1:.2}/{a2:.2} (drift {drift:.2})  gain {gain:6.2} ms ({:5.1}%) {}",
+            "{name:>9}: {b:6.2} ms vs scan {a1:.2}/{a2:.2} (drift {drift:.2})  gain {gain:6.2} ms ({:5.1}%) {}{}",
             gain / scan * 100.0,
-            if gain.abs() > drift { "" } else { "<- within drift, not a result" }
+            if gain.abs() > drift { "" } else { "<- within drift, not a result" },
+            gpu_time_note(&device, &queue, &variant),
         );
         assert!(b > 0.0, "{name}: the timer returned nothing");
     }
@@ -480,4 +481,86 @@ fn the_scene_clone_is_measured_against_not_cloning() {
     }
 
     assert!(scene.nodes.len() > 1, "the benchmark scene is empty");
+}
+
+/// What the GPU itself says the dispatches took, as a suffix for a bench row.
+///
+/// The wall-clock figures above are submit-to-poll over a batch, so they carry
+/// queue submission and driver overhead that no shader change can move. These
+/// come from timestamps written at each pass boundary, so they are the shader's
+/// own time -- narrower, and the honest number when the question is "did the
+/// traversal get faster" rather than "did the frame get cheaper".
+///
+/// Empty when the adapter has no timestamp support, which is not a failure.
+fn gpu_time_note(device: &wgpu::Device, queue: &wgpu::Queue, prepared: &Prepared) -> String {
+    // One untimed dispatch first: the first run of a pipeline pays for shader
+    // compilation and first touch of every buffer, which is not its steady cost.
+    prepared.dispatch(device, queue);
+    device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+
+    let Some(t) = prepared.dispatch_timed(device, queue) else {
+        return String::new();
+    };
+    if t.beam > 0.0 {
+        format!("  [gpu {:.2} ms = beam {:.2} + main {:.2}]", t.total(), t.beam, t.main)
+    } else {
+        format!("  [gpu {:.2} ms]", t.main)
+    }
+}
+
+/// The GPU's own clock, reported next to the wall-clock numbers it qualifies.
+///
+/// Wall-clock over a batch includes submit and driver overhead; a timestamp
+/// pair around each pass does not. Printing both is the point -- when they
+/// disagree, the difference is the overhead, and that is worth seeing rather
+/// than averaging away.
+#[test]
+#[ignore]
+fn the_dispatches_are_timed_by_the_gpu() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    if !timestamps_supported(&device) {
+        eprintln!("adapter has no TIMESTAMP_QUERY, skipping");
+        return;
+    }
+
+    let (tree, extent) = bench_scene();
+    let volume = GpuVolume::from_contree(&tree);
+    let (eye, world_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    println!("scene: extent {extent}, 1280x720, close to geometry");
+    for (name, flags) in [
+        ("scan", march_flags::NONE),
+        ("dda", march_flags::DDA),
+        ("mask", march_flags::MASK_FILTER),
+        ("beam", march_flags::BEAM),
+        ("all", march_flags::DEFAULT),
+    ] {
+        let prepared = Prepared::new(
+            &device, &shader, "march", &tree, &volume, world_from_clip, eye, 1280, 720, flags,
+        );
+        // Discard the first dispatch: it pays for pipeline compilation.
+        prepared.dispatch(&device, &queue);
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+
+        // Several readings; the GPU clock is steadier than wall clock but the
+        // card still ramps, so report the median rather than one sample.
+        let mut totals: Vec<f32> = (0..7)
+            .map(|_| prepared.dispatch_timed(&device, &queue).expect("timestamps").total())
+            .collect();
+        let mut beams: Vec<f32> = (0..7)
+            .map(|_| prepared.dispatch_timed(&device, &queue).expect("timestamps").beam)
+            .collect();
+
+        let total = median_of(&mut totals);
+        let beam = median_of(&mut beams);
+        if beam > 0.0 {
+            println!("{name:>6}: {total:7.3} ms total  (beam {beam:.3} + main {:.3})", total - beam);
+        } else {
+            println!("{name:>6}: {total:7.3} ms total");
+        }
+    }
 }

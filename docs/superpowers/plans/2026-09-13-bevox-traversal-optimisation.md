@@ -905,3 +905,36 @@ rewriting until the number moves.
 
 Milestone 7 — the sphere brush wired to mouse input with dirty-range upload — is
 the last one left in the spec, and is independent of everything here.
+
+---
+
+## GPU timestamps, added afterwards
+
+The spec asked for timestamp queries wrapping each dispatch. They live in the
+headless harness (`Prepared::dispatch_timed`), not in the app: that is where the
+A/B/A discipline is, and it needs no device-feature negotiation in the binary.
+An adapter without `TIMESTAMP_QUERY` still runs every test and simply reports no
+GPU time.
+
+Measured at 1280x720, extent 1024, close to geometry, GTX 1650:
+
+```
+      dda:  22.02 ms vs scan 40.57/39.29 (drift 1.28)  gain 17.91 ms (44.9%)  [gpu 20.70 ms]
+     mask:  34.42 ms vs scan 39.48/39.94 (drift 0.46)  gain  5.28 ms (13.3%)  [gpu 34.29 ms]
+ dda+mask:  18.50 ms vs scan 40.37/40.13 (drift 0.24)  gain 21.75 ms (54.0%)  [gpu 17.73 ms]
+     beam:  29.31 ms vs scan 39.84/40.55 (drift 0.71)  gain 10.88 ms (27.1%)  [gpu 30.78 ms = beam 0.93 + main 29.86]
+      all:  15.44 ms vs scan 39.89/40.75 (drift 0.86)  gain 24.88 ms (61.7%)  [gpu 15.78 ms = beam 0.30 + main 15.49]
+```
+
+Two things worth keeping from this.
+
+**The wall-clock numbers were honest.** GPU time tracks them within about a
+millisecond at every flag setting, so submit and driver overhead was never
+hiding inside the measurements the optimisation decisions were made from. That
+was worth checking rather than assuming.
+
+**The beam prepass is nearly free, and gets cheaper in company.** 0.93 ms on its
+own, 0.30 ms with DDA and the mask filter on -- the prepass is itself a march,
+so it benefits from the same optimisations it feeds. Its cost was never the
+question; what it hands the main pass is. Splitting the two passes is the one
+thing wall-clock timing could not have told us.

@@ -33,6 +33,11 @@ pub fn parity_materials() -> MaterialTable {
     table
 }
 
+/// Whether this device can report GPU time.
+pub fn timestamps_supported(device: &wgpu::Device) -> bool {
+    device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
+}
+
 /// One read-only storage binding of the given minimum element size.
 pub fn storage_entry(binding: u32, min_size: u64) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
@@ -54,9 +59,15 @@ pub fn gpu_device() -> Option<(wgpu::Device, wgpu::Queue)> {
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
             .ok()?;
+        // Timestamps are requested when the adapter has them and silently
+        // dropped when it does not, so a device without the feature still runs
+        // every test -- it just cannot report GPU time. `timestamps_supported`
+        // is how a caller finds out which it got.
+        let features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("bevox_test_device"),
+                required_features: features,
                 ..Default::default()
             })
             .await
@@ -145,8 +156,40 @@ pub struct Prepared {
     /// Kept so a test can apply an incremental update the way the app does.
     node_buffer: wgpu::Buffer,
     voxel_buffer: wgpu::Buffer,
+    /// Timestamps around each pass, when the device supports them. Four slots:
+    /// beam begin/end then main begin/end, so a beam-less configuration simply
+    /// leaves the first pair unwritten.
+    timestamps: Option<Timestamps>,
     width: u32,
     height: u32,
+}
+
+/// Query set plus the two buffers a timestamp readback needs.
+struct Timestamps {
+    set: wgpu::QuerySet,
+    /// Written by `resolve_query_set`; cannot be mapped directly.
+    resolve: wgpu::Buffer,
+    /// Mappable copy of `resolve`.
+    readback: wgpu::Buffer,
+}
+
+/// Timestamp slots this configuration writes: two per pass that runs.
+fn used_slots(prepared: &Prepared) -> u32 {
+    if prepared.beam_pipeline.is_some() { 4 } else { 2 }
+}
+
+/// GPU time for one dispatched frame, in milliseconds.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuTime {
+    /// The beam prepass, or 0.0 when the configuration has none.
+    pub beam: f32,
+    pub main: f32,
+}
+
+impl GpuTime {
+    pub fn total(&self) -> f32 {
+        self.beam + self.main
+    }
 }
 
 impl Prepared {
@@ -322,14 +365,67 @@ impl Prepared {
             ],
         });
 
-        Self { pipeline, beam_pipeline, bind_group, texture, node_buffer, voxel_buffer, width, height }
+        let timestamps = timestamps_supported(device).then(|| {
+            let slots = 4;
+            Timestamps {
+                set: device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("march_timestamps"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: slots,
+                }),
+                resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("march_timestamp_resolve"),
+                    size: u64::from(slots) * 8,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+                readback: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("march_timestamp_readback"),
+                    size: u64::from(slots) * 8,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+            }
+        });
+
+        Self {
+            pipeline,
+            beam_pipeline,
+            bind_group,
+            texture,
+            node_buffer,
+            voxel_buffer,
+            timestamps,
+            width,
+            height,
+        }
     }
 
     /// The prepass, when there is one, then the main pass. Separate passes, so
     /// the beam writes are visible to the reads that follow.
-    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, timed: bool) {
+        let writes = |begin: u32, end: u32| {
+            self.timestamps.as_ref().filter(|_| timed).map(|t| wgpu::ComputePassTimestampWrites {
+                query_set: &t.set,
+                beginning_of_pass_write_index: Some(begin),
+                end_of_pass_write_index: Some(end),
+            })
+        };
+
+        // Slots are packed, not fixed: resolving a query that was never
+        // written is a validation error, so a configuration without a beam
+        // pass must not leave a hole at the start of the set.
+        let (beam_slots, main_slots) = if self.beam_pipeline.is_some() {
+            ((0u32, 1u32), (2u32, 3u32))
+        } else {
+            ((0, 1), (0, 1))
+        };
+
         if let Some(beam) = &self.beam_pipeline {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("beam_pass"),
+                timestamp_writes: writes(beam_slots.0, beam_slots.1),
+            });
             pass.set_pipeline(beam);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(
@@ -338,23 +434,70 @@ impl Prepared {
                 1,
             );
         }
-        let mut pass = encoder.begin_compute_pass(&Default::default());
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("march_pass"),
+            timestamp_writes: writes(main_slots.0, main_slots.1),
+        });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
+        drop(pass);
+
+        if timed && let Some(t) = &self.timestamps {
+            let used = if self.beam_pipeline.is_some() { 4 } else { 2 };
+            encoder.resolve_query_set(&t.set, 0..used, &t.resolve, 0);
+            encoder.copy_buffer_to_buffer(&t.resolve, 0, &t.readback, 0, u64::from(used) * 8);
+        }
+    }
+
+    /// Dispatches once and reads back what the GPU says each pass took.
+    ///
+    /// Returns None when the adapter has no timestamp support, which is a
+    /// normal state rather than a failure -- the wall-clock timings still work.
+    ///
+    /// This is a whole round trip per call: submit, wait, map, unmap. It is for
+    /// reporting a number, not for use inside a timed loop, where the waiting
+    /// would dominate the thing being measured.
+    pub fn dispatch_timed(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<GpuTime> {
+        let t = self.timestamps.as_ref()?;
+        let period = queue.get_timestamp_period();
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        self.encode(&mut encoder, true);
+        queue.submit([encoder.finish()]);
+
+        t.readback.map_async(wgpu::MapMode::Read, ..u64::from(used_slots(self)) * 8, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+
+        let used = if self.beam_pipeline.is_some() { 4usize } else { 2 };
+        let ticks: Vec<u64> = {
+            let view = t.readback.get_mapped_range(..u64::from(used as u32) * 8);
+            bytemuck::cast_slice::<u8, u64>(&view).to_vec()
+        };
+        t.readback.unmap();
+
+        // Ticks are a monotonic counter; a pass that never ran leaves its pair
+        // untouched, and saturating_sub keeps that at zero rather than wrapping
+        // into a nonsense duration.
+        let ms = |a: u64, b: u64| b.saturating_sub(a) as f32 * period / 1_000_000.0;
+        if self.beam_pipeline.is_some() {
+            Some(GpuTime { beam: ms(ticks[0], ticks[1]), main: ms(ticks[2], ticks[3]) })
+        } else {
+            Some(GpuTime { beam: 0.0, main: ms(ticks[0], ticks[1]) })
+        }
     }
 
     /// Submits one dispatch without waiting; the caller polls once per batch.
     pub fn dispatch(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let mut encoder = device.create_command_encoder(&Default::default());
-        self.encode(&mut encoder);
+        self.encode(&mut encoder, false);
         queue.submit([encoder.finish()]);
     }
 
     /// Dispatches once and reads the result back as RGBA bytes.
     pub fn read_back(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u8> {
         let mut encoder = device.create_command_encoder(&Default::default());
-        self.encode(&mut encoder);
+        self.encode(&mut encoder, false);
         read_texture(device, queue, encoder, &self.texture, self.width, self.height)
     }
 
