@@ -2,6 +2,7 @@ pub mod address;
 pub mod arena;
 pub mod contree;
 pub mod dense;
+pub mod distance_field;
 pub mod edit;
 pub mod gpu;
 pub mod march;
