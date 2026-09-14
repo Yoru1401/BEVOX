@@ -158,6 +158,12 @@ pub fn prepare_march_buffers(
             label: Some("bevox_beam"),
             // One distance per coarse pixel. Sized for the largest target the
             // window can be, because it is built once and the window is not.
+            //
+            // Left zeroed, which is load-bearing: wgpu zero-initialises buffers,
+            // and a zero seed means no offset. So the frames before the prepass
+            // pipeline finishes compiling render correctly and merely slowly,
+            // rather than seeding from uninitialised memory and dropping
+            // geometry.
             size: u64::from(BEAM_CAPACITY) * 4,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,

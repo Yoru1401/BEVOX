@@ -1068,7 +1068,7 @@ intermediate at extent 4096 would be 68 GB; the same scene is about 30 MB as a
 contree, which is what makes the sparse builder load-bearing rather than an
 optimisation.
 
-Frame times at 1280x720, Church at extent 4096:
+Frame times at 1280x720, Church at extent 4096, read from the app's counter:
 
 | camera | frame time | fps |
 |---|---|---|
@@ -1080,6 +1080,38 @@ screen: more pixels hit, every hit casts a shadow ray, and every ray descends
 through near-field nodes where the current shader linearly scans all 64 children
 of each node regardless of how few are occupied. DDA within bricks, the bitmask
 filter and the beam prepass all target exactly that case.
+
+### After milestone 8
+
+Measured headlessly by `the_real_scenes_are_measured_with_the_defaults`, A/B/A in
+one process at 1280x720, GTX 1650. The camera is derived from each scene: framed
+at 1.1 extents, and thirty voxels in front of the first surface that framing
+sees.
+
+| scene | framed: scan | framed: defaults | close: scan | close: defaults |
+|---|---|---|---|---|
+| Church_Of_St_Sophia | 5.80 ms | 5.27 ms (9.1%) | 14.07 ms | 11.03 ms (21.6%) |
+| castle | 4.23 ms | 4.30 ms (-1.5%) | 9.93 ms | 8.37 ms (15.8%) |
+| custom | 6.83 ms | 6.14 ms (10.2%) | 19.92 ms | 11.03 ms (44.7%) |
+| nuke | 4.24 ms | 4.19 ms (1.2%) | 10.69 ms | 8.70 ms (18.6%) |
+| sponza | 7.10 ms | 6.49 ms (8.6%) | 24.00 ms | 11.67 ms (51.4%) |
+
+These are not comparable to the app-counter figures above, and deliberately so:
+this is the compute dispatch alone, at a camera the scene picks, while those were
+whole frames at a position flown to by hand. The gain is the comparable part.
+
+The shape of it is what milestone 8 predicted. Close to geometry, where the
+complaint came from, the scenes gain 16-51%. Framed back, where most rays miss
+and the frame is already 4-7 ms, there is little left to win -- and `castle`
+framed back is 1.5% *slower*, against 0.00 ms of drift, so the loss is real if
+tiny. With almost every ray missing, the beam prepass has no emptiness to hand
+over and its dispatch is pure cost. Not enough to turn the flag off: the case it
+loses in already runs at 240 fps, and the case it wins in is the one that stutters.
+
+The synthetic benchmark gains more than any real scene (63.8% against 15-51%)
+because it was built to: a floor and solid columns fill the view with near-field
+geometry, which is precisely what these three optimisations attack. A real scene
+spends more of its frame on rays that miss entirely, and none of this helps those.
 
 ## What this plan deliberately does not do
 

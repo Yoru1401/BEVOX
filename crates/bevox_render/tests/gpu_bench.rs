@@ -201,3 +201,107 @@ fn optimisations_are_measured_against_the_baseline() {
         assert!(b > 0.0, "{name}: the timer returned nothing");
     }
 }
+
+/// The composed .vox scenes, at the two camera positions milestone 8 was
+/// argued from. Ignored by default: it needs the gitignored `assets/`, and it
+/// spends minutes on scenes at extent 4096.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench -- --ignored
+/// --nocapture`.
+///
+/// Measured headlessly rather than by reading the app's frame counter. The
+/// counter is capped at 60, so a framed-back reading can only say "at least as
+/// fast as before" -- and a scene rendering nothing at all reports exactly the
+/// same 60, which is how a ray budget bug survived a frame-rate check once
+/// already.
+#[test]
+#[ignore]
+fn the_real_scenes_are_measured_with_the_defaults() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        eprintln!("no assets directory, skipping");
+        return;
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("vox")))
+        .collect();
+    files.sort();
+
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    for path in files {
+        let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let Ok((tree, _materials)) = bevox_core::vox::load_scene(&path) else {
+            println!("{name}: failed to load, skipping");
+            continue;
+        };
+        let volume = GpuVolume::from_contree(&tree);
+        let extent = tree.extent();
+
+        for (label, (eye, world_from_clip)) in
+            [("framed", framed_camera(extent)), ("close", close_camera(&tree, extent))]
+        {
+            let baseline = Prepared::new(
+                &device, &shader, "march", &tree, &volume, world_from_clip, eye, 1280, 720,
+                march_flags::NONE,
+            );
+            let variant = Prepared::new(
+                &device, &shader, "march", &tree, &volume, world_from_clip, eye, 1280, 720,
+                march_flags::DEFAULT,
+            );
+            let (a1, b, a2) = compare_aba(&device, &queue, &baseline, &variant);
+            let scan = (a1 + a2) * 0.5;
+            println!(
+                "{name:>22} {label:>6} (extent {extent}): scan {scan:7.2} ms -> {b:7.2} ms  \
+                 {:5.1}% (drift {:.2})",
+                (scan - b) / scan * 100.0,
+                (a1 - a2).abs()
+            );
+        }
+    }
+}
+
+/// The whole volume in view, the way the app frames a scene on load.
+fn framed_camera(extent: u32) -> (Vec3, Mat4) {
+    let e = extent as f32;
+    let centre = Vec3::splat(e * 0.5);
+    let eye = centre + Vec3::new(0.6, 0.5, 1.0).normalize() * e * 1.1;
+    let view = Mat4::look_at_rh(eye, centre, Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1280.0 / 720.0, 0.1, e * 8.0);
+    (eye, (projection * view).inverse())
+}
+
+/// Thirty voxels in front of the first surface the framed camera sees.
+///
+/// A fixed distance in voxels, not a fraction of the extent: "close" has to mean
+/// the same angular size for a cathedral at extent 4096 and a model at 256, or
+/// the large scenes get measured from further away and look cheap.
+fn close_camera(tree: &bevox_core::contree::Contree, extent: u32) -> (Vec3, Mat4) {
+    let e = extent as f32;
+    let centre = Vec3::splat(e * 0.5);
+    let (eye, _) = framed_camera(extent);
+    let dir = (centre - eye).normalize();
+    let mut stats = bevox_core::march::MarchStats::default();
+    let surface = match bevox_core::march::march(
+        tree,
+        glam::Affine3A::IDENTITY,
+        eye,
+        dir,
+        e * 8.0,
+        false,
+        &mut stats,
+    ) {
+        Some(hit) => eye + dir * hit.t,
+        // An empty line of sight is still a valid measurement; stand at the centre.
+        None => centre,
+    };
+    let close = surface - dir * 30.0;
+    let view = Mat4::look_at_rh(close, surface + dir * e * 0.25, Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1280.0 / 720.0, 0.1, e * 8.0);
+    (close, (projection * view).inverse())
+}

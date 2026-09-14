@@ -443,10 +443,10 @@ fn a_distant_camera_on_a_large_volume_still_reaches_the_geometry() {
 /// shape every later bit-identity test takes, so it is worth having green
 /// before anything depends on it.
 #[test]
-fn setting_flags_does_not_change_output_yet() {
-    // 0b110 only: DDA has landed and owns its own identity test below. The
-    // remaining bits must still be inert, which is what keeps a half-finished
-    // optimisation from silently altering output.
+fn the_mask_filter_and_beam_together_leave_output_identical() {
+    // MASK_FILTER | BEAM: the one pairing the other two identity tests do not
+    // cover between them. Neither touches shadow rays, so this one can stay
+    // exact where the beam test has to allow a grazing pixel.
     let Some((device, queue)) = gpu_device() else {
         eprintln!("no GPU adapter available, skipping");
         return;
@@ -469,7 +469,7 @@ fn setting_flags_does_not_change_output_yet() {
             &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume, width,
             height, 0b110,
         );
-        assert_eq!(off, on, "{entry}: flags changed output before any optimisation exists");
+        assert_eq!(off, on, "{entry}: the mask filter and beam together changed output");
     }
 }
 

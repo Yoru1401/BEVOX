@@ -43,7 +43,11 @@ pub mod march_flags {
     pub const BEAM: u32 = 4;
     /// What the app runs. Each optimisation joins this only once it has measured
     /// faster while staying bit-identical.
-    pub const DEFAULT: u32 = NONE;
+    ///
+    /// All three earned it. A/B/A at 1280x720, extent 1024, close to geometry:
+    /// scan 44.5 ms, mask 39.1, beam 31.2, DDA 22.3, all three 16.1 -- a 63.8%
+    /// gain against 0.2 ms of drift.
+    pub const DEFAULT: u32 = DDA | MASK_FILTER | BEAM;
 }
 
 /// The sun direction the renderer and the parity tests share.
