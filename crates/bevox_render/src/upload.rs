@@ -488,4 +488,50 @@ mod tests {
             scene.tree.arena().voxels().len().div_ceil(4) as u32
         );
     }
+
+    #[test]
+    fn an_edit_does_not_rebuild_gpu_scene_data_but_a_replacement_does() {
+        // Regression guard for the generation gate in `build_gpu_scene`: it
+        // must reject `is_changed()` (which every edit trips) and accept only
+        // a generation bump. Comparing the resource's node bytes before and
+        // after -- not just its `generation` field, which a buggy rebuild
+        // would also set to the unchanged scene generation -- is what makes
+        // this fail if that guard regresses.
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<GpuSceneData>()
+            .add_systems(Update, build_gpu_scene);
+
+        let mut tree = Contree::empty(3);
+        tree.apply_sphere(Vec3::new(32.0, 32.0, 32.0), 10.0, MaterialId(1));
+        tree.arena_mut().clear_dirty();
+        app.insert_resource(VoxelScene { tree, materials: MaterialTable::new(), generation: 1 });
+        app.update();
+
+        let loaded_nodes = app.world().resource::<GpuSceneData>().nodes.clone();
+        assert!(loaded_nodes.len() > 1, "the initial load should have produced real geometry");
+
+        // An edit: mutates the tree (so `is_changed()` would trip) but leaves
+        // `generation` alone, as every real brush edit does.
+        app.world_mut()
+            .resource_mut::<VoxelScene>()
+            .tree
+            .apply_sphere(Vec3::new(5.0, 5.0, 5.0), 4.0, MaterialId(2));
+        app.update();
+        assert_eq!(
+            app.world().resource::<GpuSceneData>().nodes,
+            loaded_nodes,
+            "an edit left generation unchanged, so GpuSceneData must not have been rebuilt"
+        );
+
+        // A replacement: bumping generation must rebuild, reflecting the tree
+        // as it stands now (already grown by the edit above).
+        app.world_mut().resource_mut::<VoxelScene>().generation = 2;
+        app.update();
+        assert_ne!(
+            app.world().resource::<GpuSceneData>().nodes,
+            loaded_nodes,
+            "bumping generation must trigger a rebuild"
+        );
+    }
 }
