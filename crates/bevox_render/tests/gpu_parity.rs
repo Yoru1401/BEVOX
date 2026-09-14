@@ -1004,11 +1004,10 @@ fn an_incrementally_uploaded_edit_renders_identically() {
 
     // One tree is edited and uploaded incrementally; the other is edited the
     // same way and uploaded from scratch each time.
-    let mut incremental = VoxelScene {
-        tree: parity_scene(),
-        materials: parity_materials(),
-        generation: 1,
-    };
+    let tree = parity_scene();
+    let field = bevox_core::distance_field::DistanceField::build(&tree);
+    let mut incremental =
+        VoxelScene { tree, materials: parity_materials(), generation: 1, field, field_dirty: None };
     incremental.tree.arena_mut().clear_dirty();
     let mut whole = parity_scene();
 

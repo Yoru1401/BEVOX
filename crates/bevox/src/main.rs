@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
+use bevox_core::distance_field::DistanceField;
 use bevox_core::material::{Material, MaterialId, MaterialTable};
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system};
@@ -84,7 +85,8 @@ fn setup(mut commands: Commands) {
         FlyCamera::looking_at(eye, centre),
     ));
 
-    commands.insert_resource(VoxelScene { tree, materials, generation: 1 });
+    let field = DistanceField::build(&tree);
+    commands.insert_resource(VoxelScene { tree, materials, generation: 1, field, field_dirty: None });
 }
 
 /// What the brush paints and how big it is.
@@ -175,6 +177,14 @@ fn brush_input(
         hit.position + hit.normal * brush.radius
     };
     scene.tree.apply_sphere(centre, brush.radius, material);
+    // Only painting needs the field touched: it adds geometry, which lowers
+    // true distances, and a stale field would then over-estimate and let a
+    // ray skip the new geometry. Erasing only raises true distances, so a
+    // stale field merely under-estimates -- costing speed, never correctness
+    // -- and is left alone.
+    if !erase {
+        scene.field_dirty = Some(scene.field.lower_around(centre, brush.radius));
+    }
     // Deliberately not bumped: an edit is uploaded by range, and bumping the
     // generation is what asks for a full rebuild.
 }

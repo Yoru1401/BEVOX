@@ -193,6 +193,10 @@ pub fn prepare_march_buffers(
                 let offset = u64::from(write.start_word) * 4;
                 queue.write_buffer(&buffers.voxels, offset, bytemuck::cast_slice(&write.words));
             }
+            for write in &update.field {
+                let offset = u64::from(write.start_word) * 4;
+                queue.write_buffer(&buffers.field, offset, bytemuck::cast_slice(&write.words));
+            }
         }
         return;
     }

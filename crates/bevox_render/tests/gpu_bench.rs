@@ -317,10 +317,13 @@ fn close_camera(tree: &bevox_core::contree::Contree, extent: u32) -> (Vec3, Mat4
 #[ignore]
 fn an_edit_uploads_a_fraction_of_the_scene() {
     let (tree, extent) = bench_scene();
+    let field = bevox_core::distance_field::DistanceField::build(&tree);
     let mut scene = bevox_render::upload::VoxelScene {
         tree,
         materials: bevox_core::material::MaterialTable::new(),
         generation: 1,
+        field,
+        field_dirty: None,
     };
     scene.tree.arena_mut().clear_dirty();
 

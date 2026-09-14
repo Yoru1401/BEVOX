@@ -7,10 +7,12 @@ use bevy::render::Extract;
 use bevy::render::extract_resource::ExtractResource;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevox_core::contree::Contree;
+use bevox_core::distance_field::DistanceField;
 use bevox_core::gpu::{GpuNode, GpuVolume};
 use bevox_core::mask_table::build_direction_masks;
 use bevox_core::material::MaterialTable;
 use bytemuck::{Pod, Zeroable};
+use std::ops::Range;
 
 /// The scene the renderer draws. Replacing it re-uploads on the next frame.
 #[derive(Resource)]
@@ -20,6 +22,14 @@ pub struct VoxelScene {
     pub materials: MaterialTable,
     /// Bumped whenever `tree` changes, so the render world knows to re-upload.
     pub generation: u32,
+    /// Coarse distance-to-solid grid, kept in step with `tree` by the brush.
+    pub field: DistanceField,
+    /// Cell range the brush lowered since the last `stage_scene_update`, if any.
+    ///
+    /// `None` after an erase: removing geometry only raises true distances, so
+    /// a stale field merely under-estimates -- costing speed, never
+    /// correctness -- and needs no upload at all.
+    pub field_dirty: Option<Range<u32>>,
 }
 
 /// Camera and volume parameters, as the shader sees them.
@@ -324,6 +334,13 @@ pub struct VoxelWrite {
     pub words: Vec<u32>,
 }
 
+/// A contiguous run of packed distance-field words to write.
+#[derive(Clone, Debug)]
+pub struct FieldWrite {
+    pub start_word: u32,
+    pub words: Vec<u32>,
+}
+
 /// One frame's worth of scene changes.
 ///
 /// Cloned into the render world every frame like the rest of the extracted
@@ -335,6 +352,9 @@ pub struct SceneUpdate {
     pub root: GpuNode,
     pub nodes: Vec<NodeWrite>,
     pub voxels: Vec<VoxelWrite>,
+    /// The field cells the brush lowered this frame. Empty on every frame with
+    /// no paint, including one that only erased.
+    pub field: Vec<FieldWrite>,
     /// Arena slots in use. The node buffer must hold this many plus the root.
     pub node_high_water: u32,
     /// Packed voxel words in use.
@@ -347,6 +367,7 @@ impl Default for SceneUpdate {
             root: GpuNode::default(),
             nodes: Vec::new(),
             voxels: Vec::new(),
+            field: Vec::new(),
             node_high_water: 0,
             voxel_word_high_water: 0,
         }
@@ -391,10 +412,29 @@ pub fn stage_scene_update(scene: &mut VoxelScene) -> SceneUpdate {
         })
         .collect();
 
+    // Rounded outward to whole words exactly like the voxel path, and read
+    // from the live field rather than remembered values so a cell sharing a
+    // boundary word with the untouched range still comes out right. `None`
+    // after an erase, which is what makes that path stage nothing at all.
+    let cells = scene.field.cells();
+    let field = scene
+        .field_dirty
+        .take()
+        .map(|r| {
+            let first = r.start / 4;
+            let last = r.end.div_ceil(4);
+            let lo = (first * 4) as usize;
+            let hi = ((last * 4) as usize).min(cells.len());
+            FieldWrite { start_word: first, words: bevox_core::gpu::pack_voxels(&cells[lo..hi]) }
+        })
+        .into_iter()
+        .collect();
+
     let update = SceneUpdate {
         root: GpuNode::from(scene.tree.root()),
         nodes,
         voxels,
+        field,
         node_high_water: arena.nodes().len() as u32,
         voxel_word_high_water: arena.voxels().len().div_ceil(4) as u32,
     };
@@ -529,7 +569,41 @@ mod tests {
         // The initial build is not an edit: clear it so a test sees only what
         // the edit under test touched.
         tree.arena_mut().clear_dirty();
-        VoxelScene { tree, materials: MaterialTable::new(), generation: 1 }
+        let field = DistanceField::build(&tree);
+        VoxelScene { tree, materials: MaterialTable::new(), generation: 1, field, field_dirty: None }
+    }
+
+    /// Painting must update the field in the same frame as the voxels, or the
+    /// GPU skips empty space that is no longer empty.
+    #[test]
+    fn a_paint_stages_the_field_cells_it_lowered() {
+        let mut scene = edit_scene();
+        scene.tree.apply_sphere(Vec3::splat(32.0), 6.0, MaterialId(2));
+        // What `brush_input` does: lower the field, then record the range
+        // `lower_around` returned so `stage_scene_update` knows to stage it.
+        scene.field_dirty = Some(scene.field.lower_around(Vec3::splat(32.0), 6.0));
+
+        let update = stage_scene_update(&mut scene);
+        assert!(!update.field.is_empty(), "a paint staged no field cells");
+
+        let whole = pack_field(&scene.field);
+        for write in &update.field {
+            for (i, word) in write.words.iter().enumerate() {
+                let w = write.start_word as usize + i;
+                assert_eq!(*word, whole[w], "staged field word {w} differs from a full pack");
+            }
+        }
+    }
+
+    /// Erasing needs no field update at all: removing geometry only increases
+    /// true distances, so a stale field under-estimates, which costs speed and
+    /// never correctness.
+    #[test]
+    fn erasing_stages_no_field_cells() {
+        let mut scene = edit_scene();
+        scene.tree.apply_sphere(Vec3::splat(32.0), 6.0, MaterialId::EMPTY);
+        let update = stage_scene_update(&mut scene);
+        assert!(update.field.is_empty(), "an erase staged field cells it did not need to");
     }
 
     #[test]
@@ -627,7 +701,14 @@ mod tests {
         let mut tree = Contree::empty(3);
         tree.apply_sphere(Vec3::new(32.0, 32.0, 32.0), 10.0, MaterialId(1));
         tree.arena_mut().clear_dirty();
-        app.insert_resource(VoxelScene { tree, materials: MaterialTable::new(), generation: 1 });
+        let field = DistanceField::build(&tree);
+        app.insert_resource(VoxelScene {
+            tree,
+            materials: MaterialTable::new(),
+            generation: 1,
+            field,
+            field_dirty: None,
+        });
         app.update();
 
         let loaded_nodes = app.world().resource::<GpuSceneData>().nodes.clone();
@@ -672,7 +753,14 @@ mod tests {
         let mut tree = Contree::empty(3);
         tree.apply_sphere(Vec3::new(32.0, 32.0, 32.0), 10.0, MaterialId(1));
         tree.arena_mut().clear_dirty();
-        app.insert_resource(VoxelScene { tree, materials: MaterialTable::new(), generation: 1 });
+        let field = DistanceField::build(&tree);
+        app.insert_resource(VoxelScene {
+            tree,
+            materials: MaterialTable::new(),
+            generation: 1,
+            field,
+            field_dirty: None,
+        });
         app.update();
 
         let loaded_nodes = app.world().resource::<GpuSceneData>().nodes.clone();
