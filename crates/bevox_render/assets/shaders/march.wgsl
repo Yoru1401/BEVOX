@@ -630,9 +630,13 @@ fn march_shadow(@builtin(global_invocation_id) id: vec3<u32>) {
     var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if hit.hit {
         let n = implicit_normal(hit.voxel, hit.face_normal);
-        // Offset along the normal so the ray does not immediately re-hit its own
-        // voxel. 0.75 matches bevox_core's reference renderer.
-        let origin = vec3<f32>(hit.voxel) + vec3<f32>(0.5) + n * 0.75;
+        // Offset along the FACE normal, not the smoothed one. The implicit
+        // normal is a blend of neighbouring empty faces, so at a three-way
+        // corner it is normalize(1,1,1) and 0.75 along it clears only 0.433
+        // per axis -- less than the voxel's 0.5 half-extent, leaving the ray
+        // inside its own voxel to immediately self-shadow. The face normal is
+        // axis-aligned, so 0.75 always clears.
+        let origin = vec3<f32>(hit.voxel) + vec3<f32>(0.5) + hit.face_normal * 0.75;
         var shadowed = 0.0;
         if traverse_any(origin, view.sun_direction.xyz, max_ray_distance()) {
             shadowed = 1.0;
@@ -708,7 +712,9 @@ fn march(@builtin(global_invocation_id) id: vec3<u32>) {
         let n = implicit_normal(hit.voxel, hit.face_normal);
         let sun = view.sun_direction.xyz;
 
-        let origin = vec3<f32>(hit.voxel) + vec3<f32>(0.5) + n * 0.75;
+        // Face normal, not the smoothed one: see march_shadow. A blended
+        // corner normal does not clear the voxel's own half-extent.
+        let origin = vec3<f32>(hit.voxel) + vec3<f32>(0.5) + hit.face_normal * 0.75;
         var diffuse = max(dot(n, sun), 0.0) * 0.75;
         if traverse_any(origin, sun, max_ray_distance()) {
             diffuse = 0.0;

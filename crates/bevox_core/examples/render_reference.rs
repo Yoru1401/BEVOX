@@ -46,7 +46,16 @@ fn main() {
             ) {
                 Some(hit) => {
                     let normal = implicit_normal(&tree, hit.voxel, hit.face_normal);
-                    shade(&tree, &table, hit.voxel, hit.material, normal, sun, &mut stats)
+                    shade(
+                        &tree,
+                        &table,
+                        hit.voxel,
+                        hit.material,
+                        normal,
+                        hit.face_normal,
+                        sun,
+                        &mut stats,
+                    )
                 }
                 None => [90, 120, 180],
             };
@@ -68,13 +77,18 @@ fn shade(
     voxel: UVec3,
     material: MaterialId,
     normal: Vec3,
+    face_normal: Vec3,
     sun: Vec3,
     stats: &mut MarchStats,
 ) -> [u8; 3] {
     let base = table.get(material).color;
 
     // Offset along the normal so the shadow ray does not re-hit its own voxel.
-    let origin = voxel.as_vec3() + Vec3::splat(0.5) + normal * 0.75;
+    // Face normal rather than the smoothed one: at a three-way corner the
+    // blended normal is normalize(1,1,1), and 0.75 along it clears only 0.433
+    // per axis -- inside the voxel's own 0.5 half-extent, so the shadow ray
+    // hits the surface it started from.
+    let origin = voxel.as_vec3() + Vec3::splat(0.5) + face_normal * 0.75;
     let shadowed = march(tree, Affine3A::IDENTITY, origin, sun, 500.0, true, stats).is_some();
 
     let ambient = 0.25;
