@@ -6,7 +6,8 @@ use crate::upload::{
 use bevy::prelude::*;
 use bevy::material::bind_group_layout_entries::BindGroupLayoutEntries;
 use bevy::material::bind_group_layout_entries::binding_types::{
-    storage_buffer_read_only_sized, texture_storage_2d, uniform_buffer_sized,
+    storage_buffer_read_only_sized, storage_buffer_sized, texture_storage_2d,
+    uniform_buffer_sized,
 };
 use bevy::material::descriptor::BindGroupLayoutDescriptor;
 use bevy::render::render_asset::RenderAssets;
@@ -25,6 +26,15 @@ pub const BEAM_SCALE: u32 = 8;
 /// built once with the scene, while the window size is only known later, so it
 /// is sized for the largest window rather than resized. 2 MB.
 pub const BEAM_CAPACITY: u32 = (7680 / BEAM_SCALE) * (4320 / BEAM_SCALE);
+
+/// Bindings the shader declares, and therefore the number of entries
+/// `init_march_pipeline`'s layout tuple must contain.
+///
+/// Adding a binding to the shader without adding a layout entry is not a
+/// compile error and no parity test catches it -- the test harness builds its
+/// own layout, so it kept passing while the app could not create its pipeline
+/// at all. `the_layout_declares_every_binding_the_shader_uses` is the gate.
+pub const MARCH_BINDING_COUNT: usize = 7;
 
 /// Voxel data budget on the GPU. Checked at upload; exceeding it is an error,
 /// never an allocation attempt.
@@ -90,6 +100,9 @@ pub fn init_march_pipeline(
             storage_buffer_read_only_sized(false, NonZero::new(16)),
             texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
             storage_buffer_read_only_sized(false, NonZero::new(8)),
+            // Beam prepass results: array<f32>, written by the prepass and read
+            // by the main pass, so read_write rather than read_only.
+            storage_buffer_sized(false, NonZero::new(4)),
         ),
     );
 
@@ -305,6 +318,40 @@ pub fn dispatch_march(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The app's bind group layout must cover every binding `march.wgsl`
+    /// declares.
+    ///
+    /// This exists because it failed: the beam prepass added
+    /// `@group(0) @binding(6)` and nothing added the matching layout entry.
+    /// The whole suite stayed green -- the GPU harness declares its own
+    /// layout -- and the app died on startup with "Shader global
+    /// ResourceBinding { group: 0, binding: 6 } is not available in the
+    /// pipeline layout".
+    #[test]
+    fn the_layout_declares_every_binding_the_shader_uses() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/shaders/march.wgsl"
+        ))
+        .expect("shader missing");
+
+        let mut bindings: Vec<usize> = source
+            .lines()
+            .filter_map(|line| line.split("@group(0) @binding(").nth(1))
+            .filter_map(|rest| rest.split(')').next())
+            .filter_map(|n| n.trim().parse().ok())
+            .collect();
+        bindings.sort_unstable();
+        bindings.dedup();
+
+        assert!(!bindings.is_empty(), "no bindings parsed; the scan is broken, not the layout");
+        assert_eq!(
+            bindings,
+            (0..MARCH_BINDING_COUNT).collect::<Vec<_>>(),
+            "march.wgsl declares bindings {bindings:?}, but the layout in              init_march_pipeline is built for {MARCH_BINDING_COUNT}. Add the missing              entry to the tuple and update MARCH_BINDING_COUNT together."
+        );
+    }
 
     #[test]
     fn capacity_leaves_room_to_grow() {
