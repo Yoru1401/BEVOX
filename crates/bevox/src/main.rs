@@ -100,12 +100,15 @@ impl Default for BrushSettings {
     }
 }
 
-/// Left click paints, middle click erases, the wheel resizes the brush.
+/// Left click paints, Ctrl+left click erases, the wheel resizes the brush.
 ///
-/// Erase is on middle, not right, because right-mouse is the exclusive look
-/// control for the fly camera: holding right-mouse rotates the view. A press
-/// on right-mouse that targets look must not also erase, or every camera
-/// rotation would destroy geometry at the crosshair.
+/// Erase is not on right-click: right-mouse is the exclusive look control for
+/// the fly camera, and a press that targets look must not also erase, or
+/// every camera rotation would destroy geometry at the crosshair.
+///
+/// Erase is not on middle-click either: middle is the same physical component
+/// as the resize wheel, so a user scrolling to size the brush who presses
+/// slightly too hard would trigger an irreversible erase at the crosshair.
 ///
 /// The pick runs against the same tree the renderer draws, so what is clicked
 /// is what was seen. Placing the sphere at the hit point rather than at the
@@ -113,6 +116,7 @@ impl Default for BrushSettings {
 /// turns.
 fn brush_input(
     buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
     mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
     mut brush: ResMut<BrushSettings>,
     mut scene: ResMut<VoxelScene>,
@@ -122,11 +126,10 @@ fn brush_input(
         brush.radius = (brush.radius + event.y).clamp(1.0, 32.0);
     }
 
-    let paint = buttons.just_pressed(MouseButton::Left);
-    let erase = buttons.just_pressed(MouseButton::Middle);
-    if !paint && !erase {
+    if !buttons.just_pressed(MouseButton::Left) {
         return;
     }
+    let erase = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let Ok((transform, projection)) = camera.single() else {
         return;
     };
@@ -151,7 +154,6 @@ fn brush_input(
     scene.tree.apply_sphere(centre, brush.radius, material);
     // Deliberately not bumped: an edit is uploaded by range, and bumping the
     // generation is what asks for a full rebuild.
-    let _ = scene.generation;
 }
 
 /// The same floor, column and carved sphere the parity test uses, so what is on

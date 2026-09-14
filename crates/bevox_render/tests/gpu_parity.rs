@@ -915,7 +915,7 @@ fn an_incrementally_uploaded_edit_renders_identically() {
     // same way and uploaded from scratch each time.
     let mut incremental = VoxelScene {
         tree: parity_scene(),
-        materials: parity_materials_table(),
+        materials: parity_materials(),
         generation: 1,
     };
     incremental.tree.arena_mut().clear_dirty();

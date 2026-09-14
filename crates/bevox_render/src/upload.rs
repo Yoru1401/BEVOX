@@ -1,5 +1,6 @@
 //! Moving voxel data and camera parameters into the render world.
 
+use crate::pipeline::buffer_capacity_for;
 use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
 use bevy::render::extract_resource::ExtractResource;
@@ -124,6 +125,15 @@ pub fn gpu_direction_masks() -> Vec<[u32; 2]> {
 /// range upload path entirely. An edit deliberately leaves `generation`
 /// alone; only a full scene load bumps it. Do not restore the `is_changed`
 /// guard here -- that is the bug this comment exists to prevent.
+///
+/// A generation match is not enough on its own, though: `prepare_march_buffers`
+/// also rebuilds -- from this resource -- whenever an edit's high-water marks
+/// have outgrown the render buffers' capacity. If this resource stayed a
+/// frozen load-time snapshot, that rebuild would re-upload stale data forever
+/// (the new capacity is computed from the same stale snapshot, so the overflow
+/// never clears). So a live tree that no longer fits the capacity implied by
+/// the existing snapshot forces a refresh too, using the same
+/// `buffer_capacity_for` the render world uses so the two worlds cannot drift.
 pub fn build_gpu_scene(
     mut commands: Commands,
     scene: Option<Res<VoxelScene>>,
@@ -133,10 +143,18 @@ pub fn build_gpu_scene(
     let Some(scene) = scene else {
         return;
     };
-    if let Some(existing) = &existing
-        && existing.generation == scene.generation
-    {
-        return;
+    if let Some(existing) = &existing {
+        // +1: the root, which lives at buffer index 0, outside the arena.
+        let nodes_needed = scene.tree.arena().nodes().len() as u32 + 1;
+        let node_capacity = buffer_capacity_for(existing.nodes.len() as u32);
+        let voxel_words_needed = scene.tree.arena().voxels().len().div_ceil(4) as u32;
+        let voxel_word_capacity = buffer_capacity_for(existing.voxels.len() as u32);
+        if existing.generation == scene.generation
+            && nodes_needed <= node_capacity
+            && voxel_words_needed <= voxel_word_capacity
+        {
+            return;
+        }
     }
     let volume = GpuVolume::from_contree(&scene.tree);
     commands.insert_resource(GpuSceneData {
@@ -252,8 +270,6 @@ pub struct SceneUpdate {
     pub node_high_water: u32,
     /// Packed voxel words in use.
     pub voxel_word_high_water: u32,
-    /// Bumped by a full scene replacement, never by an edit.
-    pub generation: u32,
 }
 
 impl Default for SceneUpdate {
@@ -264,7 +280,6 @@ impl Default for SceneUpdate {
             voxels: Vec::new(),
             node_high_water: 0,
             voxel_word_high_water: 0,
-            generation: 0,
         }
     }
 }
@@ -313,7 +328,6 @@ pub fn stage_scene_update(scene: &mut VoxelScene) -> SceneUpdate {
         voxels,
         node_high_water: arena.nodes().len() as u32,
         voxel_word_high_water: arena.voxels().len().div_ceil(4) as u32,
-        generation: scene.generation,
     };
 
     scene.tree.arena_mut().clear_dirty();
@@ -532,6 +546,68 @@ mod tests {
             app.world().resource::<GpuSceneData>().nodes,
             loaded_nodes,
             "bumping generation must trigger a rebuild"
+        );
+    }
+
+    #[test]
+    fn an_edit_that_outgrows_the_buffers_forces_a_rebuild_from_the_live_tree() {
+        // Regression guard for the capacity-overflow path: `prepare_march_buffers`
+        // falls back to rebuilding from `GpuSceneData` once an edit's high-water
+        // mark outgrows the render buffers. If `build_gpu_scene` never refreshes
+        // that snapshot for anything but a generation bump, that fallback reads
+        // a permanently stale tree.
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<GpuSceneData>()
+            .add_systems(Update, build_gpu_scene);
+
+        let mut tree = Contree::empty(3);
+        tree.apply_sphere(Vec3::new(32.0, 32.0, 32.0), 10.0, MaterialId(1));
+        tree.arena_mut().clear_dirty();
+        app.insert_resource(VoxelScene { tree, materials: MaterialTable::new(), generation: 1 });
+        app.update();
+
+        let loaded_nodes = app.world().resource::<GpuSceneData>().nodes.clone();
+        let node_capacity = buffer_capacity_for(loaded_nodes.len() as u32);
+
+        // Paint one isolated voxel per leaf block (extent 4, so a 64-extent tree
+        // has 16^3 of them) across distinct blocks until the live arena has
+        // outgrown the capacity the loaded snapshot implies. Each block starts
+        // untouched, so a single covered voxel among its 64 is never uniform
+        // and always forces a fresh node allocation up the chain to the root.
+        {
+            let mut scene = app.world_mut().resource_mut::<VoxelScene>();
+            'grid: for bx in 0..16u32 {
+                for by in 0..16u32 {
+                    for bz in 0..16u32 {
+                        if scene.tree.arena().nodes().len() as u32 + 1 >= node_capacity {
+                            break 'grid;
+                        }
+                        let centre = Vec3::new(
+                            (bx * 4) as f32 + 0.5,
+                            (by * 4) as f32 + 0.5,
+                            (bz * 4) as f32 + 0.5,
+                        );
+                        scene.tree.apply_sphere(centre, 0.6, MaterialId(2));
+                    }
+                }
+            }
+            assert!(
+                scene.tree.arena().nodes().len() as u32 + 1 >= node_capacity,
+                "test setup failed to outgrow the buffers -- widen the grid"
+            );
+        }
+        app.update();
+
+        let rebuilt_nodes = app.world().resource::<GpuSceneData>().nodes.clone();
+        assert_ne!(
+            rebuilt_nodes, loaded_nodes,
+            "outgrowing the buffers must rebuild GpuSceneData, not keep serving the load-time snapshot"
+        );
+        let expected = GpuVolume::from_contree(&app.world().resource::<VoxelScene>().tree).buffer_nodes();
+        assert_eq!(
+            rebuilt_nodes, expected,
+            "the forced rebuild must reflect the tree as it stands now, not some other snapshot"
         );
     }
 }

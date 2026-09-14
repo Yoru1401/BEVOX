@@ -33,23 +33,6 @@ pub fn parity_materials() -> MaterialTable {
     table
 }
 
-/// The same colours `parity_materials` produces, as a MaterialTable.
-///
-/// Shared rather than duplicated so a test cannot pass by lighting the scene
-/// differently from the thing it is checking.
-///
-/// `push` assigns ids in order from 1, so the nth pushed material gets
-/// MaterialId(n) -- which is what makes this agree with `parity_materials`,
-/// whose index 0 is the empty slot.
-pub fn parity_materials_table() -> bevox_core::material::MaterialTable {
-    let mut table = bevox_core::material::MaterialTable::new();
-    let source = parity_materials();
-    for id in 1..source.len() as u8 {
-        table.push(source.get(bevox_core::material::MaterialId(id)));
-    }
-    table
-}
-
 /// One read-only storage binding of the given minimum element size.
 pub fn storage_entry(binding: u32, min_size: u64) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
