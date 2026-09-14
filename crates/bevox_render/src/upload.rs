@@ -209,6 +209,104 @@ pub fn march_uniform(
     }
 }
 
+/// A contiguous run of nodes to write, addressed by arena slot.
+#[derive(Clone, Debug)]
+pub struct NodeWrite {
+    /// First arena slot. The buffer index is this plus one: index 0 is the root.
+    pub start: u32,
+    pub nodes: Vec<GpuNode>,
+}
+
+/// A contiguous run of packed voxel words to write.
+#[derive(Clone, Debug)]
+pub struct VoxelWrite {
+    pub start_word: u32,
+    pub words: Vec<u32>,
+}
+
+/// One frame's worth of scene changes.
+///
+/// Cloned into the render world every frame like the rest of the extracted
+/// state, which is only affordable because it is empty on frames with no edit.
+#[derive(Resource, Clone, Debug, ExtractResource)]
+pub struct SceneUpdate {
+    /// Always present. The root lives outside the arena, so no dirty range can
+    /// name it, and nearly every edit replaces it.
+    pub root: GpuNode,
+    pub nodes: Vec<NodeWrite>,
+    pub voxels: Vec<VoxelWrite>,
+    /// Arena slots in use. The node buffer must hold this many plus the root.
+    pub node_high_water: u32,
+    /// Packed voxel words in use.
+    pub voxel_word_high_water: u32,
+    /// Bumped by a full scene replacement, never by an edit.
+    pub generation: u32,
+}
+
+impl Default for SceneUpdate {
+    fn default() -> Self {
+        Self {
+            root: GpuNode::default(),
+            nodes: Vec::new(),
+            voxels: Vec::new(),
+            node_high_water: 0,
+            voxel_word_high_water: 0,
+            generation: 0,
+        }
+    }
+}
+
+/// Drains the arena's dirty ranges into a delta the render world can write.
+///
+/// Reads the current arena rather than remembering old values, which is what
+/// makes the voxel path correct: a dirty byte range is rounded outward to whole
+/// words, and the untouched bytes sharing those words are re-read as they are.
+pub fn stage_scene_update(scene: &mut VoxelScene) -> SceneUpdate {
+    let node_ranges = scene.tree.arena().dirty_nodes();
+    let voxel_ranges = scene.tree.arena().dirty_voxels();
+
+    let arena = scene.tree.arena();
+    let nodes = node_ranges
+        .iter()
+        .map(|r| NodeWrite {
+            start: r.start,
+            nodes: arena.nodes()[r.start as usize..r.end as usize]
+                .iter()
+                .map(|n| GpuNode::from(*n))
+                .collect(),
+        })
+        .collect();
+
+    let bytes = arena.voxels();
+    let voxels = voxel_ranges
+        .iter()
+        .map(|r| {
+            let first = r.start / 4;
+            let last = r.end.div_ceil(4);
+            let lo = (first * 4) as usize;
+            // The final word may run past the arena; pack_voxels zero-pads it,
+            // and those bytes belong to no voxel.
+            let hi = ((last * 4) as usize).min(bytes.len());
+            VoxelWrite {
+                start_word: first,
+                words: bevox_core::gpu::pack_voxels(&bytes[lo..hi]),
+            }
+        })
+        .collect();
+
+    let update = SceneUpdate {
+        root: GpuNode::from(scene.tree.root()),
+        nodes,
+        voxels,
+        node_high_water: arena.nodes().len() as u32,
+        voxel_word_high_water: arena.voxels().len().div_ceil(4) as u32,
+        generation: scene.generation,
+    };
+
+    scene.tree.arena_mut().clear_dirty();
+    update
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +366,99 @@ mod tests {
         assert_eq!(u.world_from_clip[3][0], 5.0);
         assert_eq!(u.world_from_clip[3][1], 6.0);
         assert_eq!(u.world_from_clip[3][2], 7.0);
+    }
+
+    use bevox_core::contree::Contree;
+    use bevox_core::material::MaterialId;
+    use glam::Vec3;
+
+    /// A scene with something in it, so an edit has existing nodes to rewrite
+    /// rather than only allocating fresh ones.
+    fn edit_scene() -> VoxelScene {
+        let mut tree = Contree::empty(3);
+        tree.apply_sphere(Vec3::new(32.0, 32.0, 32.0), 12.0, MaterialId(1));
+        // The initial build is not an edit: clear it so a test sees only what
+        // the edit under test touched.
+        tree.arena_mut().clear_dirty();
+        VoxelScene { tree, materials: MaterialTable::new(), generation: 1 }
+    }
+
+    #[test]
+    fn staging_an_untouched_scene_produces_no_writes() {
+        let mut scene = edit_scene();
+        let update = stage_scene_update(&mut scene);
+        assert!(update.nodes.is_empty(), "nothing was edited, yet nodes were staged");
+        assert!(update.voxels.is_empty(), "nothing was edited, yet voxels were staged");
+    }
+
+    #[test]
+    fn the_root_is_staged_even_when_it_is_in_no_dirty_range() {
+        // The root lives at buffer index 0, outside the arena, so no dirty
+        // range can ever name it -- and nearly every edit replaces it.
+        let mut scene = edit_scene();
+        let before = GpuNode::from(scene.tree.root());
+        scene.tree.apply_sphere(Vec3::new(32.0, 32.0, 32.0), 20.0, MaterialId(2));
+        let update = stage_scene_update(&mut scene);
+        assert_eq!(update.root, GpuNode::from(scene.tree.root()));
+        assert_ne!(update.root, before, "this edit should have changed the root");
+    }
+
+    #[test]
+    fn staged_nodes_carry_the_bytes_the_arena_holds_now() {
+        let mut scene = edit_scene();
+        scene.tree.apply_sphere(Vec3::new(20.0, 20.0, 20.0), 6.0, MaterialId(3));
+        let update = stage_scene_update(&mut scene);
+        assert!(!update.nodes.is_empty(), "an edit staged no node writes");
+        let arena = scene.tree.arena();
+        for write in &update.nodes {
+            for (i, staged) in write.nodes.iter().enumerate() {
+                let slot = write.start as usize + i;
+                assert_eq!(
+                    *staged,
+                    GpuNode::from(arena.nodes()[slot]),
+                    "staged node at arena slot {slot} does not match the arena"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn staged_voxel_words_match_a_full_pack_of_the_arena() {
+        let mut scene = edit_scene();
+        scene.tree.apply_sphere(Vec3::new(30.0, 30.0, 30.0), 4.0, MaterialId(4));
+        let update = stage_scene_update(&mut scene);
+        let whole = bevox_core::gpu::pack_voxels(scene.tree.arena().voxels());
+        assert!(!update.voxels.is_empty(), "an edit staged no voxel writes");
+        for write in &update.voxels {
+            for (i, word) in write.words.iter().enumerate() {
+                let w = write.start_word as usize + i;
+                assert_eq!(*word, whole[w], "staged voxel word {w} differs from a full pack");
+            }
+        }
+    }
+
+    #[test]
+    fn staging_clears_the_dirty_record_so_the_next_frame_stages_nothing() {
+        let mut scene = edit_scene();
+        scene.tree.apply_sphere(Vec3::new(32.0, 32.0, 32.0), 8.0, MaterialId(1));
+        let first = stage_scene_update(&mut scene);
+        assert!(!first.nodes.is_empty());
+        let second = stage_scene_update(&mut scene);
+        assert!(second.nodes.is_empty(), "the same edit staged twice");
+        assert!(second.voxels.is_empty(), "the same edit staged twice");
+    }
+
+    #[test]
+    fn the_high_water_marks_cover_the_whole_arena() {
+        // The buffers must be large enough for every slot, not merely for the
+        // dirty ones: a slot allocated by an earlier edit is still read.
+        let mut scene = edit_scene();
+        scene.tree.apply_sphere(Vec3::new(40.0, 40.0, 40.0), 10.0, MaterialId(2));
+        let update = stage_scene_update(&mut scene);
+        assert_eq!(update.node_high_water, scene.tree.arena().nodes().len() as u32);
+        assert_eq!(
+            update.voxel_word_high_water,
+            scene.tree.arena().voxels().len().div_ceil(4) as u32
+        );
     }
 }
