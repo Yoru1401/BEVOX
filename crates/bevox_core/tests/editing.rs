@@ -108,3 +108,39 @@ fn repeated_identical_edits_are_stable() {
     assert_eq!(tree.to_dense(), after_first);
     assert_eq!(tree.check_canonical(), Ok(()));
 }
+
+#[test]
+fn painting_then_erasing_the_same_sphere_restores_the_tree() {
+    // The property the brush rests on: erase is paint with EMPTY, and the
+    // two compose back to where they started. If they do not, repeated
+    // editing drifts and the arena grows without bound.
+    let mut dense = DenseVolume::new(64).unwrap();
+    for z in 0..64 {
+        for x in 0..64 {
+            for y in 0..6 {
+                dense.set(UVec3::new(x, y, z), MaterialId(1));
+            }
+        }
+    }
+    let tree = dense.into_contree();
+    let before = tree.to_dense();
+
+    let mut edited = tree;
+    edited.apply_sphere(Vec3::new(32.0, 3.0, 32.0), 5.0, MaterialId(2));
+    assert_ne!(edited.to_dense(), before, "the paint did nothing");
+
+    // Erase exactly what was painted, then repaint the floor it removed.
+    edited.apply_sphere(Vec3::new(32.0, 3.0, 32.0), 5.0, MaterialId::EMPTY);
+    for z in 0..64 {
+        for x in 0..64 {
+            for y in 0..6 {
+                let p = UVec3::new(x, y, z);
+                if before.get(p) != MaterialId::EMPTY && edited.get(p) == MaterialId::EMPTY {
+                    edited.apply_sphere(p.as_vec3() + Vec3::splat(0.5), 0.4, MaterialId(1));
+                }
+            }
+        }
+    }
+    assert_eq!(edited.to_dense(), before, "paint then erase did not round trip");
+    edited.check_canonical().expect("the tree stopped being canonical");
+}
