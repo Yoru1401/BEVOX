@@ -3,6 +3,7 @@
 use crate::pipeline::buffer_capacity_for;
 use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
+use bevy::render::Extract;
 use bevy::render::extract_resource::ExtractResource;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevox_core::contree::Contree;
@@ -67,10 +68,10 @@ pub struct MarchTarget {
 
 /// The scene as the render world sees it.
 ///
-/// ponytail: cloned into the render world every frame. Fine at 64^3 (a few
-/// hundred KB); switch to uploading only when `generation` changes once editing
-/// lands and scenes get large.
-#[derive(Resource, Clone, ExtractResource)]
+/// Extracted by `extract_gpu_scene` rather than `ExtractResourcePlugin`, which
+/// would clone the whole thing every frame. The render world keeps its copy
+/// across frames and only needs a fresh one when the scene is actually rebuilt.
+#[derive(Resource, Clone)]
 pub struct GpuSceneData {
     pub nodes: Vec<GpuNode>,
     pub voxels: Vec<u32>,
@@ -100,6 +101,51 @@ impl Default for GpuSceneData {
             generation: 0,
         }
     }
+}
+
+/// Whether the render world's copy of the scene is stale.
+///
+/// `changed` is the main-world resource's change flag, which `build_gpu_scene`
+/// raises only when it actually rebuilds. That covers both of its triggers --
+/// a replaced scene and an edit outgrowing the buffers -- where comparing
+/// generations alone would miss the second, since an overflow rebuild
+/// deliberately leaves the generation where it is.
+///
+/// The generation comparison is belt and braces for the one failure that would
+/// be worst: a missed change tick on the load path leaving the render world
+/// showing nothing at all.
+pub fn scene_copy_is_stale(
+    changed: bool,
+    render_generation: Option<u32>,
+    main_generation: u32,
+) -> bool {
+    match render_generation {
+        // The render world has no copy yet, so anything is news.
+        None => true,
+        Some(g) => changed || g != main_generation,
+    }
+}
+
+/// Copies the scene into the render world, but only when it changed.
+///
+/// The per-frame cost of the blanket plugin was the whole payload: at extent
+/// 1024 the benchmark scene is 1.16 MB of nodes and 2.13 MB of voxels, and a
+/// composed `.vox` scene at extent 4096 runs to tens of megabytes. None of it
+/// changes on a frame where nothing was edited, and the render world reads only
+/// `depth`, `extent` and `generation` on such frames anyway.
+pub fn extract_gpu_scene(
+    mut commands: Commands,
+    scene: Extract<Res<GpuSceneData>>,
+    existing: Option<Res<GpuSceneData>>,
+) {
+    if !scene_copy_is_stale(
+        scene.is_changed(),
+        existing.map(|e| e.generation),
+        scene.generation,
+    ) {
+        return;
+    }
+    commands.insert_resource((*scene).clone());
 }
 
 /// The active camera, as the render world needs it.
@@ -360,6 +406,29 @@ mod tests {
         for (got, want) in split.iter().zip(source.iter()) {
             assert_eq!(u64::from(got[0]) | (u64::from(got[1]) << 32), *want);
         }
+    }
+
+    #[test]
+    fn a_render_world_without_a_copy_always_extracts() {
+        assert!(scene_copy_is_stale(false, None, 7));
+    }
+
+    #[test]
+    fn an_unchanged_scene_is_not_re_extracted() {
+        // The whole point: no clone on a quiet frame.
+        assert!(!scene_copy_is_stale(false, Some(7), 7));
+    }
+
+    #[test]
+    fn a_rebuilt_scene_is_extracted_even_at_the_same_generation() {
+        // An edit that outgrows the buffers rebuilds without bumping the
+        // generation, so the change flag is the only signal that it happened.
+        assert!(scene_copy_is_stale(true, Some(7), 7));
+    }
+
+    #[test]
+    fn a_generation_mismatch_is_extracted_even_without_the_change_flag() {
+        assert!(scene_copy_is_stale(false, Some(7), 8));
     }
 
     #[test]

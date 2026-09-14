@@ -8,7 +8,7 @@ pub mod upload;
 use bevy::prelude::*;
 use bevy::render::extract_resource::ExtractResourcePlugin;
 use bevy::render::renderer::{RenderGraph, RenderGraphSystems};
-use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
+use bevy::render::{ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems};
 
 /// Inserted by the plugin so tests can prove it built.
 #[derive(Resource, Debug, PartialEq, Eq)]
@@ -26,7 +26,6 @@ impl Plugin for BevoxRenderPlugin {
             .init_resource::<upload::GpuSceneData>()
             .init_resource::<upload::SceneUpdate>()
             .add_plugins(ExtractResourcePlugin::<upload::MarchTarget>::default())
-            .add_plugins(ExtractResourcePlugin::<upload::GpuSceneData>::default())
             .add_plugins(ExtractResourcePlugin::<upload::SceneUpdate>::default())
             .add_plugins(ExtractResourcePlugin::<upload::ExtractedMarchCamera>::default())
             .add_systems(
@@ -50,6 +49,7 @@ impl Plugin for BevoxRenderPlugin {
         let render_app = app.sub_app_mut(RenderApp);
         render_app
             .add_systems(RenderStartup, pipeline::init_march_pipeline)
+            .add_systems(ExtractSchedule, upload::extract_gpu_scene)
             .add_systems(
                 Render,
                 pipeline::prepare_march_buffers.in_set(RenderSystems::Prepare),
