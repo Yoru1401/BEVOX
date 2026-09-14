@@ -100,7 +100,7 @@ impl Default for BrushSettings {
     }
 }
 
-/// Left click paints, right click erases, the wheel resizes the brush.
+/// Left click paints at the cursor, right click erases, the wheel resizes.
 ///
 /// Camera look is on middle-drag, which is what frees both other buttons for
 /// editing. Two earlier arrangements were bugs: erase on right-click when look
@@ -112,12 +112,28 @@ impl Default for BrushSettings {
 /// is what was seen. Placing the sphere at the hit point rather than at the
 /// voxel centre keeps the brush from stepping in whole voxels as the camera
 /// turns.
+/// The cursor in normalised device coordinates: -1 to 1 on each axis, y up.
+///
+/// Screen coordinates run y-down from the top-left, so y is flipped. This
+/// matches `primary_ray` in march.wgsl, which is what makes a click land on
+/// the voxel that was drawn under the pointer.
+fn cursor_ndc(window: &Window) -> Option<Vec2> {
+    let p = window.cursor_position()?;
+    let w = window.width();
+    let h = window.height();
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    Some(Vec2::new(p.x / w * 2.0 - 1.0, 1.0 - p.y / h * 2.0))
+}
+
 fn brush_input(
     buttons: Res<ButtonInput<MouseButton>>,
     mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
     mut brush: ResMut<BrushSettings>,
     mut scene: ResMut<VoxelScene>,
     camera: Query<(&GlobalTransform, &Projection), With<Camera3d>>,
+    windows: Query<&Window>,
 ) {
     for event in wheel.read() {
         brush.radius = (brush.radius + event.y).clamp(1.0, 32.0);
@@ -135,9 +151,18 @@ fn brush_input(
     let eye = transform.translation();
     let world_from_clip =
         (projection.get_clip_from_view() * transform.to_matrix().inverse()).inverse();
-    // The crosshair, not the cursor: the fly camera holds the pointer captive
-    // for looking, so the centre of the screen is where the user is aiming.
-    let Some(hit) = pick_voxel(&scene.tree, world_from_clip, eye, Vec2::ZERO) else {
+
+    // The cursor, not the crosshair. Look is on middle-drag, so the pointer is
+    // free and the user aims with it. A cursor outside the window picks
+    // nothing rather than falling back to the centre, which would place a
+    // sphere somewhere the user was not pointing.
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Some(ndc) = cursor_ndc(window) else {
+        return;
+    };
+    let Some(hit) = pick_voxel(&scene.tree, world_from_clip, eye, ndc) else {
         return;
     };
 

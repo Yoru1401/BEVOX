@@ -117,6 +117,50 @@ mod tests {
         );
     }
 
+    /// A vertical offset must move the pick vertically, and upward on screen
+    /// must mean upward in the world.
+    ///
+    /// Screen coordinates run y-down and NDC runs y-up, so there is a flip in
+    /// the middle of this. Nothing caught a flip while the app only ever
+    /// picked at the screen centre; now that it picks at the cursor, a flip
+    /// would put every click on the wrong side of what the user aimed at.
+    #[test]
+    fn an_upward_offset_picks_a_higher_voxel() {
+        let tree = block_scene();
+        // Level with the block's centre, looking straight at it, so "up on
+        // screen" is unambiguously "up in the world".
+        let eye = Vec3::new(32.0, 32.0, -40.0);
+        let world_from_clip = camera(eye, Vec3::splat(32.0));
+        let centre = pick_voxel(&tree, world_from_clip, eye, Vec2::ZERO).unwrap();
+        let up = pick_voxel(&tree, world_from_clip, eye, Vec2::new(0.0, 0.1)).unwrap();
+        assert!(
+            up.voxel.y > centre.voxel.y,
+            "an upward offset picked {:?}, not above the centre pick {:?}",
+            up.voxel,
+            centre.voxel
+        );
+    }
+
+    /// The two axes must not be swapped.
+    ///
+    /// `an_off_centre_point_picks_a_different_voxel_than_the_centre` only
+    /// proves `ndc` is read at all: feeding y into the x slot would still
+    /// produce "a different voxel" and pass it.
+    #[test]
+    fn the_two_ndc_axes_are_not_swapped() {
+        let tree = block_scene();
+        let eye = Vec3::new(32.0, 32.0, -40.0);
+        let world_from_clip = camera(eye, Vec3::splat(32.0));
+        let centre = pick_voxel(&tree, world_from_clip, eye, Vec2::ZERO).unwrap();
+        let x_off = pick_voxel(&tree, world_from_clip, eye, Vec2::new(0.1, 0.0)).unwrap();
+        let y_off = pick_voxel(&tree, world_from_clip, eye, Vec2::new(0.0, 0.1)).unwrap();
+
+        assert_ne!(x_off.voxel.x, centre.voxel.x, "a horizontal offset did not move x");
+        assert_eq!(x_off.voxel.y, centre.voxel.y, "a horizontal offset moved y");
+        assert_ne!(y_off.voxel.y, centre.voxel.y, "a vertical offset did not move y");
+        assert_eq!(y_off.voxel.x, centre.voxel.x, "a vertical offset moved x");
+    }
+
     #[test]
     fn an_off_centre_point_picks_a_different_voxel_than_the_centre() {
         // Guards against ignoring the ndc argument entirely, which would make
