@@ -1,7 +1,10 @@
 //! Fly camera. The arithmetic lives in free functions so it is testable
 //! without a window, an input device or a running app.
 
+use bevy::math::Affine3A;
 use bevy::prelude::*;
+use bevox_core::contree::Contree;
+use bevox_core::march::{MarchStats, march};
 use std::f32::consts::FRAC_PI_2;
 
 /// Slightly under a right angle, so looking straight up never flips the basis.
@@ -102,6 +105,51 @@ fn axis(keys: &ButtonInput<KeyCode>, positive: KeyCode, negative: KeyCode) -> f3
     (keys.pressed(positive) as i32 as f32) - (keys.pressed(negative) as i32 as f32)
 }
 
+/// Where the camera starts: just in front of the first surface on the way to
+/// the volume's centre, rather than framing the whole thing from outside.
+///
+/// Framing from outside puts the camera where the renderer is cheapest and the
+/// scene is least interesting, and it switches the distance field off
+/// entirely -- the skip walk gives up on its first sample outside the grid, so
+/// a framed start pays the field's load cost and gets none of its benefit
+/// until the user flies in.
+///
+/// The surface is found with the CPU reference marcher rather than guessed, so
+/// this lands sensibly whether the model is 16 voxels across or 4096, and
+/// whether its geometry sits at the centre or off in a corner.
+pub fn start_camera(tree: &Contree) -> (Vec3, Vec3) {
+    let extent = tree.extent() as f32;
+    let centre = Vec3::splat(extent * 0.5);
+    // The old framed position, now only a place to look *from*.
+    let outside = centre + Vec3::new(-1.0, 1.2, -1.0).normalize() * extent * 1.1;
+    let dir = (centre - outside).normalize();
+
+    let mut stats = MarchStats::default();
+    let hit = march(
+        tree,
+        Affine3A::IDENTITY,
+        outside,
+        dir,
+        extent * 8.0,
+        false,
+        &mut stats,
+    );
+
+    match hit {
+        // Stand off the surface by a fixed distance in voxels, not a fraction
+        // of the extent: "close" has to mean the same apparent size whether the
+        // model is tiny or 4096 across.
+        Some(hit) => {
+            let surface = outside + dir * hit.t;
+            (surface - dir * 24.0, surface)
+        }
+        // Nothing on that line of sight -- an empty or very sparse scene. Stand
+        // at the centre and look along the same direction rather than framing
+        // from outside, so the view is still inside the volume.
+        None => (centre, centre + dir * extent * 0.25),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +231,50 @@ mod tests {
     #[test]
     fn a_zero_direction_falls_back_to_the_default_orientation() {
         assert_eq!(yaw_pitch_towards(Vec3::ZERO), (0.0, 0.0));
+    }
+
+    /// The camera must start inside the volume, close to something.
+    ///
+    /// Outside it the distance field is switched off -- the skip walk gives up
+    /// on its first out-of-grid sample -- so a framed start pays the field's
+    /// load cost and gets none of its benefit.
+    #[test]
+    fn the_start_camera_lands_inside_the_volume_near_geometry() {
+        use bevox_core::dense::DenseVolume;
+        use bevox_core::material::MaterialId;
+        use glam::UVec3;
+
+        let extent = 256u32;
+        let mut dense = DenseVolume::new(extent).unwrap();
+        for z in 0..extent {
+            for x in 0..extent {
+                for y in 0..40 {
+                    dense.set(UVec3::new(x, y, z), MaterialId(1));
+                }
+            }
+        }
+        let tree = dense.into_contree();
+        let (eye, target) = start_camera(&tree);
+
+        let hi = extent as f32;
+        assert!(
+            eye.cmpge(Vec3::ZERO).all() && eye.cmple(Vec3::splat(hi)).all(),
+            "the camera starts at {eye:?}, outside the 0..{hi} volume"
+        );
+        assert!(
+            eye.distance(target) < 40.0,
+            "the camera starts {} units from what it looks at, which is not close",
+            eye.distance(target)
+        );
+    }
+
+    /// An empty scene has no surface to stand near, and must still not frame
+    /// from outside.
+    #[test]
+    fn an_empty_scene_starts_at_the_centre() {
+        let tree = Contree::empty(3);
+        let (eye, target) = start_camera(&tree);
+        assert_eq!(eye, Vec3::splat(32.0));
+        assert_ne!(eye, target, "the camera looks at its own position");
     }
 }

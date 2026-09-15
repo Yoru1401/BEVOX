@@ -4,7 +4,7 @@ use bevox_core::dense::DenseVolume;
 use bevox_core::distance_field::DistanceField;
 use bevox_core::material::{Material, MaterialId, MaterialTable};
 use bevox_render::BevoxRenderPlugin;
-use bevox_render::camera::{FlyCamera, fly_camera_system};
+use bevox_render::camera::{FlyCamera, fly_camera_system, start_camera};
 use bevox_render::pick::pick_voxel;
 use bevox_render::upload::{VoxelScene, apply_brush};
 
@@ -67,12 +67,7 @@ fn setup(mut commands: Commands) {
         None => demo_scene(),
     };
 
-    // Framed from the volume's extent rather than hardcoded: an imported model
-    // may be 16 or 1024 voxels across, and a fixed position would put the camera
-    // inside the geometry or leave it off screen.
-    let extent = tree.extent() as f32;
-    let centre = Vec3::splat(extent * 0.5);
-    let eye = centre + Vec3::new(-1.0, 1.2, -1.0).normalize() * extent * 1.1;
+    let (eye, look_at) = start_camera(&tree);
 
     // 3D camera exists only to supply view and projection matrices to the
     // shader; it renders nothing itself.
@@ -82,7 +77,7 @@ fn setup(mut commands: Commands) {
         Transform::from_translation(eye),
         // Yaw and pitch must agree with the intended direction: the fly camera
         // rewrites the transform's rotation from them every frame.
-        FlyCamera::looking_at(eye, centre),
+        FlyCamera::looking_at(eye, look_at),
     ));
 
     let field = DistanceField::build(&tree);
