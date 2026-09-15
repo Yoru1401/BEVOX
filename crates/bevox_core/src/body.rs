@@ -86,6 +86,12 @@ mod tests {
 
         assert_eq!(direct.map(|h| h.voxel), through.map(|h| h.voxel));
         assert_eq!(direct.map(|h| h.t), through.map(|h| h.t));
+
+        // A cloned body (exercising the `Clone` derive step 3 added to
+        // `Contree`/`NodeArena`) must march identically to its original.
+        let mut c = MarchStats::default();
+        let cloned = body.clone().march_world(origin, dir, 500.0, &mut c);
+        assert_eq!(through.map(|h| h.t), cloned.map(|h| h.t));
     }
 
     /// Translating the body moves where the ray meets it by exactly the same
@@ -113,10 +119,20 @@ mod tests {
     /// A rigid transform preserves distance. A quarter turn about the cube's
     /// own centre leaves a ray down the axis meeting it at the same distance,
     /// because a cube is symmetric under that rotation.
+    ///
+    /// Distance alone cannot catch a forward/inverse rotation swap here: for a
+    /// ray along Z through a 90-degree-about-Y rotation about the cube's own
+    /// centre, `R` and `R^-1` send the ray direction to exactly opposite local
+    /// axes, so the entry distance comes out identical either way for *any*
+    /// x/y offset of the ray -- offsetting the ray off the rotation centre
+    /// (below) is still good practice but does not by itself distinguish the
+    /// two. What differs is which face the ray enters through: the correct
+    /// mapping enters the local +X face, the swapped one enters -X. That is
+    /// what `face_normal` pins down.
     #[test]
     fn a_rigid_rotation_preserves_the_hit_distance() {
         let centre = Vec3::splat(32.0);
-        let origin = Vec3::new(32.0, 32.0, -40.0);
+        let origin = Vec3::new(36.0, 30.0, -40.0);
         let dir = Vec3::Z;
         let mut stats = MarchStats::default();
 
@@ -138,6 +154,15 @@ mod tests {
             "a quarter turn of a symmetric cube changed the hit distance from {} to {}",
             still.t,
             turned.t
+        );
+        // Entry distance is symmetric under this rotation (see comment above),
+        // so it cannot catch a forward/inverse swap; the entered face can. A
+        // swap enters the opposite local face and flips this to `Vec3::NEG_X`.
+        assert_eq!(
+            turned.face_normal,
+            Vec3::X,
+            "entered the wrong local face ({:?}); the rotation direction may be reversed",
+            turned.face_normal
         );
     }
 
@@ -176,6 +201,31 @@ mod tests {
             (local.length() - 1.0).abs() < 1e-5,
             "a unit direction came out of the transform with length {}",
             local.length()
+        );
+    }
+
+    /// The frames must point the way their names say. A ray march can hide a
+    /// swap when the geometry happens to be symmetric about the rotation; this
+    /// cannot.
+    #[test]
+    fn world_from_local_places_the_local_origin_at_the_body_position() {
+        let body = Body::new(
+            cube(),
+            Vec3::new(5.0, -3.0, 11.0),
+            Quat::from_euler(glam::EulerRot::XYZ, 0.3, -0.7, 1.1),
+        );
+
+        let placed = body.world_from_local().transform_point3(Vec3::ZERO);
+        assert!(
+            (placed - body.position).length() < 1e-4,
+            "the body's local origin landed at {placed:?}, not at its position {:?}",
+            body.position
+        );
+
+        let back = body.local_from_world().transform_point3(body.position);
+        assert!(
+            back.length() < 1e-4,
+            "the body's position should map to its local origin, got {back:?}"
         );
     }
 }
