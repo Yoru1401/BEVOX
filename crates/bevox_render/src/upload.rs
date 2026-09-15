@@ -82,6 +82,62 @@ pub struct MarchTarget {
     pub height: u32,
 }
 
+/// One body as the shader reads it.
+///
+/// Carries the inverse placement because that is the direction a ray travels —
+/// world into local — and the rotation separately because a normal rotates
+/// back without the translation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct GpuBody {
+    pub local_from_world: [[f32; 4]; 4],
+    pub rotation: [[f32; 4]; 4],
+    /// Index of this body's root in the shared node buffer. Its arena slot `n`
+    /// is at `node_base + 1 + n`, matching how the static world is laid out.
+    pub node_base: u32,
+    pub voxel_base: u32,
+    pub depth: u32,
+    pub extent: u32,
+}
+
+/// The static world and every body, packed end to end into shared buffers.
+pub struct PackedScene {
+    pub nodes: Vec<GpuNode>,
+    pub voxels: Vec<u32>,
+    pub bodies: Vec<GpuBody>,
+}
+
+/// Packs the static world followed by each body.
+///
+/// One set of buffers rather than one per body: a body is small, and a second
+/// pair of bindings per body would cap the count at whatever the device allows
+/// rather than at what the frame budget allows.
+pub fn pack_bodies(world: &Contree, bodies: &[bevox_core::body::Body]) -> PackedScene {
+    let world_volume = GpuVolume::from_contree(world);
+    let mut nodes = world_volume.buffer_nodes();
+    let mut voxels = world_volume.voxels;
+    let mut out = Vec::with_capacity(bodies.len());
+
+    for body in bodies {
+        let volume = GpuVolume::from_contree(&body.volume);
+        let node_base = nodes.len() as u32;
+        let voxel_base = voxels.len() as u32;
+        nodes.extend_from_slice(&volume.buffer_nodes());
+        voxels.extend_from_slice(&volume.voxels);
+
+        out.push(GpuBody {
+            local_from_world: Mat4::from(body.local_from_world()).to_cols_array_2d(),
+            rotation: Mat4::from_quat(body.orientation).to_cols_array_2d(),
+            node_base,
+            voxel_base,
+            depth: body.volume.depth(),
+            extent: body.volume.extent(),
+        });
+    }
+
+    PackedScene { nodes, voxels, bodies: out }
+}
+
 /// The scene as the render world sees it.
 ///
 /// Extracted by `extract_gpu_scene` rather than `ExtractResourcePlugin`, which
@@ -91,6 +147,9 @@ pub struct MarchTarget {
 pub struct GpuSceneData {
     pub nodes: Vec<GpuNode>,
     pub voxels: Vec<u32>,
+    /// Every rigid body in the scene, packed after the static world in `nodes`
+    /// and `voxels`. Empty until something populates `VoxelScene` with bodies.
+    pub bodies: Vec<GpuBody>,
     pub palette: Vec<[f32; 4]>,
     /// Reachability masks as low/high halves: WGSL has no 64-bit integer.
     /// Constant, so it is built once rather than per scene.
@@ -114,6 +173,7 @@ impl Default for GpuSceneData {
         Self {
             nodes: vec![GpuNode::default()],
             voxels: Vec::new(),
+            bodies: Vec::new(),
             palette: MaterialTable::new().to_gpu(),
             direction_masks: gpu_direction_masks(),
             // Depth must be at least 1: the shader starts at level `depth - 1`.
@@ -227,14 +287,18 @@ pub fn build_gpu_scene(
             return;
         }
     }
-    let volume = GpuVolume::from_contree(&scene.tree);
+    // No bodies yet: nothing in `VoxelScene` carries a body list. `pack_bodies`
+    // still runs so this path matches what a scene with bodies will produce,
+    // and an empty slice packs out to exactly the static world.
+    let packed = pack_bodies(&scene.tree, &[]);
     // The scene's own field, not a fresh build. `VoxelScene` builds it once at
     // load and `apply_brush` keeps it current, so rebuilding here would both
     // discard that work and stall: 930 ms at extent 4096, on a path that also
     // runs when an edit outgrows the buffers mid-session.
     commands.insert_resource(GpuSceneData {
-        nodes: volume.buffer_nodes(),
-        voxels: volume.voxels,
+        nodes: packed.nodes,
+        voxels: packed.voxels,
+        bodies: packed.bodies,
         palette: scene.materials.to_gpu(),
         direction_masks: gpu_direction_masks(),
         depth: scene.tree.depth(),
@@ -595,7 +659,7 @@ mod tests {
 
     use bevox_core::contree::Contree;
     use bevox_core::material::MaterialId;
-    use glam::Vec3;
+    use glam::{Mat4, Quat, Vec3};
 
     /// A scene with something in it, so an edit has existing nodes to rewrite
     /// rather than only allocating fresh ones.
@@ -838,5 +902,63 @@ mod tests {
             rebuilt_nodes, expected,
             "the forced rebuild must reflect the tree as it stands now, not some other snapshot"
         );
+    }
+
+    #[test]
+    fn a_gpu_body_is_the_size_the_shader_expects() {
+        // Two mat4x4 (64 each) plus four u32 rounded to a 16-byte boundary.
+        assert_eq!(size_of::<GpuBody>(), 144);
+        assert_eq!(align_of::<GpuBody>(), 4);
+    }
+
+    #[test]
+    fn packing_a_body_shifts_its_arena_past_the_static_world() {
+        let world = Contree::empty(3);
+        let body = bevox_core::body::Body::new(
+            Contree::empty(2),
+            Vec3::new(1.0, 2.0, 3.0),
+            Quat::IDENTITY,
+        );
+        let packed = pack_bodies(&world, std::slice::from_ref(&body));
+
+        let world_nodes = GpuVolume::from_contree(&world).buffer_nodes().len() as u32;
+        assert_eq!(
+            packed.bodies[0].node_base, world_nodes,
+            "the body's root must sit immediately after the static world's nodes"
+        );
+        assert_eq!(
+            packed.nodes.len() as u32,
+            world_nodes + GpuVolume::from_contree(&body.volume).buffer_nodes().len() as u32,
+            "the packed buffer must hold both volumes end to end"
+        );
+    }
+
+    #[test]
+    fn a_packed_body_carries_the_inverse_of_its_placement() {
+        // The shader transforms rays world-to-local, so that is what it needs.
+        let body = bevox_core::body::Body::new(
+            Contree::empty(2),
+            Vec3::new(4.0, 0.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let packed = pack_bodies(&Contree::empty(3), std::slice::from_ref(&body));
+        let m = Mat4::from_cols_array_2d(&packed.bodies[0].local_from_world);
+        let there_and_back = m.transform_point3(Vec3::new(4.0, 0.0, 0.0));
+        assert!(
+            there_and_back.length() < 1e-4,
+            "the body's own position should map to its local origin, got {there_and_back:?}"
+        );
+    }
+
+    #[test]
+    fn a_scene_with_no_bodies_packs_exactly_the_static_world() {
+        // The zero-body case must be byte-identical, because the whole feature
+        // is required to leave a body-free scene untouched.
+        let world = Contree::empty(3);
+        let packed = pack_bodies(&world, &[]);
+        let plain = GpuVolume::from_contree(&world);
+        assert_eq!(packed.nodes, plain.buffer_nodes());
+        assert_eq!(packed.voxels, plain.voxels);
+        assert!(packed.bodies.is_empty());
     }
 }

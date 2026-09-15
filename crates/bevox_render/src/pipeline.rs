@@ -1,7 +1,8 @@
 //! Bind group layout, compute pipeline and the dispatch that runs it.
 
 use crate::upload::{
-    ExtractedMarchCamera, GpuSceneData, MarchTarget, MarchUniform, SceneUpdate, march_flags,
+    ExtractedMarchCamera, GpuBody, GpuSceneData, MarchTarget, MarchUniform, SceneUpdate,
+    march_flags,
 };
 use bevy::prelude::*;
 use bevy::material::bind_group_layout_entries::BindGroupLayoutEntries;
@@ -34,7 +35,7 @@ pub const BEAM_CAPACITY: u32 = (7680 / BEAM_SCALE) * (4320 / BEAM_SCALE);
 /// compile error and no parity test catches it -- the test harness builds its
 /// own layout, so it kept passing while the app could not create its pipeline
 /// at all. `the_layout_declares_every_binding_the_shader_uses` is the gate.
-pub const MARCH_BINDING_COUNT: usize = 8;
+pub const MARCH_BINDING_COUNT: usize = 9;
 
 /// Voxel data budget on the GPU. Checked at upload; exceeding it is an error,
 /// never an allocation attempt.
@@ -55,15 +56,26 @@ pub fn buffer_capacity_for(high_water: u32) -> u32 {
 /// data as the voxel bytes are, and at 16 bytes an entry it is usually the
 /// larger of the two. Checking voxels alone left a scene free to allocate an
 /// unbounded node buffer.
-pub fn within_budget(node_capacity: u32, voxel_word_capacity: u32, field_words: u32) -> bool {
-    budget_bytes(node_capacity, voxel_word_capacity, field_words) <= VOXEL_BUDGET_BYTES
+pub fn within_budget(
+    node_capacity: u32,
+    voxel_word_capacity: u32,
+    field_words: u32,
+    body_count: u32,
+) -> bool {
+    budget_bytes(node_capacity, voxel_word_capacity, field_words, body_count) <= VOXEL_BUDGET_BYTES
 }
 
-/// Bytes the three storage buffers would occupy at these capacities.
-pub fn budget_bytes(node_capacity: u32, voxel_word_capacity: u32, field_words: u32) -> u64 {
+/// Bytes the four storage buffers would occupy at these capacities.
+pub fn budget_bytes(
+    node_capacity: u32,
+    voxel_word_capacity: u32,
+    field_words: u32,
+    body_count: u32,
+) -> u64 {
     u64::from(node_capacity) * size_of::<GpuNode>() as u64
         + u64::from(voxel_word_capacity) * 4
         + u64::from(field_words) * 4
+        + u64::from(body_count) * size_of::<GpuBody>() as u64
 }
 
 #[derive(Resource)]
@@ -85,6 +97,7 @@ pub struct MarchBuffers {
     pub direction_masks: Buffer,
     pub beam: Buffer,
     pub field: Buffer,
+    pub bodies: Buffer,
     pub generation: u32,
     pub node_capacity: u32,
     pub voxel_word_capacity: u32,
@@ -118,6 +131,8 @@ pub fn init_march_pipeline(
             storage_buffer_sized(false, NonZero::new(4)),
             // Distance field: array<u32>, four cells packed per word.
             storage_buffer_read_only_sized(false, NonZero::new(4)),
+            // Rigid bodies: array<GpuBody>, one element minimum.
+            storage_buffer_read_only_sized(false, NonZero::new(size_of::<GpuBody>() as u64)),
         ),
     );
 
@@ -166,7 +181,12 @@ pub fn prepare_march_buffers(
         world_from_clip: camera.world_from_clip.to_cols_array_2d(),
         camera_position: camera.position.extend(0.0).to_array(),
         sun_direction: crate::upload::SUN_DIRECTION.normalize().extend(0.0).to_array(),
-        volume_params: [scene.depth, scene.extent, crate::upload::march_flags::DEFAULT, 0],
+        volume_params: [
+            scene.depth,
+            scene.extent,
+            crate::upload::march_flags::DEFAULT,
+            scene.bodies.len() as u32,
+        ],
         // The cell size travels with the edge count rather than a matching
         // shader-side constant, so `march.wgsl` cannot silently disagree with
         // `bevox_core::distance_field::CELL_VOXELS` about how big a cell is.
@@ -207,16 +227,20 @@ pub fn prepare_march_buffers(
     let node_capacity = buffer_capacity_for(scene.nodes.len() as u32);
     let voxel_word_capacity = buffer_capacity_for(scene.voxels.len() as u32);
     let field_words = scene.distance_field.len() as u32;
-    if !within_budget(node_capacity, voxel_word_capacity, field_words) {
+    // A zero-length storage buffer is invalid, so an empty body list still
+    // uploads room for one (zeroed) GpuBody; the uniform's count stays at zero.
+    let body_capacity = scene.bodies.len().max(1) as u32;
+    if !within_budget(node_capacity, voxel_word_capacity, field_words, body_capacity) {
         // Once, not every frame. The rejection returns without replacing the
         // buffers, so the condition holds again next frame and an `error!`
         // here would repeat at frame rate until the scene changed.
         error_once!(
-            "volume needs {} MB ({} MB of nodes, {} MB of voxels, {} MB of field), over the {} MB budget;              scene not uploaded",
-            budget_bytes(node_capacity, voxel_word_capacity, field_words) / (1024 * 1024),
+            "volume needs {} MB ({} MB of nodes, {} MB of voxels, {} MB of field, {} MB of bodies), over the {} MB budget;              scene not uploaded",
+            budget_bytes(node_capacity, voxel_word_capacity, field_words, body_capacity) / (1024 * 1024),
             u64::from(node_capacity) * size_of::<GpuNode>() as u64 / (1024 * 1024),
             u64::from(voxel_word_capacity) * 4 / (1024 * 1024),
             u64::from(field_words) * 4 / (1024 * 1024),
+            u64::from(body_capacity) * size_of::<GpuBody>() as u64 / (1024 * 1024),
             VOXEL_BUDGET_BYTES / (1024 * 1024)
         );
         return;
@@ -226,6 +250,8 @@ pub fn prepare_march_buffers(
     node_bytes.resize(node_capacity as usize * size_of::<GpuNode>(), 0);
     let mut voxel_bytes = bytemuck::cast_slice(&scene.voxels).to_vec();
     voxel_bytes.resize(voxel_word_capacity as usize * 4, 0);
+    let mut body_bytes = bytemuck::cast_slice(&scene.bodies).to_vec();
+    body_bytes.resize(body_capacity as usize * size_of::<GpuBody>(), 0);
 
     commands.insert_resource(MarchBuffers {
         uniform: device.create_buffer_with_data(&BufferInitDescriptor {
@@ -272,6 +298,11 @@ pub fn prepare_march_buffers(
             contents: bytemuck::cast_slice(&scene.distance_field),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         }),
+        bodies: device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("bevox_bodies"),
+            contents: &body_bytes,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        }),
         generation: scene.generation,
         node_capacity,
         voxel_word_capacity,
@@ -311,6 +342,7 @@ pub fn dispatch_march(
             buffers.direction_masks.as_entire_binding(),
             buffers.beam.as_entire_binding(),
             buffers.field.as_entire_binding(),
+            buffers.bodies.as_entire_binding(),
         )),
     );
 
@@ -425,8 +457,8 @@ mod tests {
         // Checked at upload and exceeding it is an error, never an allocation
         // attempt -- so the check must be on the capacity actually requested.
         let over_on_voxels = (VOXEL_BUDGET_BYTES / 4) as u32 + 1;
-        assert!(!within_budget(1, buffer_capacity_for(over_on_voxels), 0));
-        assert!(within_budget(buffer_capacity_for(1000), buffer_capacity_for(1000), 0));
+        assert!(!within_budget(1, buffer_capacity_for(over_on_voxels), 0, 0));
+        assert!(within_budget(buffer_capacity_for(1000), buffer_capacity_for(1000), 0, 0));
     }
 
     #[test]
@@ -434,7 +466,14 @@ mod tests {
         // A node is 16 bytes, so the node arena is usually the larger array.
         // Budgeting only the voxels let it grow without a bound.
         let over_on_nodes = (VOXEL_BUDGET_BYTES / size_of::<GpuNode>() as u64) as u32 + 1;
-        assert!(!within_budget(buffer_capacity_for(over_on_nodes), 1, 0));
+        assert!(!within_budget(buffer_capacity_for(over_on_nodes), 1, 0, 0));
+    }
+
+    #[test]
+    fn bodies_count_against_the_budget_too() {
+        // Body geometry counts against the budget the same as the static world.
+        let over_on_bodies = (VOXEL_BUDGET_BYTES / size_of::<GpuBody>() as u64) as u32 + 1;
+        assert!(!within_budget(1, 1, 0, over_on_bodies));
     }
 
     #[test]
@@ -443,8 +482,8 @@ mod tests {
         let half = (VOXEL_BUDGET_BYTES / 2) as u32;
         let nodes = half / size_of::<GpuNode>() as u32;
         let words = half / 4;
-        assert!(within_budget(nodes, 1, 0));
-        assert!(within_budget(1, words, 0));
-        assert!(!within_budget(nodes + 1, words + 1, 0));
+        assert!(within_budget(nodes, 1, 0, 0));
+        assert!(within_budget(1, words, 0, 0));
+        assert!(!within_budget(nodes + 1, words + 1, 0, 0));
     }
 }

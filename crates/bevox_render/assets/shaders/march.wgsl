@@ -37,6 +37,19 @@ const FLAG_DISTANCE_FIELD: u32 = 8u;
 // cell, four cells packed per word.
 @group(0) @binding(7) var<storage, read> distance_field: array<u32>;
 
+// A rigid body's placement and where its own geometry lives in the shared
+// node/voxel buffers. Unread until the composition pass (a later task) walks
+// this array alongside the static world.
+struct GpuBody {
+    local_from_world: mat4x4<f32>,
+    rotation: mat4x4<f32>,
+    node_base: u32,
+    voxel_base: u32,
+    depth: u32,
+    extent: u32,
+};
+@group(0) @binding(8) var<storage, read> bodies: array<GpuBody>;
+
 const BRICK_EDGE: u32 = 4u;
 const CHILDREN: u32 = 64u;
 const MAX_STEPS: u32 = 4096u;

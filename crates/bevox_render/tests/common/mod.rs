@@ -286,6 +286,14 @@ impl Prepared {
             contents: bytemuck::cast_slice(&field_words),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        // Unread until the composition pass; a zero-length storage buffer is
+        // invalid, so this test harness's scenes (which never carry bodies)
+        // still upload room for one zeroed GpuBody.
+        let body_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bodies"),
+            contents: bytemuck::bytes_of(&bevox_render::upload::GpuBody::default()),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("march"),
@@ -306,6 +314,7 @@ impl Prepared {
                 storage_entry(2, 4),
                 storage_entry(3, 16),
                 storage_entry(7, 4),
+                storage_entry(8, size_of::<bevox_render::upload::GpuBody>() as u64),
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -374,6 +383,7 @@ impl Prepared {
                 wgpu::BindGroupEntry { binding: 5, resource: mask_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: beam_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: field_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: body_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&view),

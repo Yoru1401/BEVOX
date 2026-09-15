@@ -464,6 +464,7 @@ fn the_scene_clone_is_measured_against_not_cloning() {
     let scene = GpuSceneData {
         nodes: volume.buffer_nodes(),
         voxels: volume.voxels,
+        bodies: Vec::new(),
         palette: MaterialTable::new().to_gpu(),
         direction_masks: gpu_direction_masks(),
         depth: tree.depth(),
@@ -495,6 +496,7 @@ fn the_scene_clone_is_measured_against_not_cloning() {
             let real = GpuSceneData {
                 nodes: volume.buffer_nodes(),
                 voxels: volume.voxels,
+                bodies: Vec::new(),
                 palette: materials.to_gpu(),
                 direction_masks: gpu_direction_masks(),
                 depth: tree.depth(),
