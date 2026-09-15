@@ -7,7 +7,7 @@
 use crate::node::{CHILDREN, Node};
 use core::ops::Range;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct NodeArena {
     nodes: Vec<Node>,
     voxels: Vec<u8>,

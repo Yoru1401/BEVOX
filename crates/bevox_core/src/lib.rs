@@ -1,5 +1,6 @@
 pub mod address;
 pub mod arena;
+pub mod body;
 pub mod contree;
 pub mod dense;
 pub mod distance_field;

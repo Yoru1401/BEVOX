@@ -8,6 +8,9 @@ use crate::node::{BRICK_EDGE, CHILDREN, Node, child_index};
 use glam::UVec3;
 use std::collections::{HashMap, HashSet};
 
+// Cloning a `Contree` copies its whole arena, so it is not something to do per
+// frame. Bodies are small and are cloned when created, not when moved.
+#[derive(Clone, Debug)]
 pub struct Contree {
     pub(crate) arena: NodeArena,
     pub(crate) root: Node,
