@@ -2,13 +2,14 @@
 //! reference marcher. Skips cleanly when no adapter is available, so a machine
 //! without a usable GPU reports a skip rather than a false failure.
 
+use bevox_core::body::Body;
 use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
 use bevox_core::gpu::GpuVolume;
 use bevox_core::march::{MarchStats, march};
 use bevox_render::upload::{VoxelScene, march_flags};
 use bevox_core::material::MaterialId;
-use glam::{Affine3A, Mat4, UVec3, Vec3, Vec4};
+use glam::{Affine3A, Mat4, Quat, UVec3, Vec3, Vec4};
 
 mod common;
 use common::*;
@@ -64,6 +65,7 @@ fn run_march_flagged(
 ) -> Vec<u8> {
     Prepared::new(
         device, source, entry_point, tree, volume, world_from_clip, eye, width, height, flags,
+        &[],
     )
     .read_back(device, queue)
 }
@@ -83,9 +85,45 @@ fn run_march(
     height: u32,
 ) -> Vec<u8> {
     Prepared::new(
-        device, source, entry_point, tree, volume, world_from_clip, eye, width, height, 0,
+        device, source, entry_point, tree, volume, world_from_clip, eye, width, height, 0, &[],
     )
     .read_back(device, queue)
+}
+
+/// Renders one frame with the given bodies packed alongside an empty-of-bodies
+/// static world, with body composition on. Mirrors `run_march_flagged`, but
+/// the flag the loop needs is nonnegotiable, so callers only choose geometry.
+#[allow(clippy::too_many_arguments)]
+fn run_bodies(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &str,
+    world_from_clip: Mat4,
+    eye: Vec3,
+    world: &Contree,
+    bodies: &[Body],
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let volume = GpuVolume::from_contree(world);
+    Prepared::new(
+        device, source, "march_identity", world, &volume, world_from_clip, eye, width, height,
+        march_flags::DEFAULT | march_flags::BODIES, bodies,
+    )
+    .read_back(device, queue)
+}
+
+/// A solid 16-voxel cube in a 64 volume, as in Task 1's body tests.
+fn body_cube() -> Contree {
+    let mut dense = DenseVolume::new(64).unwrap();
+    for z in 24..40 {
+        for y in 24..40 {
+            for x in 24..40 {
+                dense.set(UVec3::new(x, y, z), MaterialId(1));
+            }
+        }
+    }
+    dense.into_contree()
 }
 
 /// The display entry point shares `traverse` with `march_identity`, but writes
@@ -1068,7 +1106,7 @@ fn an_incrementally_uploaded_edit_renders_identically() {
     let volume = GpuVolume::from_contree(&incremental.tree);
     let prepared = Prepared::new(
         &device, &shader, "march_identity", &incremental.tree, &volume, world_from_clip, eye,
-        width, height, march_flags::DEFAULT,
+        width, height, march_flags::DEFAULT, &[],
     );
 
     for (i, (centre, radius, material)) in edits.iter().enumerate() {
@@ -1099,4 +1137,81 @@ fn an_incrementally_uploaded_edit_renders_identically() {
             width * height
         );
     }
+}
+
+/// A scene with no bodies must be untouched by the composition loop.
+///
+/// This is the one that protects everything built before this milestone: the
+/// loop runs, finds nothing, and must leave every pixel exactly as it was.
+#[test]
+fn a_scene_with_no_bodies_is_bit_identical_with_bodies_enabled() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let tree = parity_scene();
+    let gpu_volume = GpuVolume::from_contree(&tree);
+    let (width, height) = (96u32, 96u32);
+    let eye = Vec3::new(-30.0, 40.0, -30.0);
+    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+    let world_from_clip = (projection * view).inverse();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    for entry in ["march_identity", "march_voxel_id", "march_normal", "march"] {
+        let without = run_march_flagged(
+            &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume, width,
+            height, march_flags::DEFAULT,
+        );
+        let with = run_march_flagged(
+            &device, &queue, &shader, entry, world_from_clip, eye, &tree, &gpu_volume, width,
+            height, march_flags::DEFAULT | march_flags::BODIES,
+        );
+        let differing = without.chunks(4).zip(with.chunks(4)).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            differing, 0,
+            "{entry}: enabling bodies changed {differing} pixels of a scene that has none"
+        );
+    }
+}
+
+/// A body must actually appear, and appear where its transform puts it.
+///
+/// The zero-body test above passes trivially if the loop never runs. This is
+/// the one that proves it does: the same body at two different placements must
+/// produce two different images, and both must differ from the empty scene.
+#[test]
+fn a_placed_body_appears_where_its_transform_puts_it() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (width, height) = (96u32, 96u32);
+    let eye = Vec3::new(32.0, 32.0, -60.0);
+    let view = Mat4::look_at_rh(eye, Vec3::splat(32.0), Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+    let world_from_clip = (projection * view).inverse();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    // An empty world so only the body can be seen.
+    let world = Contree::empty(3);
+    let cube = body_cube();
+
+    let empty = run_bodies(
+        &device, &queue, &shader, world_from_clip, eye, &world, &[], width, height,
+    );
+    let left = run_bodies(
+        &device, &queue, &shader, world_from_clip, eye, &world,
+        &[Body::new(cube.clone(), Vec3::new(-12.0, 0.0, 0.0), Quat::IDENTITY)],
+        width, height,
+    );
+    let right = run_bodies(
+        &device, &queue, &shader, world_from_clip, eye, &world,
+        &[Body::new(cube, Vec3::new(12.0, 0.0, 0.0), Quat::IDENTITY)],
+        width, height,
+    );
+
+    assert_ne!(empty, left, "a body was placed but nothing was drawn");
+    assert_ne!(empty, right, "a body was placed but nothing was drawn");
+    assert_ne!(left, right, "moving the body did not move what was drawn");
 }

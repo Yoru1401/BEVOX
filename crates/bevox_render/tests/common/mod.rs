@@ -202,14 +202,20 @@ impl Prepared {
         source: &str,
         entry_point: &str,
         tree: &Contree,
-        volume: &GpuVolume,
+        _volume: &GpuVolume,
         world_from_clip: Mat4,
         eye: Vec3,
         width: u32,
         height: u32,
         flags: u32,
+        bodies: &[bevox_core::body::Body],
     ) -> Self {
         let field = bevox_core::distance_field::DistanceField::build(tree);
+        // The static world packed with every body, in the same buffers and the
+        // same layout `pack_bodies` gives the real render pipeline. An empty
+        // body list packs out to exactly the static world, so this is also the
+        // path every pre-bodies test still runs.
+        let packed = bevox_render::upload::pack_bodies(tree, bodies);
         let uniform = TestUniform {
             world_from_clip: world_from_clip.to_cols_array_2d(),
             camera_position: eye.extend(0.0).to_array(),
@@ -217,7 +223,7 @@ impl Prepared {
                 .normalize()
                 .extend(0.0)
                 .to_array(),
-            volume_params: [tree.depth(), tree.extent(), flags, 0],
+            volume_params: [tree.depth(), tree.extent(), flags, packed.bodies.len() as u32],
             // The cell size travels in the uniform rather than a matching
             // shader-side constant, so the shader cannot silently disagree
             // with `bevox_core::distance_field::CELL_VOXELS`.
@@ -225,17 +231,17 @@ impl Prepared {
         };
 
         // Root first, arena shifted by one: the layout the shader indexes.
-        let nodes = volume.buffer_nodes();
+        let nodes = packed.nodes;
         let node_bytes: Vec<u8> = if nodes.is_empty() {
             vec![0u8; 16]
         } else {
             bytemuck::cast_slice(&nodes).to_vec()
         };
         // A zero-length storage buffer is invalid, so an empty volume gets padding.
-        let voxel_bytes: Vec<u8> = if volume.voxels.is_empty() {
+        let voxel_bytes: Vec<u8> = if packed.voxels.is_empty() {
             vec![0u8; 4]
         } else {
-            bytemuck::cast_slice(&volume.voxels).to_vec()
+            bytemuck::cast_slice(&packed.voxels).to_vec()
         };
 
         let node_capacity = bevox_render::pipeline::buffer_capacity_for(nodes.len() as u32);
@@ -243,7 +249,7 @@ impl Prepared {
         node_bytes.resize(node_capacity as usize * size_of::<GpuNode>(), 0);
 
         let voxel_capacity =
-            bevox_render::pipeline::buffer_capacity_for(volume.voxels.len() as u32);
+            bevox_render::pipeline::buffer_capacity_for(packed.voxels.len() as u32);
         let mut voxel_bytes = voxel_bytes;
         voxel_bytes.resize(voxel_capacity as usize * 4, 0);
 
@@ -286,12 +292,17 @@ impl Prepared {
             contents: bytemuck::cast_slice(&field_words),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        // Unread until the composition pass; a zero-length storage buffer is
-        // invalid, so this test harness's scenes (which never carry bodies)
-        // still upload room for one zeroed GpuBody.
+        // A zero-length storage buffer is invalid, so a body-free scene still
+        // uploads room for one zeroed GpuBody; the uniform's count, not the
+        // buffer length, is what the shader loop actually reads.
+        let body_bytes: Vec<u8> = if packed.bodies.is_empty() {
+            bytemuck::bytes_of(&bevox_render::upload::GpuBody::default()).to_vec()
+        } else {
+            bytemuck::cast_slice(&packed.bodies).to_vec()
+        };
         let body_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bodies"),
-            contents: bytemuck::bytes_of(&bevox_render::upload::GpuBody::default()),
+            contents: &body_bytes,
             usage: wgpu::BufferUsages::STORAGE,
         });
 

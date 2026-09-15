@@ -20,6 +20,7 @@ const FLAG_DDA: u32 = 1u;
 const FLAG_MASK_FILTER: u32 = 2u;
 const FLAG_BEAM: u32 = 4u;
 const FLAG_DISTANCE_FIELD: u32 = 8u;
+const FLAG_BODIES: u32 = 16u;
 
 @group(0) @binding(0) var<uniform> view: MarchUniform;
 @group(0) @binding(1) var<storage, read> nodes: array<vec4<u32>>;
@@ -38,8 +39,7 @@ const FLAG_DISTANCE_FIELD: u32 = 8u;
 @group(0) @binding(7) var<storage, read> distance_field: array<u32>;
 
 // A rigid body's placement and where its own geometry lives in the shared
-// node/voxel buffers. Unread until the composition pass (a later task) walks
-// this array alongside the static world.
+// node/voxel buffers. Walked by compose_bodies, alongside the static world.
 struct GpuBody {
     local_from_world: mat4x4<f32>,
     rotation: mat4x4<f32>,
@@ -102,6 +102,13 @@ fn child_slot(n: vec4<u32>, i: u32) -> u32 {
 
 fn voxel_byte(index: u32) -> u32 {
     return (voxels[index / 4u] >> ((index % 4u) * 8u)) & 0xFFu;
+}
+
+/// `voxel_byte`, but starting from a volume's own word offset in the shared
+/// buffer rather than word 0. `voxel_base` is in words: each packed volume
+/// begins on a word boundary, so only the word half of the split needs it.
+fn voxel_byte_at(voxel_base: u32, index: u32) -> u32 {
+    return (voxels[voxel_base + index / 4u] >> ((index % 4u) * 8u)) & 0xFFu;
 }
 
 fn level_extent(level: u32) -> u32 {
@@ -236,26 +243,32 @@ fn entry_normal(origin: vec3<f32>, inv_dir: vec3<f32>, lo: vec3<f32>, hi: vec3<f
     return vec3<f32>(0.0, 0.0, 1.0);
 }
 
-fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
+/// `traverse`, told where a volume's nodes and voxels begin.
+///
+/// The static world is this with both bases zero. A body's root sits at
+/// `node_base` and its arena slot n at `node_base + 1 + n`, which is the same
+/// root-first layout the static world uses, just offset.
+fn traverse_at(
+    origin: vec3<f32>, dir: vec3<f32>, max_dist: f32,
+    node_base: u32, voxel_base: u32, depth: u32, extent: u32,
+) -> Hit {
     // Float division by zero yields infinity in WGSL, which is exactly what the
     // CPU reference stores for a zero direction component. Writing it as a plain
     // divide keeps both sides comparable instead of substituting a large finite.
     let inv_dir = vec3<f32>(1.0) / dir;
 
-    let depth = view.volume_params.x;
-    let extent = f32(view.volume_params.y);
-    let root_slab = ray_box(origin, inv_dir, vec3<f32>(0.0), vec3<f32>(extent));
+    let root_slab = ray_box(origin, inv_dir, vec3<f32>(0.0), vec3<f32>(f32(extent)));
     if !root_slab.hit {
         return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0));
     }
 
-    // Element 0 of `nodes` is the root written by the uploader, so every arena
-    // slot n lives at index n + 1.
+    // Index `node_base` is the root written by the uploader, so every arena
+    // slot n lives at index node_base + 1 + n.
     var stack: array<Frame, MAX_DEPTH>;
     var sp: u32 = 0u;
     var running: bool = true;
     stack[0] = Frame(
-        nodes[0],
+        nodes[node_base],
         vec3<u32>(0u),
         depth - 1u,
         max(root_slab.t_enter, 0.0),
@@ -426,14 +439,14 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
             let hi = lo + vec3<f32>(1.0);
             return Hit(
                 true,
-                voxel_byte(slot),
+                voxel_byte_at(voxel_base, slot),
                 best_t,
                 best_origin,
                 entry_normal(origin, inv_dir, lo, hi),
             );
         }
 
-        let child = nodes[slot + 1u];
+        let child = nodes[node_base + 1u + slot];
 
         // Skip a child the ray cannot reach anything inside of. Only subdivided
         // children carry an occupancy mask; a uniform solid's mask is zero and
@@ -468,6 +481,41 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
     }
 
     return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0));
+}
+
+/// The static world, at its fixed place in the shared buffers. Every existing
+/// call site and every parity test is pinned to this function, so it must stay
+/// exactly what it was before bodies existed.
+fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
+    return traverse_at(origin, dir, max_dist, 0u, 0u, view.volume_params.x, view.volume_params.y);
+}
+
+/// The nearest of the static world's hit and every body's.
+///
+/// `t` is directly comparable because body transforms are rigid: the ray is
+/// rotated and translated into the body's frame, never scaled, so a distance
+/// means the same thing in both. The normal comes back through the rotation
+/// alone -- putting a normal through the full affine would add the translation
+/// and point it nowhere.
+fn compose_bodies(origin: vec3<f32>, dir: vec3<f32>, world_hit: Hit, max_dist: f32) -> Hit {
+    var best = world_hit;
+    var limit = max_dist;
+    if best.hit { limit = best.t; }
+
+    let count = view.volume_params.w;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let b = bodies[i];
+        let local_origin = (b.local_from_world * vec4<f32>(origin, 1.0)).xyz;
+        let local_dir = (b.local_from_world * vec4<f32>(dir, 0.0)).xyz;
+
+        let h = traverse_at(local_origin, local_dir, limit, b.node_base, b.voxel_base, b.depth, b.extent);
+        if h.hit && h.t < limit {
+            best = h;
+            best.face_normal = (b.rotation * vec4<f32>(h.face_normal, 0.0)).xyz;
+            limit = h.t;
+        }
+    }
+    return best;
 }
 
 /// Material at a voxel coordinate, or 0 outside the volume.
@@ -694,11 +742,12 @@ fn primary_hit(id: vec3<u32>, size: vec2<u32>) -> Hit {
     if flag_enabled(FLAG_DISTANCE_FIELD) {
         t_seed = skip_empty_space(view.camera_position.xyz, dir, vec3<f32>(1.0) / dir, t_seed, max_ray_distance());
     }
-    var hit = traverse(
-        view.camera_position.xyz + dir * t_seed,
-        dir,
-        max_ray_distance() - t_seed,
-    );
+    let origin = view.camera_position.xyz + dir * t_seed;
+    let max_dist = max_ray_distance() - t_seed;
+    var hit = traverse(origin, dir, max_dist);
+    if flag_enabled(FLAG_BODIES) {
+        hit = compose_bodies(origin, dir, hit, max_dist);
+    }
     // Measured from the offset origin; callers want it absolute.
     hit.t = hit.t + t_seed;
     return hit;

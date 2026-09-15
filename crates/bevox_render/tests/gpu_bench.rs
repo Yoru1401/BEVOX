@@ -146,6 +146,7 @@ fn record_the_baseline() {
         1280,
         720,
         0,
+        &[],
     );
 
     let ms = time_dispatches(&device, &queue, &prepared, BATCH);
@@ -177,6 +178,7 @@ fn optimisations_are_measured_against_the_baseline() {
     let make = |flags: u32| {
         Prepared::new(
             &device, &shader, "march", &tree, &volume, world_from_clip, eye, 1280, 720, flags,
+            &[],
         )
     };
     let baseline = make(march_flags::NONE);
@@ -251,11 +253,11 @@ fn the_real_scenes_are_measured_with_the_defaults() {
         {
             let baseline = Prepared::new(
                 &device, &shader, "march", &tree, &volume, world_from_clip, eye, 1280, 720,
-                march_flags::NONE,
+                march_flags::NONE, &[],
             );
             let variant = Prepared::new(
                 &device, &shader, "march", &tree, &volume, world_from_clip, eye, 1280, 720,
-                march_flags::DEFAULT,
+                march_flags::DEFAULT, &[],
             );
             let (a1, b, a2) = compare_aba(&device, &queue, &baseline, &variant);
             let scan = (a1 + a2) * 0.5;
@@ -572,6 +574,7 @@ fn the_dispatches_are_timed_by_the_gpu() {
     ] {
         let prepared = Prepared::new(
             &device, &shader, "march", &tree, &volume, world_from_clip, eye, 1280, 720, flags,
+            &[],
         );
         // Discard the first dispatch: it pays for pipeline compilation.
         prepared.dispatch(&device, &queue);

@@ -57,6 +57,11 @@ pub mod march_flags {
     pub const BEAM: u32 = 4;
     /// Advance the ray through empty space the distance field can prove clear.
     pub const DISTANCE_FIELD: u32 = 8;
+    /// Compose every rigid body into the march alongside the static world.
+    ///
+    /// Not in `DEFAULT` yet: Task 5 decides that once it has measured the cost
+    /// of the composition loop on a body-free scene.
+    pub const BODIES: u32 = 16;
     /// What the app runs. Each optimisation joins this only once it has measured
     /// faster while staying bit-identical.
     ///
