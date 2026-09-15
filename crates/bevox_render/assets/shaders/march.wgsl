@@ -10,7 +10,7 @@ struct MarchUniform {
     camera_position: vec4<f32>,
     sun_direction: vec4<f32>,
     volume_params: vec4<u32>,  // [depth, extent, flags, 0]
-    field_params: vec4<u32>,  // [field_edge, 0, 0, 0]
+    field_params: vec4<u32>,  // [field_edge, field_cell_size, 0, 0]
 };
 
 // Traversal optimisations, matching bevox_render::upload::march_flags. One
@@ -540,8 +540,15 @@ fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
     return normalize(far.xyz / far.w - view.camera_position.xyz);
 }
 
-/// Voxels per field cell, per axis. Must match bevox_core's CELL_VOXELS.
-const FIELD_CELL: f32 = 16.0;
+/// Voxels per field cell, per axis, as built by `DistanceField::build`.
+///
+/// Carried in the uniform rather than a shader-side constant: a constant here
+/// would be a second spelling of `bevox_core::distance_field::CELL_VOXELS`,
+/// free to drift from it, and a mismatch would make the field's promised
+/// cube the wrong size on the GPU while every CPU-side check kept passing.
+fn field_cell_size() -> f32 {
+    return f32(view.field_params.y);
+}
 
 fn field_at(cell: vec3<i32>) -> u32 {
     let edge = i32(view.field_params.x);
@@ -564,18 +571,19 @@ fn field_at(cell: vec3<i32>) -> u32 {
 /// promised, so it cannot skip geometry unless the field itself lied.
 fn skip_empty_space(origin: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, start: f32, max_dist: f32) -> f32 {
     var t = start;
+    let cell_size = field_cell_size();
     // A ray crosses a bounded number of cubes before it either hits something
     // or leaves; the bound stops a degenerate direction spinning here.
     for (var i = 0u; i < 64u; i = i + 1u) {
         if t > max_dist { return t; }
         let p = origin + dir * t;
-        let cell = vec3<i32>(floor(p / FIELD_CELL));
+        let cell = vec3<i32>(floor(p / cell_size));
         let d = field_at(cell);
         if d == 0u { return t; }
 
         // Exit plane of the cube of `d` cells around this one.
-        let lo = (vec3<f32>(cell) - vec3<f32>(f32(d) - 1.0)) * FIELD_CELL;
-        let hi = (vec3<f32>(cell) + vec3<f32>(f32(d))) * FIELD_CELL;
+        let lo = (vec3<f32>(cell) - vec3<f32>(f32(d) - 1.0)) * cell_size;
+        let hi = (vec3<f32>(cell) + vec3<f32>(f32(d))) * cell_size;
         let t0 = (lo - origin) * inv_dir;
         let t1 = (hi - origin) * inv_dir;
         let far = max(t0, t1);

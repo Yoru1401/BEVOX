@@ -22,7 +22,7 @@ pub struct TestUniform {
     pub sun_direction: [f32; 4],
     /// `[depth, extent, flags, 0]`.
     pub volume_params: [u32; 4],
-    /// `[field_edge, 0, 0, 0]`.
+    /// `[field_edge, field_cell_size, 0, 0]`.
     pub field_params: [u32; 4],
 }
 
@@ -158,6 +158,7 @@ pub struct Prepared {
     /// Kept so a test can apply an incremental update the way the app does.
     node_buffer: wgpu::Buffer,
     voxel_buffer: wgpu::Buffer,
+    field_buffer: wgpu::Buffer,
     /// Timestamps around each pass, when the device supports them. Four slots:
     /// beam begin/end then main begin/end, so a beam-less configuration simply
     /// leaves the first pair unwritten.
@@ -217,7 +218,10 @@ impl Prepared {
                 .extend(0.0)
                 .to_array(),
             volume_params: [tree.depth(), tree.extent(), flags, 0],
-            field_params: [field.edge(), 0, 0, 0],
+            // The cell size travels in the uniform rather than a matching
+            // shader-side constant, so the shader cannot silently disagree
+            // with `bevox_core::distance_field::CELL_VOXELS`.
+            field_params: [field.edge(), bevox_core::distance_field::CELL_VOXELS, 0, 0],
         };
 
         // Root first, arena shifted by one: the layout the shader indexes.
@@ -407,6 +411,7 @@ impl Prepared {
             texture,
             node_buffer,
             voxel_buffer,
+            field_buffer,
             timestamps,
             width,
             height,
@@ -531,6 +536,10 @@ impl Prepared {
         for write in &update.voxels {
             let offset = u64::from(write.start_word) * 4;
             queue.write_buffer(&self.voxel_buffer, offset, bytemuck::cast_slice(&write.words));
+        }
+        for write in &update.field {
+            let offset = u64::from(write.start_word) * 4;
+            queue.write_buffer(&self.field_buffer, offset, bytemuck::cast_slice(&write.words));
         }
     }
 }

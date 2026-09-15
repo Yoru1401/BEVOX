@@ -167,7 +167,10 @@ pub fn prepare_march_buffers(
         camera_position: camera.position.extend(0.0).to_array(),
         sun_direction: crate::upload::SUN_DIRECTION.normalize().extend(0.0).to_array(),
         volume_params: [scene.depth, scene.extent, crate::upload::march_flags::DEFAULT, 0],
-        field_params: [scene.field_edge, 0, 0, 0],
+        // The cell size travels with the edge count rather than a matching
+        // shader-side constant, so `march.wgsl` cannot silently disagree with
+        // `bevox_core::distance_field::CELL_VOXELS` about how big a cell is.
+        field_params: [scene.field_edge, bevox_core::distance_field::CELL_VOXELS, 0, 0],
     };
 
     // Reuse the buffers unless the scene was replaced outright or an edit grew

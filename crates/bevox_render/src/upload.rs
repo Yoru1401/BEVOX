@@ -42,7 +42,7 @@ pub struct MarchUniform {
     pub sun_direction: [f32; 4],
     /// `[depth, extent, march_flags, 0]`.
     pub volume_params: [u32; 4],
-    /// `[field_edge, 0, 0, 0]`.
+    /// `[field_edge, field_cell_size, 0, 0]`.
     pub field_params: [u32; 4],
 }
 
@@ -308,19 +308,26 @@ pub fn create_march_target(
 ///
 /// `world_from_clip` is the inverse view-projection: the shader multiplies a
 /// clip-space point by it to get a world-space ray target.
+///
+/// Takes the field rather than recomputing its edge count from `tree.extent()`:
+/// that formula already lives in `DistanceField::build`, and repeating it here
+/// is a second spelling of the same number that could silently drift from it.
 pub fn march_uniform(
     world_from_clip: Mat4,
     camera_position: Vec3,
     tree: &Contree,
+    field: &DistanceField,
     flags: u32,
 ) -> MarchUniform {
-    let field_edge = (tree.extent() / bevox_core::distance_field::CELL_VOXELS).max(1);
     MarchUniform {
         world_from_clip: world_from_clip.to_cols_array_2d(),
         camera_position: camera_position.extend(0.0).to_array(),
         sun_direction: SUN_DIRECTION.normalize().extend(0.0).to_array(),
         volume_params: [tree.depth(), tree.extent(), flags, 0],
-        field_params: [field_edge, 0, 0, 0],
+        // The cell size travels in the uniform rather than as a matching
+        // shader-side constant, which is exactly the duplication that let
+        // `march.wgsl`'s copy silently disagree with this one.
+        field_params: [field.edge(), bevox_core::distance_field::CELL_VOXELS, 0, 0],
     }
 }
 
@@ -539,15 +546,22 @@ mod tests {
     #[test]
     fn volume_params_carry_depth_and_extent() {
         let tree = Contree::empty(3);
-        let u = march_uniform(Mat4::IDENTITY, Vec3::ZERO, &tree, march_flags::NONE);
+        let field = DistanceField::build(&tree);
+        let u = march_uniform(Mat4::IDENTITY, Vec3::ZERO, &tree, &field, march_flags::NONE);
         assert_eq!(u.volume_params[0], 3);
         assert_eq!(u.volume_params[1], 64);
+        // The cell size travels with the edge count rather than a shader-side
+        // constant, so this is the one place that number is spelled out.
+        assert_eq!(u.field_params[0], field.edge());
+        assert_eq!(u.field_params[1], bevox_core::distance_field::CELL_VOXELS);
     }
 
     #[test]
     fn the_camera_position_survives_into_the_uniform() {
         let tree = Contree::empty(2);
-        let u = march_uniform(Mat4::IDENTITY, Vec3::new(1.0, 2.0, 3.0), &tree, march_flags::NONE);
+        let field = DistanceField::build(&tree);
+        let u =
+            march_uniform(Mat4::IDENTITY, Vec3::new(1.0, 2.0, 3.0), &tree, &field, march_flags::NONE);
         assert_eq!(u.camera_position[0], 1.0);
         assert_eq!(u.camera_position[1], 2.0);
         assert_eq!(u.camera_position[2], 3.0);
@@ -556,10 +570,12 @@ mod tests {
     #[test]
     fn flags_land_where_the_shader_reads_them() {
         let tree = Contree::empty(2);
+        let field = DistanceField::build(&tree);
         let u = march_uniform(
             Mat4::IDENTITY,
             Vec3::ZERO,
             &tree,
+            &field,
             march_flags::DDA | march_flags::BEAM,
         );
         assert_eq!(u.volume_params[2], 0b101);
@@ -569,7 +585,8 @@ mod tests {
     fn the_matrix_is_stored_column_major_as_wgsl_expects() {
         let m = Mat4::from_translation(Vec3::new(5.0, 6.0, 7.0));
         let tree = Contree::empty(2);
-        let u = march_uniform(m, Vec3::ZERO, &tree, march_flags::NONE);
+        let field = DistanceField::build(&tree);
+        let u = march_uniform(m, Vec3::ZERO, &tree, &field, march_flags::NONE);
         // glam is column-major, and to_cols_array_2d yields columns.
         assert_eq!(u.world_from_clip[3][0], 5.0);
         assert_eq!(u.world_from_clip[3][1], 6.0);

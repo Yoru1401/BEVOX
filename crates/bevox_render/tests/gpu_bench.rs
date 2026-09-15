@@ -331,15 +331,29 @@ fn an_edit_uploads_a_fraction_of_the_scene() {
 
     let whole_nodes = scene.tree.arena().nodes().len() * 16;
     let whole_voxels = scene.tree.arena().voxels().len();
+    // Raw cell count, matching how `whole_voxels` counts pre-packing bytes
+    // rather than the four-cells-per-word form the GPU buffer actually holds.
+    let whole_field = scene.field.cells().len();
+    let whole = whole_nodes + whole_voxels + whole_field;
     println!(
-        "scene: extent {extent}, {} node bytes, {} voxel bytes",
-        whole_nodes, whole_voxels
+        "scene: extent {extent}, {} node bytes, {} voxel bytes, {} field bytes",
+        whole_nodes, whole_voxels, whole_field
     );
 
     for radius in [2.0f32, 8.0, 32.0] {
         let centre = Vec3::splat(extent as f32 * 0.5);
         let started = std::time::Instant::now();
-        scene.tree.apply_sphere(centre, radius, bevox_core::material::MaterialId(3));
+        // `apply_brush`, not `tree.apply_sphere` directly: only `apply_brush`
+        // lowers the field and marks it dirty, and the field is the largest
+        // of the three components below. Painting through `apply_sphere`
+        // alone would leave `update.field` empty and this benchmark would
+        // report a byte total that omits the biggest write entirely.
+        bevox_render::upload::apply_brush(
+            &mut scene,
+            centre,
+            radius,
+            bevox_core::material::MaterialId(3),
+        );
         let edit_ms = started.elapsed().as_secs_f32() * 1000.0;
 
         let staged = std::time::Instant::now();
@@ -348,15 +362,17 @@ fn an_edit_uploads_a_fraction_of_the_scene() {
 
         let node_bytes: usize = update.nodes.iter().map(|w| w.nodes.len() * 16).sum();
         let voxel_bytes: usize = update.voxels.iter().map(|w| w.words.len() * 4).sum();
-        let total = node_bytes + voxel_bytes;
+        let field_bytes: usize = update.field.iter().map(|w| w.words.len() * 4).sum();
+        let total = node_bytes + voxel_bytes + field_bytes;
         println!(
-            "radius {radius:>5}: edit {edit_ms:6.2} ms, stage {stage_ms:5.2} ms, \
-             upload {total:>9} bytes ({:.3}% of the scene) in {} ranges",
-            total as f64 / (whole_nodes + whole_voxels) as f64 * 100.0,
-            update.nodes.len() + update.voxels.len()
+            "radius {radius:>5}: edit {edit_ms:6.2} ms, stage {stage_ms:5.2} ms, upload \
+             nodes {node_bytes:>9} + voxels {voxel_bytes:>9} + field {field_bytes:>9} \
+             = {total:>9} bytes ({:.3}% of the scene) in {} ranges",
+            total as f64 / whole as f64 * 100.0,
+            update.nodes.len() + update.voxels.len() + update.field.len()
         );
         assert!(
-            total < whole_nodes + whole_voxels,
+            total < whole,
             "radius {radius} uploaded the whole scene; the dirty ranges are not narrowing anything"
         );
     }

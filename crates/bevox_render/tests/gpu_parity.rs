@@ -857,7 +857,17 @@ fn open_scene() -> Contree {
 /// that open from some angles and not others. This sweeps angles over a scene
 /// with large open volumes -- a scene of only scattered single voxels
 /// saturates the coarse field to zero everywhere and would exercise none of
-/// the jump arithmetic, which is why the non-vacuity guard below exists.
+/// the jump arithmetic, which is why the field-wide non-vacuity guard below
+/// exists.
+///
+/// That guard only proves the field has large values *somewhere*; it says
+/// nothing about the cell each camera actually starts in. The cameras used to
+/// orbit at radius 360 around a scene of extent 256 -- entirely outside the
+/// volume, where `field_at` reads 0 for every cell -- so `skip_empty_space`
+/// returned on iteration 0 for every ray and none of the jump arithmetic ever
+/// ran, while the field-wide guard stayed green throughout. The per-camera
+/// `at_eye >= 2` assert below is what actually catches that: it fails the
+/// moment a camera's own starting cell cannot produce a jump.
 #[test]
 fn the_distance_field_leaves_output_bit_identical() {
     let Some((device, queue)) = gpu_device() else {
@@ -875,13 +885,41 @@ fn the_distance_field_leaves_output_bit_identical() {
     eprintln!("distance field max claimed: {max_claimed}");
     let gpu_volume = GpuVolume::from_contree(&tree);
     let (width, height) = (96u32, 96u32);
-    let centre = Vec3::splat(128.0);
+    // A point in the open space open_scene() provides: above the floor
+    // (y 0..4), below every column top (y 90), and clear of all three
+    // 24-wide columns. The cameras orbit this point instead of the scene's
+    // outer edge, so a ray actually starts inside the volume the field
+    // covers.
+    let centre = Vec3::new(128.0, 40.0, 128.0);
+    // Radius 32, with the ring rotated 20 degrees off the compass
+    // directions. The three columns sit at roughly 45-degree intervals
+    // around this point, so an unrotated ring of 8 (0, 45, 90, ...) aims two
+    // of the eight cameras straight down a column wall, where the per-camera
+    // guard below fails. Found by scanning radius and phase for one that
+    // keeps every camera's own cell reading at least 2 -- 22.5 degrees, the
+    // midpoint of the safe window, also clears that guard but then lands one
+    // ray exactly on a voxel boundary the field-skip's origin nudge resolves
+    // a ULP to the other side of from the unskipped scan (a one-cell graze
+    // in march_voxel_id, not a lost hit), so this is 20 rather than the
+    // midpoint. Confirmed clean -- zero differing pixels across every angle,
+    // entry point and flag combination -- before committing to it.
+    let radius = 32.0f32;
+    let phase = 20.0f32.to_radians();
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
     for step in 0..8u32 {
-        let angle = step as f32 * std::f32::consts::TAU / 8.0;
-        // centre.y is 128; -8 puts the eye at y = 120 as asked.
-        let eye = centre + Vec3::new(angle.cos() * 360.0, -8.0, angle.sin() * 360.0);
+        let angle = phase + step as f32 * std::f32::consts::TAU / 8.0;
+        let eye = centre + Vec3::new(angle.cos() * radius, 0.0, angle.sin() * radius);
+
+        let eye_cell = (eye / bevox_core::distance_field::CELL_VOXELS as f32).as_uvec3();
+        let at_eye = field.get(eye_cell);
+        assert!(
+            at_eye >= 2,
+            "angle {step}: the field reads {at_eye} at the camera's own cell, so \
+             skip_empty_space returns on its first iteration and this test exercises \
+             none of the jump arithmetic"
+        );
+
         let view = Mat4::look_at_rh(eye, centre, Vec3::Y);
         let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
         let world_from_clip = (projection * view).inverse();
@@ -1003,13 +1041,29 @@ fn an_incrementally_uploaded_edit_renders_identically() {
     ];
 
     // One tree is edited and uploaded incrementally; the other is edited the
-    // same way and uploaded from scratch each time.
+    // same way and uploaded from scratch each time. Both go through
+    // `apply_brush`, not `tree.apply_sphere` directly -- that is the only
+    // path that lowers the field and marks `field_dirty`, and staying off it
+    // is exactly what let this test pass with `update.field` wired up to
+    // nothing at all: painting a tree via `apply_sphere` alone never dirties
+    // a field range, so `stage_scene_update` always staged an empty
+    // `update.field`, and this test could not have told a correct write from
+    // no write.
     let tree = parity_scene();
     let field = bevox_core::distance_field::DistanceField::build(&tree);
     let mut incremental =
         VoxelScene { tree, materials: parity_materials(), generation: 1, field, field_dirty: None };
     incremental.tree.arena_mut().clear_dirty();
-    let mut whole = parity_scene();
+
+    let whole_tree = parity_scene();
+    let whole_field = bevox_core::distance_field::DistanceField::build(&whole_tree);
+    let mut whole = VoxelScene {
+        tree: whole_tree,
+        materials: parity_materials(),
+        generation: 1,
+        field: whole_field,
+        field_dirty: None,
+    };
 
     let volume = GpuVolume::from_contree(&incremental.tree);
     let prepared = Prepared::new(
@@ -1018,8 +1072,8 @@ fn an_incrementally_uploaded_edit_renders_identically() {
     );
 
     for (i, (centre, radius, material)) in edits.iter().enumerate() {
-        incremental.tree.apply_sphere(*centre, *radius, *material);
-        whole.apply_sphere(*centre, *radius, *material);
+        bevox_render::upload::apply_brush(&mut incremental, *centre, *radius, *material);
+        bevox_render::upload::apply_brush(&mut whole, *centre, *radius, *material);
 
         let update = bevox_render::upload::stage_scene_update(&mut incremental);
         assert!(
@@ -1031,9 +1085,9 @@ fn an_incrementally_uploaded_edit_renders_identically() {
         prepared.apply_update(&queue, &update);
         let got = prepared.read_back(&device, &queue);
 
-        let whole_volume = GpuVolume::from_contree(&whole);
+        let whole_volume = GpuVolume::from_contree(&whole.tree);
         let reference = run_march_flagged(
-            &device, &queue, &shader, "march_identity", world_from_clip, eye, &whole,
+            &device, &queue, &shader, "march_identity", world_from_clip, eye, &whole.tree,
             &whole_volume, width, height, march_flags::DEFAULT,
         );
 

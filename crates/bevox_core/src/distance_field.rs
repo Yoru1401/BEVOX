@@ -90,11 +90,6 @@ impl DistanceField {
         self.cells[self.index(cell) as usize]
     }
 
-    /// The field value covering a voxel coordinate.
-    pub fn sample_voxel(&self, p: UVec3) -> u8 {
-        self.get(p / CELL_VOXELS)
-    }
-
     fn index(&self, cell: UVec3) -> u32 {
         cell.x + cell.y * self.edge + cell.z * self.edge * self.edge
     }
@@ -170,6 +165,12 @@ impl DistanceField {
         let hi = ((centre / CELL_VOXELS as f32) + Vec3::splat(reach))
             .min(Vec3::splat((self.edge - 1) as f32))
             .as_uvec3();
+
+        // A centre far enough outside the volume can clamp lo past hi on some
+        // axis; an inverted range would slice `lo > hi` below and panic.
+        if lo.cmpgt(hi).any() {
+            return 0..0;
+        }
 
         let solid_lo = ((centre - Vec3::splat(radius)) / CELL_VOXELS as f32).floor();
         let solid_hi = ((centre + Vec3::splat(radius)) / CELL_VOXELS as f32).ceil();
