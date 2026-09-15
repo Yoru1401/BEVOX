@@ -849,6 +849,72 @@ git commit -m "perf(render): measure the distance field and set the default" -m 
 
 ---
 
+## Measurements
+
+GTX 1650, release, 2026-09-15. A/B/A interleaved in one process, drift reported.
+
+### Against the existing optimisations, 1280x720, extent 1024, close to geometry
+
+```
+      dda:  19.72 ms vs scan 33.75/33.79 (drift 0.04)  gain 14.05 ms (41.6%)  [gpu 19.64]
+     mask:  30.00 ms vs scan 34.07/33.96 (drift 0.11)  gain  4.02 ms (11.8%)  [gpu 30.34]
+ dda+mask:  16.79 ms vs scan 34.31/34.31 (drift 0.01)  gain 17.52 ms (51.1%)  [gpu 16.78]
+     beam:  24.54 ms vs scan 34.34/34.36 (drift 0.02)  gain  9.81 ms (28.6%)  [gpu 24.46 = beam 0.92 + main 23.54]
+      all:  14.04 ms vs scan 34.43/34.40 (drift 0.03)  gain 20.37 ms (59.2%)  [gpu 13.98 = beam 0.30 + main 13.68]
+    field:  22.00 ms vs scan 34.61/34.62 (drift 0.01)  gain 12.62 ms (36.5%)  [gpu 21.91]
+all+field:  12.25 ms vs scan 34.61/34.62 (drift 0.01)  gain 22.36 ms (64.6%)  [gpu 12.18 = beam 0.29 + main 11.89]
+```
+
+The field earns its place: **14.04 -> 12.25 ms on top of the other three, a further
+12.8%**, against 0.01 ms of drift. It also stands alone at 36.5%, second only to
+DDA among the four.
+
+**The concern raised before this plan was written was wrong, and worth recording
+as wrong.** It said close to geometry rays hit quickly, so there might be little
+empty space left to skip, and that the beam prepass already covered much of it.
+The measurement says otherwise. The beam prepass samples once per 8x8 pixel
+block and caps its seed conservatively; the field gives every ray its own
+multi-cube jump, and the two compose rather than overlap.
+
+### Real scenes, scan versus the new four-flag default
+
+```
+   Church_Of_St_Sophia framed (4096):  5.53 ->  5.16 ms  ( 6.8%, drift 0.03)
+   Church_Of_St_Sophia  close (4096): 13.59 ->  9.49 ms  (30.2%, drift 0.04)
+                castle framed (4096):  4.12 ->  4.07 ms  ( 1.3%, drift 0.02)
+                castle  close (4096):  9.67 ->  6.98 ms  (27.8%, drift 0.02)
+                custom framed ( 256):  6.79 ->  5.22 ms  (23.1%, drift 0.01)
+                custom  close ( 256): 19.66 ->  9.91 ms  (49.6%, drift 0.02)
+                  nuke framed (4096):  4.01 ->  3.94 ms  ( 1.8%, drift 0.00)
+                  nuke  close (4096): 10.31 ->  7.03 ms  (31.9%, drift 0.01)
+                sponza framed (1024):  6.92 ->  6.21 ms  (10.3%, drift 0.02)
+                sponza  close (1024): 24.64 -> 11.30 ms  (54.1%, drift 0.04)
+```
+
+Against the previous three-flag default the close-camera gains rise from 21.6 to
+30.2 (Church), 15.8 to 27.8 (castle), 18.6 to 31.9 (nuke), 44.7 to 49.6
+(custom) and 51.4 to 54.1 (sponza). The two 4096 scenes that gained least from
+the earlier work gain most from this.
+
+### What the field costs
+
+```
+   Church_Of_St_Sophia (extent 4096): 256^3 = 16777216 cells, built in 929.3 ms, 16.0 MB
+                castle (extent 4096): 256^3 = 16777216 cells, built in 929.8 ms, 16.0 MB
+                custom (extent  256):  16^3 =     4096 cells, built in   0.3 ms,  0.0 MB
+                  nuke (extent 4096): 256^3 = 16777216 cells, built in 923.8 ms, 16.0 MB
+                sponza (extent 1024):  64^3 =   262144 cells, built in  14.3 ms,  0.2 MB
+```
+
+Roughly 930 ms and 16 MB at extent 4096, against a compose that already takes
+about two seconds -- so load time rises by about half. It is paid once. The
+16 MB counts against the 512 MB budget, which `within_budget` now includes.
+
+This is also why `build_gpu_scene` packs the scene's own maintained field rather
+than building a fresh one: that path also runs when an edit outgrows the
+buffers, and a 930 ms stall mid-edit would be worse than anything the field
+saves.
+
 ## Milestone check
 
 Empty space is skipped by a conservative coarse field that survives editing, measured A/B/A against the existing path, and held to bit-identity except for the documented grazing-shadow pixels.

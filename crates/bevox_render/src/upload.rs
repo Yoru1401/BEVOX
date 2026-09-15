@@ -7,10 +7,12 @@ use bevy::render::Extract;
 use bevy::render::extract_resource::ExtractResource;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevox_core::contree::Contree;
+use bevox_core::distance_field::DistanceField;
 use bevox_core::gpu::{GpuNode, GpuVolume};
 use bevox_core::mask_table::build_direction_masks;
-use bevox_core::material::MaterialTable;
+use bevox_core::material::{MaterialId, MaterialTable};
 use bytemuck::{Pod, Zeroable};
+use std::ops::Range;
 
 /// The scene the renderer draws. Replacing it re-uploads on the next frame.
 #[derive(Resource)]
@@ -20,6 +22,14 @@ pub struct VoxelScene {
     pub materials: MaterialTable,
     /// Bumped whenever `tree` changes, so the render world knows to re-upload.
     pub generation: u32,
+    /// Coarse distance-to-solid grid, kept in step with `tree` by the brush.
+    pub field: DistanceField,
+    /// Cell range the brush lowered since the last `stage_scene_update`, if any.
+    ///
+    /// `None` after an erase: removing geometry only raises true distances, so
+    /// a stale field merely under-estimates -- costing speed, never
+    /// correctness -- and needs no upload at all.
+    pub field_dirty: Option<Range<u32>>,
 }
 
 /// Camera and volume parameters, as the shader sees them.
@@ -32,6 +42,8 @@ pub struct MarchUniform {
     pub sun_direction: [f32; 4],
     /// `[depth, extent, march_flags, 0]`.
     pub volume_params: [u32; 4],
+    /// `[field_edge, field_cell_size, 0, 0]`.
+    pub field_params: [u32; 4],
 }
 
 /// Traversal optimisations, carried in `volume_params.z`.
@@ -43,13 +55,17 @@ pub mod march_flags {
     pub const DDA: u32 = 1;
     pub const MASK_FILTER: u32 = 2;
     pub const BEAM: u32 = 4;
+    /// Advance the ray through empty space the distance field can prove clear.
+    pub const DISTANCE_FIELD: u32 = 8;
     /// What the app runs. Each optimisation joins this only once it has measured
     /// faster while staying bit-identical.
     ///
-    /// All three earned it. A/B/A at 1280x720, extent 1024, close to geometry:
-    /// scan 44.5 ms, mask 39.1, beam 31.2, DDA 22.3, all three 16.1 -- a 63.8%
-    /// gain against 0.2 ms of drift.
-    pub const DEFAULT: u32 = DDA | MASK_FILTER | BEAM;
+    /// All four earned it. A/B/A at 1280x720, extent 1024, close to geometry:
+    /// scan 34.6 ms, mask 30.0, field 22.0, beam 24.5, DDA 19.7, the first
+    /// three 14.0, all four 12.25 -- a 64.6% gain against 0.01 ms of drift.
+    /// The field is worth 12.8% on top of the other three, which is why it is
+    /// here rather than reverted.
+    pub const DEFAULT: u32 = DDA | MASK_FILTER | BEAM | DISTANCE_FIELD;
 }
 
 /// The sun direction the renderer and the parity tests share.
@@ -81,6 +97,11 @@ pub struct GpuSceneData {
     pub direction_masks: Vec<[u32; 2]>,
     pub depth: u32,
     pub extent: u32,
+    /// Chebyshev distance to the nearest solid voxel per coarse cell, packed
+    /// four to a word.
+    pub distance_field: Vec<u32>,
+    /// Cells per axis, so the shader can index the grid.
+    pub field_edge: u32,
     pub generation: u32,
 }
 
@@ -98,6 +119,10 @@ impl Default for GpuSceneData {
             // Depth must be at least 1: the shader starts at level `depth - 1`.
             depth: 1,
             extent: 4,
+            // A single zero cell claims no empty space anywhere, the safe
+            // value for an empty scene.
+            distance_field: vec![0],
+            field_edge: 1,
             generation: 0,
         }
     }
@@ -203,6 +228,10 @@ pub fn build_gpu_scene(
         }
     }
     let volume = GpuVolume::from_contree(&scene.tree);
+    // The scene's own field, not a fresh build. `VoxelScene` builds it once at
+    // load and `apply_brush` keeps it current, so rebuilding here would both
+    // discard that work and stall: 930 ms at extent 4096, on a path that also
+    // runs when an edit outgrows the buffers mid-session.
     commands.insert_resource(GpuSceneData {
         nodes: volume.buffer_nodes(),
         voxels: volume.voxels,
@@ -210,8 +239,15 @@ pub fn build_gpu_scene(
         direction_masks: gpu_direction_masks(),
         depth: scene.tree.depth(),
         extent: scene.tree.extent(),
+        field_edge: scene.field.edge(),
+        distance_field: pack_field(&scene.field),
         generation: scene.generation,
     });
+}
+
+/// The field packed four cells to a word, matching `pack_voxels`.
+pub fn pack_field(field: &bevox_core::distance_field::DistanceField) -> Vec<u32> {
+    bevox_core::gpu::pack_voxels(field.cells())
 }
 
 /// Reads the active 3D camera in the main world so it can be extracted.
@@ -272,10 +308,15 @@ pub fn create_march_target(
 ///
 /// `world_from_clip` is the inverse view-projection: the shader multiplies a
 /// clip-space point by it to get a world-space ray target.
+///
+/// Takes the field rather than recomputing its edge count from `tree.extent()`:
+/// that formula already lives in `DistanceField::build`, and repeating it here
+/// is a second spelling of the same number that could silently drift from it.
 pub fn march_uniform(
     world_from_clip: Mat4,
     camera_position: Vec3,
     tree: &Contree,
+    field: &DistanceField,
     flags: u32,
 ) -> MarchUniform {
     MarchUniform {
@@ -283,6 +324,10 @@ pub fn march_uniform(
         camera_position: camera_position.extend(0.0).to_array(),
         sun_direction: SUN_DIRECTION.normalize().extend(0.0).to_array(),
         volume_params: [tree.depth(), tree.extent(), flags, 0],
+        // The cell size travels in the uniform rather than as a matching
+        // shader-side constant, which is exactly the duplication that let
+        // `march.wgsl`'s copy silently disagree with this one.
+        field_params: [field.edge(), bevox_core::distance_field::CELL_VOXELS, 0, 0],
     }
 }
 
@@ -301,6 +346,13 @@ pub struct VoxelWrite {
     pub words: Vec<u32>,
 }
 
+/// A contiguous run of packed distance-field words to write.
+#[derive(Clone, Debug)]
+pub struct FieldWrite {
+    pub start_word: u32,
+    pub words: Vec<u32>,
+}
+
 /// One frame's worth of scene changes.
 ///
 /// Cloned into the render world every frame like the rest of the extracted
@@ -312,6 +364,9 @@ pub struct SceneUpdate {
     pub root: GpuNode,
     pub nodes: Vec<NodeWrite>,
     pub voxels: Vec<VoxelWrite>,
+    /// The field cells the brush lowered this frame. Empty on every frame with
+    /// no paint, including one that only erased.
+    pub field: Vec<FieldWrite>,
     /// Arena slots in use. The node buffer must hold this many plus the root.
     pub node_high_water: u32,
     /// Packed voxel words in use.
@@ -324,9 +379,24 @@ impl Default for SceneUpdate {
             root: GpuNode::default(),
             nodes: Vec::new(),
             voxels: Vec::new(),
+            field: Vec::new(),
             node_high_water: 0,
             voxel_word_high_water: 0,
         }
+    }
+}
+
+/// Applies one brush stroke, updating the distance field only when it must.
+///
+/// This is where the paint/erase asymmetry lives, and it lives here rather
+/// than in the app so it can be tested. Painting adds geometry and lowers true
+/// distances, so a field left stale would over-estimate and rays would skip
+/// the new geometry. Erasing only raises true distances, leaving the field
+/// under-estimating, which costs a little speed and nothing else.
+pub fn apply_brush(scene: &mut VoxelScene, centre: Vec3, radius: f32, material: MaterialId) {
+    scene.tree.apply_sphere(centre, radius, material);
+    if !material.is_empty() {
+        scene.field_dirty = Some(scene.field.lower_around(centre, radius));
     }
 }
 
@@ -368,10 +438,29 @@ pub fn stage_scene_update(scene: &mut VoxelScene) -> SceneUpdate {
         })
         .collect();
 
+    // Rounded outward to whole words exactly like the voxel path, and read
+    // from the live field rather than remembered values so a cell sharing a
+    // boundary word with the untouched range still comes out right. `None`
+    // after an erase, which is what makes that path stage nothing at all.
+    let cells = scene.field.cells();
+    let field = scene
+        .field_dirty
+        .take()
+        .map(|r| {
+            let first = r.start / 4;
+            let last = r.end.div_ceil(4);
+            let lo = (first * 4) as usize;
+            let hi = ((last * 4) as usize).min(cells.len());
+            FieldWrite { start_word: first, words: bevox_core::gpu::pack_voxels(&cells[lo..hi]) }
+        })
+        .into_iter()
+        .collect();
+
     let update = SceneUpdate {
         root: GpuNode::from(scene.tree.root()),
         nodes,
         voxels,
+        field,
         node_high_water: arena.nodes().len() as u32,
         voxel_word_high_water: arena.voxels().len().div_ceil(4) as u32,
     };
@@ -432,24 +521,47 @@ mod tests {
     }
 
     #[test]
+    fn the_field_packs_four_cells_to_a_word() {
+        let field = bevox_core::distance_field::DistanceField::build(&Contree::empty(3));
+        let packed = pack_field(&field);
+        assert_eq!(packed.len(), field.cells().len().div_ceil(4));
+        // Little-endian within the word, matching pack_voxels.
+        let first = packed[0];
+        for i in 0..4 {
+            assert_eq!(
+                ((first >> (i * 8)) & 0xFF) as u8,
+                field.cells()[i as usize],
+                "cell {i} is not in byte {i} of word 0"
+            );
+        }
+    }
+
+    #[test]
     fn the_uniform_is_the_size_the_shader_expects() {
-        // mat4x4 (64) + vec4 (16) + vec4 sun (16) + uvec4 (16)
-        assert_eq!(size_of::<MarchUniform>(), 112);
+        // mat4x4 (64) + vec4 (16) + vec4 sun (16) + uvec4 (16) + uvec4 field (16)
+        assert_eq!(size_of::<MarchUniform>(), 128);
         assert_eq!(align_of::<MarchUniform>(), 4);
     }
 
     #[test]
     fn volume_params_carry_depth_and_extent() {
         let tree = Contree::empty(3);
-        let u = march_uniform(Mat4::IDENTITY, Vec3::ZERO, &tree, march_flags::NONE);
+        let field = DistanceField::build(&tree);
+        let u = march_uniform(Mat4::IDENTITY, Vec3::ZERO, &tree, &field, march_flags::NONE);
         assert_eq!(u.volume_params[0], 3);
         assert_eq!(u.volume_params[1], 64);
+        // The cell size travels with the edge count rather than a shader-side
+        // constant, so this is the one place that number is spelled out.
+        assert_eq!(u.field_params[0], field.edge());
+        assert_eq!(u.field_params[1], bevox_core::distance_field::CELL_VOXELS);
     }
 
     #[test]
     fn the_camera_position_survives_into_the_uniform() {
         let tree = Contree::empty(2);
-        let u = march_uniform(Mat4::IDENTITY, Vec3::new(1.0, 2.0, 3.0), &tree, march_flags::NONE);
+        let field = DistanceField::build(&tree);
+        let u =
+            march_uniform(Mat4::IDENTITY, Vec3::new(1.0, 2.0, 3.0), &tree, &field, march_flags::NONE);
         assert_eq!(u.camera_position[0], 1.0);
         assert_eq!(u.camera_position[1], 2.0);
         assert_eq!(u.camera_position[2], 3.0);
@@ -458,10 +570,12 @@ mod tests {
     #[test]
     fn flags_land_where_the_shader_reads_them() {
         let tree = Contree::empty(2);
+        let field = DistanceField::build(&tree);
         let u = march_uniform(
             Mat4::IDENTITY,
             Vec3::ZERO,
             &tree,
+            &field,
             march_flags::DDA | march_flags::BEAM,
         );
         assert_eq!(u.volume_params[2], 0b101);
@@ -471,7 +585,8 @@ mod tests {
     fn the_matrix_is_stored_column_major_as_wgsl_expects() {
         let m = Mat4::from_translation(Vec3::new(5.0, 6.0, 7.0));
         let tree = Contree::empty(2);
-        let u = march_uniform(m, Vec3::ZERO, &tree, march_flags::NONE);
+        let field = DistanceField::build(&tree);
+        let u = march_uniform(m, Vec3::ZERO, &tree, &field, march_flags::NONE);
         // glam is column-major, and to_cols_array_2d yields columns.
         assert_eq!(u.world_from_clip[3][0], 5.0);
         assert_eq!(u.world_from_clip[3][1], 6.0);
@@ -490,7 +605,38 @@ mod tests {
         // The initial build is not an edit: clear it so a test sees only what
         // the edit under test touched.
         tree.arena_mut().clear_dirty();
-        VoxelScene { tree, materials: MaterialTable::new(), generation: 1 }
+        let field = DistanceField::build(&tree);
+        VoxelScene { tree, materials: MaterialTable::new(), generation: 1, field, field_dirty: None }
+    }
+
+    /// Painting must update the field in the same frame as the voxels, or the
+    /// GPU skips empty space that is no longer empty.
+    #[test]
+    fn a_paint_stages_the_field_cells_it_lowered() {
+        let mut scene = edit_scene();
+        apply_brush(&mut scene, Vec3::splat(32.0), 6.0, MaterialId(2));
+
+        let update = stage_scene_update(&mut scene);
+        assert!(!update.field.is_empty(), "a paint staged no field cells");
+
+        let whole = pack_field(&scene.field);
+        for write in &update.field {
+            for (i, word) in write.words.iter().enumerate() {
+                let w = write.start_word as usize + i;
+                assert_eq!(*word, whole[w], "staged field word {w} differs from a full pack");
+            }
+        }
+    }
+
+    /// Erasing needs no field update at all: removing geometry only increases
+    /// true distances, so a stale field under-estimates, which costs speed and
+    /// never correctness.
+    #[test]
+    fn erasing_stages_no_field_cells() {
+        let mut scene = edit_scene();
+        apply_brush(&mut scene, Vec3::splat(32.0), 6.0, MaterialId::EMPTY);
+        let update = stage_scene_update(&mut scene);
+        assert!(update.field.is_empty(), "an erase staged field cells it did not need to");
     }
 
     #[test]
@@ -588,7 +734,14 @@ mod tests {
         let mut tree = Contree::empty(3);
         tree.apply_sphere(Vec3::new(32.0, 32.0, 32.0), 10.0, MaterialId(1));
         tree.arena_mut().clear_dirty();
-        app.insert_resource(VoxelScene { tree, materials: MaterialTable::new(), generation: 1 });
+        let field = DistanceField::build(&tree);
+        app.insert_resource(VoxelScene {
+            tree,
+            materials: MaterialTable::new(),
+            generation: 1,
+            field,
+            field_dirty: None,
+        });
         app.update();
 
         let loaded_nodes = app.world().resource::<GpuSceneData>().nodes.clone();
@@ -633,7 +786,14 @@ mod tests {
         let mut tree = Contree::empty(3);
         tree.apply_sphere(Vec3::new(32.0, 32.0, 32.0), 10.0, MaterialId(1));
         tree.arena_mut().clear_dirty();
-        app.insert_resource(VoxelScene { tree, materials: MaterialTable::new(), generation: 1 });
+        let field = DistanceField::build(&tree);
+        app.insert_resource(VoxelScene {
+            tree,
+            materials: MaterialTable::new(),
+            generation: 1,
+            field,
+            field_dirty: None,
+        });
         app.update();
 
         let loaded_nodes = app.world().resource::<GpuSceneData>().nodes.clone();

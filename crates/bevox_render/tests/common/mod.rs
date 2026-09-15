@@ -22,6 +22,8 @@ pub struct TestUniform {
     pub sun_direction: [f32; 4],
     /// `[depth, extent, flags, 0]`.
     pub volume_params: [u32; 4],
+    /// `[field_edge, field_cell_size, 0, 0]`.
+    pub field_params: [u32; 4],
 }
 
 /// Colours for the parity scene's two materials. A zeroed palette would render
@@ -156,6 +158,7 @@ pub struct Prepared {
     /// Kept so a test can apply an incremental update the way the app does.
     node_buffer: wgpu::Buffer,
     voxel_buffer: wgpu::Buffer,
+    field_buffer: wgpu::Buffer,
     /// Timestamps around each pass, when the device supports them. Four slots:
     /// beam begin/end then main begin/end, so a beam-less configuration simply
     /// leaves the first pair unwritten.
@@ -206,6 +209,7 @@ impl Prepared {
         height: u32,
         flags: u32,
     ) -> Self {
+        let field = bevox_core::distance_field::DistanceField::build(tree);
         let uniform = TestUniform {
             world_from_clip: world_from_clip.to_cols_array_2d(),
             camera_position: eye.extend(0.0).to_array(),
@@ -214,6 +218,10 @@ impl Prepared {
                 .extend(0.0)
                 .to_array(),
             volume_params: [tree.depth(), tree.extent(), flags, 0],
+            // The cell size travels in the uniform rather than a matching
+            // shader-side constant, so the shader cannot silently disagree
+            // with `bevox_core::distance_field::CELL_VOXELS`.
+            field_params: [field.edge(), bevox_core::distance_field::CELL_VOXELS, 0, 0],
         };
 
         // Root first, arena shifted by one: the layout the shader indexes.
@@ -272,6 +280,12 @@ impl Prepared {
             contents: bytemuck::cast_slice(&palette),
             usage: wgpu::BufferUsages::STORAGE,
         });
+        let field_words = bevox_render::upload::pack_field(&field);
+        let field_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("field"),
+            contents: bytemuck::cast_slice(&field_words),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("march"),
@@ -291,6 +305,7 @@ impl Prepared {
                 storage_entry(1, 16),
                 storage_entry(2, 4),
                 storage_entry(3, 16),
+                storage_entry(7, 4),
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -358,6 +373,7 @@ impl Prepared {
                 wgpu::BindGroupEntry { binding: 3, resource: palette_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: mask_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: beam_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: field_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&view),
@@ -395,6 +411,7 @@ impl Prepared {
             texture,
             node_buffer,
             voxel_buffer,
+            field_buffer,
             timestamps,
             width,
             height,
@@ -519,6 +536,10 @@ impl Prepared {
         for write in &update.voxels {
             let offset = u64::from(write.start_word) * 4;
             queue.write_buffer(&self.voxel_buffer, offset, bytemuck::cast_slice(&write.words));
+        }
+        for write in &update.field {
+            let offset = u64::from(write.start_word) * 4;
+            queue.write_buffer(&self.field_buffer, offset, bytemuck::cast_slice(&write.words));
         }
     }
 }

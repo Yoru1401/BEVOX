@@ -10,6 +10,7 @@ struct MarchUniform {
     camera_position: vec4<f32>,
     sun_direction: vec4<f32>,
     volume_params: vec4<u32>,  // [depth, extent, flags, 0]
+    field_params: vec4<u32>,  // [field_edge, field_cell_size, 0, 0]
 };
 
 // Traversal optimisations, matching bevox_render::upload::march_flags. One
@@ -18,6 +19,7 @@ struct MarchUniform {
 const FLAG_DDA: u32 = 1u;
 const FLAG_MASK_FILTER: u32 = 2u;
 const FLAG_BEAM: u32 = 4u;
+const FLAG_DISTANCE_FIELD: u32 = 8u;
 
 @group(0) @binding(0) var<uniform> view: MarchUniform;
 @group(0) @binding(1) var<storage, read> nodes: array<vec4<u32>>;
@@ -31,6 +33,9 @@ const FLAG_BEAM: u32 = 4u;
 // rather than a second storage texture: one binding instead of two, and no
 // read-access storage texture to negotiate with the adapter.
 @group(0) @binding(6) var<storage, read_write> beam: array<f32>;
+// Distance field: Chebyshev distance to the nearest solid voxel per coarse
+// cell, four cells packed per word.
+@group(0) @binding(7) var<storage, read> distance_field: array<u32>;
 
 const BRICK_EDGE: u32 = 4u;
 const CHILDREN: u32 = 64u;
@@ -535,6 +540,66 @@ fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
     return normalize(far.xyz / far.w - view.camera_position.xyz);
 }
 
+/// Voxels per field cell, per axis, as built by `DistanceField::build`.
+///
+/// Carried in the uniform rather than a shader-side constant: a constant here
+/// would be a second spelling of `bevox_core::distance_field::CELL_VOXELS`,
+/// free to drift from it, and a mismatch would make the field's promised
+/// cube the wrong size on the GPU while every CPU-side check kept passing.
+fn field_cell_size() -> f32 {
+    return f32(view.field_params.y);
+}
+
+fn field_at(cell: vec3<i32>) -> u32 {
+    let edge = i32(view.field_params.x);
+    if cell.x < 0 || cell.y < 0 || cell.z < 0
+        || cell.x >= edge || cell.y >= edge || cell.z >= edge {
+        return 0u;
+    }
+    let i = u32(cell.x + cell.y * edge + cell.z * edge * edge);
+    return (distance_field[i / 4u] >> ((i % 4u) * 8u)) & 0xFFu;
+}
+
+/// Advances `t` past empty space the field can prove is empty.
+///
+/// The field holds a Chebyshev distance, so a value of `d` at the ray's cell
+/// promises the whole cube of `d` cells around it is empty. Advancing to that
+/// cube's exit plane is therefore safe in any direction, which is the property
+/// a Euclidean field would not give.
+///
+/// Conservative by construction: it never advances past the cube the field
+/// promised, so it cannot skip geometry unless the field itself lied.
+fn skip_empty_space(origin: vec3<f32>, dir: vec3<f32>, inv_dir: vec3<f32>, start: f32, max_dist: f32) -> f32 {
+    var t = start;
+    let cell_size = field_cell_size();
+    // A ray crosses a bounded number of cubes before it either hits something
+    // or leaves; the bound stops a degenerate direction spinning here.
+    for (var i = 0u; i < 64u; i = i + 1u) {
+        if t > max_dist { return t; }
+        let p = origin + dir * t;
+        let cell = vec3<i32>(floor(p / cell_size));
+        let d = field_at(cell);
+        if d == 0u { return t; }
+
+        // Exit plane of the cube of `d` cells around this one.
+        let lo = (vec3<f32>(cell) - vec3<f32>(f32(d) - 1.0)) * cell_size;
+        let hi = (vec3<f32>(cell) + vec3<f32>(f32(d))) * cell_size;
+        let t0 = (lo - origin) * inv_dir;
+        let t1 = (hi - origin) * inv_dir;
+        let far = max(t0, t1);
+        let exit = min(min(far.x, far.y), far.z);
+        // Nudge past the boundary, or the next sample lands on the same cell
+        // and the loop makes no progress.
+        if exit <= t { return t; }
+        // Relative, not fixed: at t in the thousands a 1e-3 nudge is below
+        // float32's ULP and rounds straight back to `exit`, so the walk stops
+        // early on exactly the large scenes this is meant to help. Kept well
+        // under one cell so it can never step past the cube just cleared.
+        t = exit + max(1e-3, exit * 1e-5);
+    }
+    return t;
+}
+
 /// Whether anything is hit within `max_dist`. Shadow rays do not care which
 /// voxel occludes them, only that one does.
 ///
@@ -542,7 +607,11 @@ fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
 /// the two drift apart, and the shadow path would stop being covered by the
 /// parity test that guards the primary one.
 fn traverse_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
-    return traverse(origin, dir, max_dist).hit;
+    var t_seed = 0.0;
+    if flag_enabled(FLAG_DISTANCE_FIELD) {
+        t_seed = skip_empty_space(origin, dir, vec3<f32>(1.0) / dir, 0.0, max_dist);
+    }
+    return traverse(origin + dir * t_seed, dir, max_dist - t_seed).hit;
 }
 
 fn beam_dims(size: vec2<u32>) -> vec2<u32> {
@@ -608,6 +677,9 @@ fn primary_hit(id: vec3<u32>, size: vec2<u32>) -> Hit {
     var t_seed = 0.0;
     if flag_enabled(FLAG_BEAM) {
         t_seed = beam_seed(id, size);
+    }
+    if flag_enabled(FLAG_DISTANCE_FIELD) {
+        t_seed = skip_empty_space(view.camera_position.xyz, dir, vec3<f32>(1.0) / dir, t_seed, max_ray_distance());
     }
     var hit = traverse(
         view.camera_position.xyz + dir * t_seed,

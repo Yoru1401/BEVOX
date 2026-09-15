@@ -1,11 +1,12 @@
 use bevy::prelude::*;
 use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
+use bevox_core::distance_field::DistanceField;
 use bevox_core::material::{Material, MaterialId, MaterialTable};
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system};
 use bevox_render::pick::pick_voxel;
-use bevox_render::upload::VoxelScene;
+use bevox_render::upload::{VoxelScene, apply_brush};
 
 fn main() {
     App::new()
@@ -84,7 +85,8 @@ fn setup(mut commands: Commands) {
         FlyCamera::looking_at(eye, centre),
     ));
 
-    commands.insert_resource(VoxelScene { tree, materials, generation: 1 });
+    let field = DistanceField::build(&tree);
+    commands.insert_resource(VoxelScene { tree, materials, generation: 1, field, field_dirty: None });
 }
 
 /// What the brush paints and how big it is.
@@ -174,7 +176,7 @@ fn brush_input(
     } else {
         hit.position + hit.normal * brush.radius
     };
-    scene.tree.apply_sphere(centre, brush.radius, material);
+    apply_brush(&mut scene, centre, brush.radius, material);
     // Deliberately not bumped: an edit is uploaded by range, and bumping the
     // generation is what asks for a full rebuild.
 }
