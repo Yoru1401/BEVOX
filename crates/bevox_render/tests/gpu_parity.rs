@@ -117,12 +117,11 @@ const FLOOR: MaterialId = MaterialId(2);
 
 /// A static world for body tests: a floor three voxels thick at extent 256.
 ///
-/// Non-empty and a different extent from the body's 64 on purpose. An empty
-/// static world packs to a lone root, so the body's `voxel_base` is 0 and its
-/// depth and extent match the world's -- a body marched with the static
-/// world's bases, or its depth and extent, would then pass. Three thick, not four, so
-/// the floor's bricks do not collapse to uniform nodes and it really owns voxel
-/// bytes the body's must be offset past. `extra` adds static voxels on top.
+/// Non-empty and a different extent from the body's 64 on purpose: a body
+/// marched with the static world's depth and extent would otherwise pass.
+/// Three thick, not four, so the floor's bricks do not collapse to uniform
+/// nodes and it really owns voxel bytes that a body read from the static
+/// world's base would pick up. `extra` adds static voxels on top.
 fn body_world(extra: &[(UVec3, MaterialId)]) -> Contree {
     let mut voxels = extra.to_vec();
     for z in 0..256 {

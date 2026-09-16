@@ -31,7 +31,8 @@ pub struct VoxelScene {
     /// a stale field merely under-estimates -- costing speed, never
     /// correctness -- and needs no upload at all.
     pub field_dirty: Option<Range<u32>>,
-    /// Rigid bodies, packed after `tree` in the shared node and voxel buffers.
+    /// Rigid bodies, packed past the world's region of the shared node and
+    /// voxel buffers.
     ///
     /// A body that only moves -- a new `position` or `orientation` -- needs
     /// nothing: its table entry is rebuilt and re-uploaded every frame, and
@@ -132,11 +133,40 @@ impl GpuBody {
     }
 }
 
-/// The static world and every body, packed end to end into shared buffers.
+/// How much of the shared buffers belongs to the static world: its data and
+/// the headroom its edits grow into. Bodies are packed past it.
+///
+/// Carried from the pack through `GpuSceneData` into the render buffers rather
+/// than recomputed, so the check that allows an incremental world write and
+/// the layout that check protects cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorldRegion {
+    /// Node entries, the root included.
+    pub nodes: u32,
+    pub voxel_words: u32,
+}
+
+impl WorldRegion {
+    /// The region for a world currently using this many entries of each.
+    pub fn around(nodes: u32, voxel_words: u32) -> Self {
+        Self { nodes: buffer_capacity_for(nodes), voxel_words: buffer_capacity_for(voxel_words) }
+    }
+
+    /// Whether a world grown to these high-water marks is still inside the
+    /// region. False means rebuild: an incremental write past the region would
+    /// land in the first body. `node_high_water` counts arena slots, and slot
+    /// `n` is at index `n + 1`, hence the strict comparison.
+    pub fn fits(&self, node_high_water: u32, voxel_word_high_water: u32) -> bool {
+        node_high_water < self.nodes && voxel_word_high_water <= self.voxel_words
+    }
+}
+
+/// The static world and every body, packed into shared buffers.
 pub struct PackedScene {
     pub nodes: Vec<GpuNode>,
     pub voxels: Vec<u32>,
     pub bodies: Vec<GpuBody>,
+    pub world_region: WorldRegion,
 }
 
 /// Packs the static world followed by each body.
@@ -144,10 +174,21 @@ pub struct PackedScene {
 /// One set of buffers rather than one per body: a body is small, and a second
 /// pair of bindings per body would cap the count at whatever the device allows
 /// rather than at what the frame budget allows.
+///
+/// Bodies start past the world's whole region, not at the end of its current
+/// data. An edit grows the world by appending to its arena, and those writes go
+/// out incrementally; packed tight, the first allocating paint would overwrite
+/// the first body. With no bodies there is nothing to protect, so the world is
+/// not padded and a body-free scene packs exactly as it always has.
 pub fn pack_bodies(world: &Contree, bodies: &[Body]) -> PackedScene {
     let world_volume = GpuVolume::from_contree(world);
     let mut nodes = world_volume.buffer_nodes();
     let mut voxels = world_volume.voxels;
+    let world_region = WorldRegion::around(nodes.len() as u32, voxels.len() as u32);
+    if !bodies.is_empty() {
+        nodes.resize(world_region.nodes as usize, GpuNode::default());
+        voxels.resize(world_region.voxel_words as usize, 0);
+    }
     let mut out = Vec::with_capacity(bodies.len());
 
     for body in bodies {
@@ -169,7 +210,7 @@ pub fn pack_bodies(world: &Contree, bodies: &[Body]) -> PackedScene {
         );
     }
 
-    PackedScene { nodes, voxels, bodies: out }
+    PackedScene { nodes, voxels, bodies: out, world_region }
 }
 
 /// The scene as the render world sees it.
@@ -181,7 +222,7 @@ pub fn pack_bodies(world: &Contree, bodies: &[Body]) -> PackedScene {
 pub struct GpuSceneData {
     pub nodes: Vec<GpuNode>,
     pub voxels: Vec<u32>,
-    /// Every rigid body in the scene, packed after the static world in `nodes`
+    /// Every rigid body in the scene, packed past `world_region` in `nodes`
     /// and `voxels`. The transforms are as of the last rebuild; the layout --
     /// bases, depth, extent -- is what `SceneUpdate::bodies` re-places each
     /// frame.
@@ -198,6 +239,8 @@ pub struct GpuSceneData {
     /// Cells per axis, so the shader can index the grid.
     pub field_edge: u32,
     pub generation: u32,
+    /// The world's share of `nodes` and `voxels`, headroom included.
+    pub world_region: WorldRegion,
 }
 
 impl Default for GpuSceneData {
@@ -220,6 +263,7 @@ impl Default for GpuSceneData {
             distance_field: vec![0],
             field_edge: 1,
             generation: 0,
+            world_region: WorldRegion::around(1, 0),
         }
     }
 }
@@ -298,9 +342,13 @@ pub fn gpu_direction_masks() -> Vec<[u32; 2]> {
 /// have outgrown the render buffers' capacity. If this resource stayed a
 /// frozen load-time snapshot, that rebuild would re-upload stale data forever
 /// (the new capacity is computed from the same stale snapshot, so the overflow
-/// never clears). So a live tree that no longer fits the capacity implied by
-/// the existing snapshot forces a refresh too, using the same
-/// `buffer_capacity_for` the render world uses so the two worlds cannot drift.
+/// never clears). So a live tree that no longer fits the snapshot's
+/// `world_region` forces a refresh too -- the same region and the same
+/// `WorldRegion::fits` the render world checks, so the two cannot drift.
+///
+/// The world region, not the snapshot's whole length: with bodies, `nodes`
+/// also holds the region's headroom and every body, and a capacity measured
+/// from that would let the world grow into the first body without a rebuild.
 pub fn build_gpu_scene(
     mut commands: Commands,
     scene: Option<Res<VoxelScene>>,
@@ -310,18 +358,14 @@ pub fn build_gpu_scene(
     let Some(scene) = scene else {
         return;
     };
-    if let Some(existing) = &existing {
-        // +1: the root, which lives at buffer index 0, outside the arena.
-        let nodes_needed = scene.tree.arena().nodes().len() as u32 + 1;
-        let node_capacity = buffer_capacity_for(existing.nodes.len() as u32);
-        let voxel_words_needed = scene.tree.arena().voxels().len().div_ceil(4) as u32;
-        let voxel_word_capacity = buffer_capacity_for(existing.voxels.len() as u32);
-        if existing.generation == scene.generation
-            && nodes_needed <= node_capacity
-            && voxel_words_needed <= voxel_word_capacity
-        {
-            return;
-        }
+    if let Some(existing) = &existing
+        && existing.generation == scene.generation
+        && existing.world_region.fits(
+            scene.tree.arena().nodes().len() as u32,
+            scene.tree.arena().voxels().len().div_ceil(4) as u32,
+        )
+    {
+        return;
     }
     // Bodies are geometry here. A body that only moved does not reach this
     // line -- the generation gate above lets it through untouched -- and its
@@ -342,6 +386,7 @@ pub fn build_gpu_scene(
         field_edge: scene.field.edge(),
         distance_field: pack_field(&scene.field),
         generation: scene.generation,
+        world_region: packed.world_region,
     });
 }
 
@@ -982,15 +1027,21 @@ mod tests {
         );
         let packed = pack_bodies(&world, std::slice::from_ref(&body));
 
-        let world_nodes = GpuVolume::from_contree(&world).buffer_nodes().len() as u32;
+        let world_volume = GpuVolume::from_contree(&world);
+        let region = WorldRegion::around(
+            world_volume.buffer_nodes().len() as u32,
+            world_volume.voxels.len() as u32,
+        );
+        assert_eq!(packed.world_region, region);
         assert_eq!(
-            packed.bodies[0].node_base, world_nodes,
-            "the body's root must sit immediately after the static world's nodes"
+            (packed.bodies[0].node_base, packed.bodies[0].voxel_base),
+            (region.nodes, region.voxel_words),
+            "the body must start past the world's region, not at its current end"
         );
         assert_eq!(
             packed.nodes.len() as u32,
-            world_nodes + GpuVolume::from_contree(&body.volume).buffer_nodes().len() as u32,
-            "the packed buffer must hold both volumes end to end"
+            region.nodes + GpuVolume::from_contree(&body.volume).buffer_nodes().len() as u32,
+            "the packed buffer must hold the world's region and then the body"
         );
     }
 
@@ -1079,5 +1130,135 @@ mod tests {
             bytemuck::cast_slice::<GpuBody, u8>(&expected),
             "the body table does not place the body where it is now"
         );
+    }
+
+    /// Painting the world must never write into a body, however far it grows.
+    ///
+    /// Paints the way the app does -- `apply_brush`, then the staging system --
+    /// one isolated voxel per leaf block, each forcing fresh allocations, until
+    /// the world outgrows its region. Every frame that still fits must stage
+    /// no write inside any body's nodes or voxels, and must not rebuild; the
+    /// frame that no longer fits must rebuild, with the bodies moved past a
+    /// region the grown world fits. The rebuild is judged by `GpuSceneData`'s
+    /// change tick, which is what `build_gpu_scene`'s trigger drives.
+    #[test]
+    fn painting_the_world_never_writes_into_a_body() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<GpuSceneData>()
+            .add_systems(
+                Update,
+                (build_gpu_scene, stage_scene_update_system.after(build_gpu_scene)),
+            );
+
+        // Off the brick grid, so the body owns voxel bytes as well as nodes.
+        let mut cube = Vec::new();
+        for z in 5..11 {
+            for y in 5..11 {
+                for x in 5..11 {
+                    cube.push((glam::UVec3::new(x, y, z), MaterialId(3)));
+                }
+            }
+        }
+        let volume = Contree::from_voxels(16, &cube);
+        let packed = GpuVolume::from_contree(&volume);
+        let (body_nodes, body_words) = (packed.buffer_nodes().len() as u32, packed.voxels.len() as u32);
+        assert!(body_words > 0, "the body owns no voxel bytes, so half the check is vacuous");
+
+        let mut scene = edit_scene();
+        scene.bodies = vec![
+            bevox_core::body::Body::new(volume.clone(), Vec3::ZERO, Quat::IDENTITY),
+            bevox_core::body::Body::new(volume, Vec3::splat(20.0), Quat::IDENTITY),
+        ];
+        let first_high_water = scene.tree.arena().nodes().len();
+        app.insert_resource(scene);
+        app.update();
+
+        let mut rebuilt = false;
+        'grid: for bx in 0..16u32 {
+            for by in 0..16u32 {
+                for bz in 0..16u32 {
+                    let (region, bodies) = {
+                        let gpu = app.world().resource::<GpuSceneData>();
+                        (gpu.world_region, gpu.bodies.clone())
+                    };
+                    let tick = app.world().get_resource_change_ticks::<GpuSceneData>().unwrap().changed;
+
+                    let centre = Vec3::new(
+                        (bx * 4) as f32 + 0.5,
+                        (by * 4) as f32 + 0.5,
+                        (bz * 4) as f32 + 0.5,
+                    );
+                    apply_brush(
+                        &mut app.world_mut().resource_mut::<VoxelScene>(),
+                        centre,
+                        0.6,
+                        MaterialId(2),
+                    );
+                    app.update();
+
+                    let update = app.world().resource::<SceneUpdate>();
+                    let rebuild_tick =
+                        app.world().get_resource_change_ticks::<GpuSceneData>().unwrap().changed;
+
+                    if !region.fits(update.node_high_water, update.voxel_word_high_water) {
+                        assert_ne!(
+                            rebuild_tick, tick,
+                            "the world outgrew its region at {centre:?}, but GpuSceneData was not rebuilt"
+                        );
+                        let gpu = app.world().resource::<GpuSceneData>();
+                        assert!(
+                            gpu.world_region.fits(update.node_high_water, update.voxel_word_high_water),
+                            "the rebuild did not make room for the world that forced it"
+                        );
+                        for body in &gpu.bodies {
+                            assert!(
+                                body.node_base >= gpu.world_region.nodes
+                                    && body.voxel_base >= gpu.world_region.voxel_words,
+                                "the rebuild packed a body inside the new world region"
+                            );
+                        }
+                        rebuilt = true;
+                        break 'grid;
+                    }
+
+                    assert_eq!(
+                        rebuild_tick, tick,
+                        "the world still fits its region at {centre:?}, yet GpuSceneData was rebuilt"
+                    );
+                    let overlaps = |a: &Range<u32>, b: &Range<u32>| a.start < b.end && b.start < a.end;
+                    let mut offending = Vec::new();
+                    for (i, body) in bodies.iter().enumerate() {
+                        let nodes = body.node_base..body.node_base + body_nodes;
+                        let words = body.voxel_base..body.voxel_base + body_words;
+                        for write in &update.nodes {
+                            // Arena slot n is buffer index n + 1.
+                            let at = write.start + 1..write.start + 1 + write.nodes.len() as u32;
+                            if overlaps(&at, &nodes) {
+                                offending.push(format!("node write {at:?} into body {i} nodes {nodes:?}"));
+                            }
+                        }
+                        for write in &update.voxels {
+                            let at = write.start_word..write.start_word + write.words.len() as u32;
+                            if overlaps(&at, &words) {
+                                offending.push(format!("voxel write {at:?} into body {i} words {words:?}"));
+                            }
+                        }
+                    }
+                    assert!(
+                        offending.is_empty(),
+                        "painting at {centre:?} wrote into a body: {}",
+                        offending.join("; ")
+                    );
+                }
+            }
+        }
+
+        let high_water = app.world().resource::<VoxelScene>().tree.arena().nodes().len();
+        assert!(
+            high_water > first_high_water,
+            "painting never grew the world ({first_high_water} -> {high_water} arena nodes)"
+        );
+        assert!(rebuilt, "the world never outgrew its region -- paint more");
     }
 }

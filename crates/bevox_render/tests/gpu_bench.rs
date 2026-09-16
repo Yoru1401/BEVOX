@@ -455,12 +455,17 @@ fn median_of(v: &mut [f32]) -> f32 {
 #[ignore]
 fn the_scene_clone_is_measured_against_not_cloning() {
     use bevox_core::material::MaterialTable;
-    use bevox_render::upload::{GpuSceneData, gpu_direction_masks};
+    use bevox_render::upload::{GpuSceneData, WorldRegion, gpu_direction_masks};
 
     let (tree, extent) = bench_scene();
     let volume = GpuVolume::from_contree(&tree);
     let field = bevox_core::distance_field::DistanceField::build(&tree);
     let scene = GpuSceneData {
+        // First, while `volume.voxels` is still here to measure.
+        world_region: WorldRegion::around(
+            volume.buffer_nodes().len() as u32,
+            volume.voxels.len() as u32,
+        ),
         nodes: volume.buffer_nodes(),
         voxels: volume.voxels,
         bodies: Vec::new(),
@@ -493,6 +498,10 @@ fn the_scene_clone_is_measured_against_not_cloning() {
             let volume = GpuVolume::from_contree(&tree);
             let field = bevox_core::distance_field::DistanceField::build(&tree);
             let real = GpuSceneData {
+                world_region: WorldRegion::around(
+                    volume.buffer_nodes().len() as u32,
+                    volume.voxels.len() as u32,
+                ),
                 nodes: volume.buffer_nodes(),
                 voxels: volume.voxels,
                 bodies: Vec::new(),

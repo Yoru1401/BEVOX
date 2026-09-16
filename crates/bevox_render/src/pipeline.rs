@@ -2,7 +2,7 @@
 
 use crate::upload::{
     ExtractedMarchCamera, GpuBody, GpuSceneData, MarchTarget, MarchUniform, SceneUpdate,
-    march_flags,
+    WorldRegion, march_flags,
 };
 use bevy::prelude::*;
 use bevy::material::bind_group_layout_entries::BindGroupLayoutEntries;
@@ -99,8 +99,10 @@ pub struct MarchBuffers {
     pub field: Buffer,
     pub bodies: Buffer,
     pub generation: u32,
-    pub node_capacity: u32,
-    pub voxel_word_capacity: u32,
+    /// The world's share of `nodes` and `voxels`, as the scene these buffers
+    /// were built from laid it out. An incremental world write is allowed only
+    /// inside it; past it are the bodies.
+    pub world_region: WorldRegion,
 }
 
 pub fn init_march_pipeline(
@@ -194,13 +196,14 @@ pub fn prepare_march_buffers(
     };
 
     // Reuse the buffers unless the scene was replaced outright or an edit grew
-    // past the room they have. Both fall through to the rebuild below.
+    // the world past its region. Both fall through to the rebuild below, which
+    // re-packs the bodies past a larger region. The region, not the whole
+    // buffer: past it lie the bodies, and a write there would overwrite one.
     if let Some(buffers) = existing
         && buffers.generation == scene.generation
-        && update.as_ref().is_none_or(|u| {
-            u.node_high_water < buffers.node_capacity
-                && u.voxel_word_high_water <= buffers.voxel_word_capacity
-        })
+        && update
+            .as_ref()
+            .is_none_or(|u| buffers.world_region.fits(u.node_high_water, u.voxel_word_high_water))
     {
         queue.write_buffer(&buffers.uniform, 0, bytemuck::bytes_of(&uniform_value));
 
@@ -231,8 +234,12 @@ pub fn prepare_march_buffers(
         return;
     }
 
-    let node_capacity = buffer_capacity_for(scene.nodes.len() as u32);
-    let voxel_word_capacity = buffer_capacity_for(scene.voxels.len() as u32);
+    // Sized as laid out: the world's region, then the bodies packed past it.
+    // With no bodies the pack is just the world, and this is the region -- the
+    // same capacity a body-free scene has always had. Bodies get no headroom of
+    // their own: changing one's geometry bumps the generation and rebuilds.
+    let node_capacity = scene.world_region.nodes.max(scene.nodes.len() as u32);
+    let voxel_word_capacity = scene.world_region.voxel_words.max(scene.voxels.len() as u32);
     let field_words = scene.distance_field.len() as u32;
     // A zero-length storage buffer is invalid, so an empty body list still
     // uploads room for one (zeroed) GpuBody; the uniform's count stays at zero.
@@ -311,8 +318,7 @@ pub fn prepare_march_buffers(
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         }),
         generation: scene.generation,
-        node_capacity,
-        voxel_word_capacity,
+        world_region: scene.world_region,
     });
 }
 
