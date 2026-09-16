@@ -124,7 +124,6 @@ fn record_the_baseline() {
 
     let built = std::time::Instant::now();
     let (tree, extent) = bench_scene();
-    let volume = GpuVolume::from_contree(&tree);
     println!(
         "scene: extent {extent}, {} arena nodes, {} voxel bytes, built in {:.2}s",
         tree.arena().nodes().len(),
@@ -140,7 +139,6 @@ fn record_the_baseline() {
         &shader,
         "march",
         &tree,
-        &volume,
         world_from_clip,
         eye,
         1280,
@@ -171,13 +169,12 @@ fn optimisations_are_measured_against_the_baseline() {
     };
 
     let (tree, extent) = bench_scene();
-    let volume = GpuVolume::from_contree(&tree);
     let (eye, world_from_clip) = bench_camera(extent);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
     let make = |flags: u32| {
         Prepared::new(
-            &device, &shader, "march", &tree, &volume, world_from_clip, eye, 1280, 720, flags,
+            &device, &shader, "march", &tree, world_from_clip, eye, 1280, 720, flags,
             &[],
         )
     };
@@ -245,18 +242,17 @@ fn the_real_scenes_are_measured_with_the_defaults() {
             println!("{name}: failed to load, skipping");
             continue;
         };
-        let volume = GpuVolume::from_contree(&tree);
         let extent = tree.extent();
 
         for (label, (eye, world_from_clip)) in
             [("framed", framed_camera(extent)), ("close", close_camera(&tree, extent))]
         {
             let baseline = Prepared::new(
-                &device, &shader, "march", &tree, &volume, world_from_clip, eye, 1280, 720,
+                &device, &shader, "march", &tree, world_from_clip, eye, 1280, 720,
                 march_flags::NONE, &[],
             );
             let variant = Prepared::new(
-                &device, &shader, "march", &tree, &volume, world_from_clip, eye, 1280, 720,
+                &device, &shader, "march", &tree, world_from_clip, eye, 1280, 720,
                 march_flags::DEFAULT, &[],
             );
             let (a1, b, a2) = compare_aba(&device, &queue, &baseline, &variant);
@@ -558,7 +554,6 @@ fn the_dispatches_are_timed_by_the_gpu() {
     }
 
     let (tree, extent) = bench_scene();
-    let volume = GpuVolume::from_contree(&tree);
     let (eye, world_from_clip) = bench_camera(extent);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
@@ -573,7 +568,7 @@ fn the_dispatches_are_timed_by_the_gpu() {
         ("all+field", march_flags::DEFAULT | march_flags::DISTANCE_FIELD),
     ] {
         let prepared = Prepared::new(
-            &device, &shader, "march", &tree, &volume, world_from_clip, eye, 1280, 720, flags,
+            &device, &shader, "march", &tree, world_from_clip, eye, 1280, 720, flags,
             &[],
         );
         // Discard the first dispatch: it pays for pipeline compilation.

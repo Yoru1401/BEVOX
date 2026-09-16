@@ -223,6 +223,10 @@ struct Hit {
     t: f32,
     voxel: vec3<u32>,
     face_normal: vec3<f32>,
+    // Set when a body, not the static world, produced this hit. Its `voxel` is
+    // then a coordinate in the body's own volume and means nothing against the
+    // static tree or as a world position.
+    from_body: bool,
 };
 
 /// Which face of a box the ray entered, from the per-axis entry distances.
@@ -259,7 +263,7 @@ fn traverse_at(
 
     let root_slab = ray_box(origin, inv_dir, vec3<f32>(0.0), vec3<f32>(f32(extent)));
     if !root_slab.hit {
-        return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0));
+        return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0), false);
     }
 
     // Index `node_base` is the root written by the uploader, so every arena
@@ -310,6 +314,7 @@ fn traverse_at(
                 frame.t_enter,
                 vec3<u32>(entered),
                 entry_normal(origin, inv_dir, lo, hi),
+                false,
             );
         }
 
@@ -443,6 +448,7 @@ fn traverse_at(
                 best_t,
                 best_origin,
                 entry_normal(origin, inv_dir, lo, hi),
+                false,
             );
         }
 
@@ -480,7 +486,7 @@ fn traverse_at(
         );
     }
 
-    return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0));
+    return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0), false);
 }
 
 /// The static world, at its fixed place in the shared buffers. Every existing
@@ -512,6 +518,7 @@ fn compose_bodies(origin: vec3<f32>, dir: vec3<f32>, world_hit: Hit, max_dist: f
         if h.hit && h.t < limit {
             best = h;
             best.face_normal = (b.rotation * vec4<f32>(h.face_normal, 0.0)).xyz;
+            best.from_body = true;
             limit = h.t;
         }
     }
@@ -743,14 +750,50 @@ fn primary_hit(id: vec3<u32>, size: vec2<u32>) -> Hit {
         t_seed = skip_empty_space(view.camera_position.xyz, dir, vec3<f32>(1.0) / dir, t_seed, max_ray_distance());
     }
     let origin = view.camera_position.xyz + dir * t_seed;
-    let max_dist = max_ray_distance() - t_seed;
-    var hit = traverse(origin, dir, max_dist);
-    if flag_enabled(FLAG_BODIES) {
-        hit = compose_bodies(origin, dir, hit, max_dist);
-    }
+    var hit = traverse(origin, dir, max_ray_distance() - t_seed);
     // Measured from the offset origin; callers want it absolute.
     hit.t = hit.t + t_seed;
+    if flag_enabled(FLAG_BODIES) {
+        // From the camera over the whole ray, not from the seeded origin. The
+        // beam seed and the distance-field skip are static-world accelerators:
+        // the prepass marched only the static tree and the field was built only
+        // from it, so neither carries any information about bodies. Starting a
+        // body march from them would skip every body standing in the empty
+        // static space they jumped over. The world hit's absolute `t` still
+        // bounds the search, because nothing behind it can be seen.
+        hit = compose_bodies(view.camera_position.xyz, dir, hit, max_ray_distance());
+    }
     return hit;
+}
+
+/// The shading normal for a hit.
+///
+/// `implicit_normal` probes neighbours in the static tree. A body hit's voxel
+/// is a coordinate in the body's own volume, so probing the static tree there
+/// reads an unrelated place; a body shades flat from its face normal, which
+/// `compose_bodies` has already rotated into world space.
+fn shading_normal(hit: Hit) -> vec3<f32> {
+    if hit.from_body {
+        return hit.face_normal;
+    }
+    return implicit_normal(hit.voxel, hit.face_normal);
+}
+
+/// Where the shadow ray toward the sun starts for this hit.
+fn shadow_origin(hit: Hit, id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
+    if hit.from_body {
+        // A body voxel is not on the world grid, so the start is the world-space
+        // hit point, lifted off the surface by the same 0.25 the static path
+        // ends up at (voxel centre + 0.75 along the face = entered face + 0.25).
+        return view.camera_position.xyz + primary_ray(id, size) * hit.t + hit.face_normal * 0.25;
+    }
+    // Offset along the FACE normal, not the smoothed one. The implicit
+    // normal is a blend of neighbouring empty faces, so at a three-way
+    // corner it is normalize(1,1,1) and 0.75 along it clears only 0.433
+    // per axis -- less than the voxel's 0.5 half-extent, leaving the ray
+    // inside its own voxel to immediately self-shadow. The face normal is
+    // axis-aligned, so 0.75 always clears.
+    return vec3<f32>(hit.voxel) + vec3<f32>(0.5) + hit.face_normal * 0.75;
 }
 
 /// Shadow flag in red: 255 shadowed, 0 lit. Parity test only.
@@ -763,14 +806,7 @@ fn march_shadow(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if hit.hit {
-        let n = implicit_normal(hit.voxel, hit.face_normal);
-        // Offset along the FACE normal, not the smoothed one. The implicit
-        // normal is a blend of neighbouring empty faces, so at a three-way
-        // corner it is normalize(1,1,1) and 0.75 along it clears only 0.433
-        // per axis -- less than the voxel's 0.5 half-extent, leaving the ray
-        // inside its own voxel to immediately self-shadow. The face normal is
-        // axis-aligned, so 0.75 always clears.
-        let origin = vec3<f32>(hit.voxel) + vec3<f32>(0.5) + hit.face_normal * 0.75;
+        let origin = shadow_origin(hit, id, size);
         var shadowed = 0.0;
         if traverse_any(origin, view.sun_direction.xyz, max_ray_distance()) {
             shadowed = 1.0;
@@ -790,13 +826,14 @@ fn march_normal(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if hit.hit {
-        let n = implicit_normal(hit.voxel, hit.face_normal);
+        let n = shading_normal(hit);
         colour = vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);
     }
     textureStore(output, vec2<i32>(id.xy), colour);
 }
 
 /// Hit voxel coordinate in RGB, hit flag in alpha. Read by the parity test only.
+/// For a body hit this is the body-local voxel: an identity, not a position.
 @compute @workgroup_size(8, 8, 1)
 fn march_voxel_id(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
@@ -843,12 +880,11 @@ fn march(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var colour = vec3<f32>(0.35, 0.47, 0.70);  // sky
     if hit.hit {
-        let n = implicit_normal(hit.voxel, hit.face_normal);
+        let n = shading_normal(hit);
         let sun = view.sun_direction.xyz;
 
-        // Face normal, not the smoothed one: see march_shadow. A blended
-        // corner normal does not clear the voxel's own half-extent.
-        let origin = vec3<f32>(hit.voxel) + vec3<f32>(0.5) + hit.face_normal * 0.75;
+        // Bodies cast no shadows yet: traverse_any marches the static world only.
+        let origin = shadow_origin(hit, id, size);
         var diffuse = max(dot(n, sun), 0.0) * 0.75;
         if traverse_any(origin, sun, max_ray_distance()) {
             diffuse = 0.0;

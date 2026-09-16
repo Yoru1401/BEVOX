@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use bevox_core::contree::Contree;
-use bevox_core::gpu::{GpuNode, GpuVolume};
+use bevox_core::gpu::GpuNode;
 use bevox_core::material::{Material, MaterialTable};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
@@ -202,7 +202,6 @@ impl Prepared {
         source: &str,
         entry_point: &str,
         tree: &Contree,
-        _volume: &GpuVolume,
         world_from_clip: Mat4,
         eye: Vec3,
         width: u32,
