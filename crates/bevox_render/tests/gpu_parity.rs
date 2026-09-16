@@ -1318,21 +1318,17 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
     let shadows = render("march_shadow");
     let sun = bevox_render::upload::SUN_DIRECTION.normalize();
 
+    // Every pixel, both ways: a pixel the CPU says hits nothing must miss on the
+    // GPU too, and one where the static world is nearer must carry its normal,
+    // not a body's. Checking only body pixels would let extra GPU hits through.
     let mut stats = MarchStats::default();
-    let mut compared = 0usize;
+    let mut body_pixels = 0usize;
     let mut mismatches = 0usize;
     let mut worst = 0.0f32;
     let mut first = String::new();
     for y in 0..height {
         for x in 0..width {
             let dir = ray_direction(world_from_clip, eye, x, y, width, height);
-            let Some(hit) = body.march_world(eye, dir, 1000.0, &mut stats) else {
-                continue;
-            };
-            compared += 1;
-
-            // The CPU hit's face normal is in the body's frame.
-            let expected = orientation * hit.face_normal;
             let i = ((y * width + x) * 4) as usize;
             let gpu_hit = pixels[i + 3] > 0;
             let got = Vec3::new(
@@ -1340,19 +1336,42 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
                 pixels[i + 1] as f32 / 255.0 * 2.0 - 1.0,
                 pixels[i + 2] as f32 / 255.0 * 2.0 - 1.0,
             );
-            let delta = (got - expected).abs().max_element();
-            worst = worst.max(delta);
 
-            // Bodies cast no shadows, so the reference marches the static world
-            // only, from the world-space hit point lifted 0.25 off the surface.
-            let origin = eye + dir * hit.t + expected * 0.25;
-            let cpu_shadowed =
-                march(&world, Affine3A::IDENTITY, origin, sun, 500.0, true, &mut stats).is_some();
-            let gpu_shadowed = shadows[i] > 127;
+            let (expected, cpu_shadowed, gpu_shadowed) =
+                match cpu_composed(&world, &body, eye, dir, &mut stats) {
+                    None => (None, false, false),
+                    Some((hit, false)) => {
+                        let n =
+                            bevox_core::normal::implicit_normal(&world, hit.voxel, hit.face_normal);
+                        (Some(n), false, false)
+                    }
+                    Some((hit, true)) => {
+                        body_pixels += 1;
+                        // The CPU hit's face normal is in the body's frame.
+                        let n = orientation * hit.face_normal;
+                        // Bodies cast no shadows, so the reference marches the
+                        // static world only, from the world-space hit point
+                        // lifted 0.25 off the surface.
+                        let origin = eye + dir * hit.t + n * 0.25;
+                        let cpu_shadowed = march(
+                            &world, Affine3A::IDENTITY, origin, sun, 500.0, true, &mut stats,
+                        )
+                        .is_some();
+                        (Some(n), cpu_shadowed, shadows[i] > 127)
+                    }
+                };
 
             // One byte per channel quantises the decoded normal to steps of
             // 2/255, so a correct normal is off by at most half of that.
-            if !gpu_hit || delta > 2.0 / 255.0 + 1e-4 || cpu_shadowed != gpu_shadowed {
+            let bad = match expected {
+                None => gpu_hit,
+                Some(n) => {
+                    let delta = (got - n).abs().max_element();
+                    worst = worst.max(delta);
+                    !gpu_hit || delta > 2.0 / 255.0 + 1e-4 || cpu_shadowed != gpu_shadowed
+                }
+            };
+            if bad {
                 if mismatches == 0 {
                     first = format!(
                         "at ({x},{y}) expected={expected:?} gpu_hit={gpu_hit} gpu={got:?} \
@@ -1364,9 +1383,134 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
         }
     }
 
-    assert!(compared > 200, "only {compared} pixels hit the body; the test is vacuous");
+    assert!(body_pixels > 200, "only {body_pixels} pixels hit the body; the test is vacuous");
     assert_eq!(
         mismatches, 0,
-        "{mismatches} of {compared} body pixels disagreed (worst channel {worst}); first {first}"
+        "{mismatches} of {} pixels disagreed ({body_pixels} on the body, worst channel {worst}); \
+         first {first}",
+        width * height
     );
+}
+
+/// What one pixel should show: the nearer of the static world's hit and the
+/// body's, and whether the body won. The body must be strictly nearer, as in
+/// `compose_bodies`.
+fn cpu_composed(
+    world: &Contree,
+    body: &Body,
+    eye: Vec3,
+    dir: Vec3,
+    stats: &mut MarchStats,
+) -> Option<(bevox_core::march::Hit, bool)> {
+    let static_hit = march(world, Affine3A::IDENTITY, eye, dir, 1000.0, false, stats);
+    match body.march_world(eye, dir, 1000.0, stats) {
+        Some(b) if static_hit.is_none_or(|s| b.t < s.t) => Some((b, true)),
+        _ => static_hit.map(|s| (s, false)),
+    }
+}
+
+/// A body whose content reaches its volume's max faces, seen from past them.
+///
+/// `extent` only bounds a body's root box, which makes a wrong one look
+/// harmless. It is not. A static-world extent (256) around a 64 body puts a
+/// camera just past the body's +X face *inside* the oversized box, so the
+/// root slab enters at t = 0; with DDA the start cell is clamped from that
+/// point and the march descends into edge cells the ray never crosses, with t
+/// near 0 -- phantom hits that beat anything in front of them. Measured in
+/// review on a body filling 25..64: 1116 phantom hits and 8091 of 8100 voxels
+/// wrong from past +X, 478 phantom hits from an oblique view. A centred body
+/// with empty edge cells, or a camera on the min side, shows none of it.
+///
+/// Checked both ways, per pixel, against the CPU: every hit must match, and
+/// every miss must miss, which is what catches a phantom.
+#[test]
+fn a_body_reaching_its_volume_edge_matches_the_cpu_from_past_that_edge() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (width, height) = (96u32, 96u32);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let world = body_world(&[]);
+
+    // Off the brick grid on the min side, flush with the volume on the max side.
+    let mut dense = DenseVolume::new(64).unwrap();
+    for z in 25..64 {
+        for y in 25..64 {
+            for x in 25..64 {
+                dense.set(UVec3::new(x, y, z), MaterialId(1));
+            }
+        }
+    }
+    // Unrotated and on integer coordinates, so body-local voxels compare exactly.
+    let body = Body::new(dense.into_contree(), Vec3::new(80.0, 40.0, 80.0), Quat::IDENTITY);
+
+    // Local camera positions past the max faces: beyond 64, inside 256.
+    let mut failures = Vec::new();
+    for local_eye in [Vec3::new(110.0, 44.0, 44.0), Vec3::new(100.0, 110.0, 120.0)] {
+        let eye = body.position + local_eye;
+        let view = Mat4::look_at_rh(eye, body.position + Vec3::splat(44.0), Vec3::Y);
+        let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+        let world_from_clip = (projection * view).inverse();
+
+        let pixels = run_bodies(
+            &device, &queue, &shader, "march_voxel_id", world_from_clip, eye, &world,
+            std::slice::from_ref(&body), width, height,
+        );
+
+        let mut stats = MarchStats::default();
+        let mut body_pixels = 0usize;
+        let mut phantoms = 0usize;
+        let mut wrong = 0usize;
+        let mut first = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                let dir = ray_direction(world_from_clip, eye, x, y, width, height);
+                let i = ((y * width + x) * 4) as usize;
+                let gpu_hit = pixels[i + 3] > 0;
+                let gpu_voxel =
+                    UVec3::new(pixels[i] as u32, pixels[i + 1] as u32, pixels[i + 2] as u32);
+
+                let expected = cpu_composed(&world, &body, eye, dir, &mut stats);
+                if matches!(expected, Some((_, true))) {
+                    body_pixels += 1;
+                }
+                let bad = match expected {
+                    None if gpu_hit => {
+                        phantoms += 1;
+                        true
+                    }
+                    None => false,
+                    Some((hit, _)) if !gpu_hit || gpu_voxel != hit.voxel => {
+                        wrong += 1;
+                        true
+                    }
+                    Some(_) => false,
+                };
+                if bad && first.is_empty() {
+                    first = format!(
+                        "at ({x},{y}) cpu={:?} gpu_hit={gpu_hit} gpu_voxel={gpu_voxel:?}",
+                        expected.map(|(h, from_body)| (h.voxel, from_body))
+                    );
+                }
+            }
+        }
+
+        eprintln!(
+            "camera {local_eye}: {body_pixels} body pixels, {phantoms} phantom hits, {wrong} wrong"
+        );
+        // Collected rather than asserted here, so a failure reports every camera.
+        if body_pixels <= 200 {
+            failures.push(format!(
+                "camera {local_eye}: only {body_pixels} pixels hit the body; the test is vacuous"
+            ));
+        }
+        if phantoms + wrong > 0 {
+            failures.push(format!(
+                "camera {local_eye}: {phantoms} phantom hits and {wrong} wrong or missing hits \
+                 ({body_pixels} body pixels); first {first}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
