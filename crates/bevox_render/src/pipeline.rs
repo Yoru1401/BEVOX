@@ -220,6 +220,13 @@ pub fn prepare_march_buffers(
                 let offset = u64::from(write.start_word) * 4;
                 queue.write_buffer(&buffers.field, offset, bytemuck::cast_slice(&write.words));
             }
+            // Every frame, edit or not: a body that moved changed only this
+            // table, so it is rewritten here while its geometry above stays
+            // put. It has as many entries as the buffer was built for -- both
+            // count the bodies of the same `GpuSceneData`.
+            if !update.bodies.is_empty() {
+                queue.write_buffer(&buffers.bodies, 0, bytemuck::cast_slice(&update.bodies));
+            }
         }
         return;
     }

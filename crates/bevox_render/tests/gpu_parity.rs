@@ -1106,8 +1106,14 @@ fn an_incrementally_uploaded_edit_renders_identically() {
     // no write.
     let tree = parity_scene();
     let field = bevox_core::distance_field::DistanceField::build(&tree);
-    let mut incremental =
-        VoxelScene { tree, materials: parity_materials(), generation: 1, field, field_dirty: None };
+    let mut incremental = VoxelScene {
+        tree,
+        materials: parity_materials(),
+        generation: 1,
+        field,
+        field_dirty: None,
+        bodies: Vec::new(),
+    };
     incremental.tree.arena_mut().clear_dirty();
 
     let whole_tree = parity_scene();
@@ -1118,6 +1124,7 @@ fn an_incrementally_uploaded_edit_renders_identically() {
         generation: 1,
         field: whole_field,
         field_dirty: None,
+        bodies: Vec::new(),
     };
 
     let volume = GpuVolume::from_contree(&incremental.tree);
@@ -1174,9 +1181,11 @@ fn a_scene_with_no_bodies_is_bit_identical_with_bodies_enabled() {
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
     for entry in ["march_identity", "march_voxel_id", "march_normal", "march"] {
+        // Masked out explicitly: `DEFAULT` carries `BODIES`, so comparing it
+        // against `DEFAULT | BODIES` would compare a build with itself.
         let without = run_march_flagged(
             &device, &queue, &shader, entry, world_from_clip, eye, &tree, width,
-            height, march_flags::DEFAULT,
+            height, march_flags::DEFAULT & !march_flags::BODIES,
         );
         let with = run_march_flagged(
             &device, &queue, &shader, entry, world_from_clip, eye, &tree, width,

@@ -324,6 +324,7 @@ fn an_edit_uploads_a_fraction_of_the_scene() {
         generation: 1,
         field,
         field_dirty: None,
+        bodies: Vec::new(),
     };
     scene.tree.arena_mut().clear_dirty();
 

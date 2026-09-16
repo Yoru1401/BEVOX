@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bevox_core::body::Body;
 use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
 use bevox_core::distance_field::DistanceField;
@@ -6,7 +7,7 @@ use bevox_core::material::{Material, MaterialId, MaterialTable};
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system, start_camera};
 use bevox_render::pick::pick_voxel;
-use bevox_render::upload::{VoxelScene, apply_brush};
+use bevox_render::upload::{VoxelScene, apply_brush, stage_scene_update_system};
 
 fn main() {
     App::new()
@@ -41,6 +42,9 @@ fn main() {
         .init_resource::<BrushSettings>()
         .add_systems(Startup, setup)
         .add_systems(Update, brush_input.after(fly_camera_system))
+        // Before staging, so the table uploaded this frame carries this frame's
+        // turn rather than the last one.
+        .add_systems(Update, spin_bodies.before(stage_scene_update_system))
         .run();
 }
 
@@ -80,8 +84,63 @@ fn setup(mut commands: Commands) {
         FlyCamera::looking_at(eye, look_at),
     ));
 
+    // On the line of sight, ten voxels short of the surface the camera faces:
+    // on screen at start whatever scene was loaded, and clear of that surface
+    // at any orientation, since the cube's half-diagonal is about five.
+    let body = demo_body(eye + (look_at - eye).normalize() * 14.0);
+
     let field = DistanceField::build(&tree);
-    commands.insert_resource(VoxelScene { tree, materials, generation: 1, field, field_dirty: None });
+    commands.insert_resource(VoxelScene {
+        tree,
+        materials,
+        generation: 1,
+        field,
+        field_dirty: None,
+        bodies: vec![body],
+    });
+}
+
+/// A six-voxel cube of material 2 -- brick, in the demo palette -- centred on
+/// `centre`.
+///
+/// Off the 4-voxel brick grid (5..11 in a 16 volume) so its bricks are partial
+/// and it owns real voxel bytes, like the body the parity tests prove, rather
+/// than collapsing to uniform nodes.
+fn demo_body(centre: Vec3) -> Body {
+    let mut dense = DenseVolume::new(16).unwrap();
+    for z in 5..11 {
+        for y in 5..11 {
+            for x in 5..11 {
+                dense.set(UVec3::new(x, y, z), MaterialId(2));
+            }
+        }
+    }
+    Body::new(dense.into_contree(), centre - Vec3::splat(8.0), Quat::IDENTITY)
+}
+
+/// Turns the demo body, so the composition can be seen working before any
+/// physics exists. Milestone 2 replaces this with integration.
+///
+/// About the volume's centre, not its local origin: a body turns about its
+/// origin, which is a corner, and would otherwise swing through a sphere
+/// rather than spin in place. Recovering the centre from the position every
+/// step lets it creep by float error -- about 0.06 voxels over 100,000 frames,
+/// half an hour at 60 Hz -- which a stand-in for physics can afford.
+fn spin_bodies(time: Res<Time>, mut scene: ResMut<VoxelScene>) {
+    let turn = Quat::from_rotation_y(time.delta_secs() * 0.7)
+        * Quat::from_rotation_x(time.delta_secs() * 0.3);
+    for body in &mut scene.bodies {
+        let half = Vec3::splat(body.volume.extent() as f32 * 0.5);
+        let centre = body.world_from_local().transform_point3(half);
+        // Renormalised every step: a quaternion accumulated by repeated
+        // multiplication drifts off unit length, and the drift shows up as a
+        // body that slowly shears.
+        body.orientation = (turn * body.orientation).normalize();
+        body.position = centre - body.orientation * half;
+        // Only the transform changed, so `generation` stays put: the body
+        // table is re-uploaded every frame. Changing a body's geometry is
+        // what needs the bump.
+    }
 }
 
 /// What the brush paints and how big it is.
@@ -202,4 +261,56 @@ fn demo_scene() -> (Contree, MaterialTable) {
     materials.push(Material { color: [140, 140, 150, 255] }).unwrap(); // 1: stone
     materials.push(Material { color: [180, 90, 70, 255] }).unwrap(); // 2: brick
     (tree, materials)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Many frames of spin must leave the orientation a rotation -- unit
+    /// length -- and leave the cube where it started.
+    #[test]
+    fn a_spun_body_stays_unit_length_and_in_place() {
+        const STEPS: u32 = 100_000;
+        let mut world = World::new();
+        let mut time = Time::<()>::default();
+        time.advance_by(std::time::Duration::from_millis(16));
+        world.insert_resource(time);
+        let tree = Contree::empty(2);
+        let field = DistanceField::build(&tree);
+        let centre = Vec3::new(40.0, 21.0, 40.0);
+        world.insert_resource(VoxelScene {
+            tree,
+            materials: MaterialTable::new(),
+            generation: 1,
+            field,
+            field_dirty: None,
+            bodies: vec![demo_body(centre)],
+        });
+
+        let spin = world.register_system(spin_bodies);
+        world.run_system(spin).unwrap();
+        assert_ne!(
+            world.resource::<VoxelScene>().bodies[0].orientation,
+            Quat::IDENTITY,
+            "one step did not turn the body, so the checks below prove nothing"
+        );
+        for _ in 0..STEPS {
+            world.run_system(spin).unwrap();
+        }
+
+        let body = &world.resource::<VoxelScene>().bodies[0];
+        let length = body.orientation.length();
+        assert!(
+            (length - 1.0).abs() < 1e-5,
+            "after {STEPS} steps the orientation has length {length}; the body would shear"
+        );
+        let now = body.world_from_local().transform_point3(Vec3::splat(8.0));
+        // Float creep is ~0.06 voxels at this step count. Swinging about the
+        // corner instead would carry the centre round a 14-voxel radius.
+        assert!(
+            (now - centre).length() < 0.1,
+            "the cube's centre wandered from {centre:?} to {now:?}"
+        );
+    }
 }

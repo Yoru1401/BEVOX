@@ -6,6 +6,7 @@ use bevy::prelude::*;
 use bevy::render::Extract;
 use bevy::render::extract_resource::ExtractResource;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
+use bevox_core::body::Body;
 use bevox_core::contree::Contree;
 use bevox_core::distance_field::DistanceField;
 use bevox_core::gpu::{GpuNode, GpuVolume};
@@ -30,6 +31,15 @@ pub struct VoxelScene {
     /// a stale field merely under-estimates -- costing speed, never
     /// correctness -- and needs no upload at all.
     pub field_dirty: Option<Range<u32>>,
+    /// Rigid bodies, packed after `tree` in the shared node and voxel buffers.
+    ///
+    /// A body that only moves -- a new `position` or `orientation` -- needs
+    /// nothing: its table entry is rebuilt and re-uploaded every frame, and
+    /// that table is a few 144-byte entries. A body whose *geometry* changes,
+    /// or a body added or removed, needs `generation` bumped, because that
+    /// moves bytes in the large node and voxel buffers. Do not bump the
+    /// generation to move a body: that rebuilds the whole scene every frame.
+    pub bodies: Vec<Body>,
 }
 
 /// Camera and volume parameters, as the shader sees them.
@@ -58,9 +68,6 @@ pub mod march_flags {
     /// Advance the ray through empty space the distance field can prove clear.
     pub const DISTANCE_FIELD: u32 = 8;
     /// Compose every rigid body into the march alongside the static world.
-    ///
-    /// Not in `DEFAULT` yet: Task 5 decides that once it has measured the cost
-    /// of the composition loop on a body-free scene.
     pub const BODIES: u32 = 16;
     /// What the app runs. Each optimisation joins this only once it has measured
     /// faster while staying bit-identical.
@@ -70,7 +77,13 @@ pub mod march_flags {
     /// three 14.0, all four 12.25 -- a 64.6% gain against 0.01 ms of drift.
     /// The field is worth 12.8% on top of the other three, which is why it is
     /// here rather than reverted.
-    pub const DEFAULT: u32 = DDA | MASK_FILTER | BEAM | DISTANCE_FIELD;
+    ///
+    /// `BODIES` is here on different grounds: it is a feature, not an
+    /// optimisation, and without it no body renders at all. It costs a
+    /// body-free scene nothing -- the composition loop runs zero times, and
+    /// the zero-body parity gate proves such a scene bit-identical with it on.
+    /// What each body costs is measured separately.
+    pub const DEFAULT: u32 = DDA | MASK_FILTER | BEAM | DISTANCE_FIELD | BODIES;
 }
 
 /// The sun direction the renderer and the parity tests share.
@@ -105,6 +118,20 @@ pub struct GpuBody {
     pub extent: u32,
 }
 
+impl GpuBody {
+    /// This entry's geometry, placed where `body` is now.
+    ///
+    /// The one spelling of a body's transform, shared by the full pack and the
+    /// per-frame table refresh so the two cannot disagree.
+    pub fn placed(self, body: &Body) -> Self {
+        Self {
+            local_from_world: Mat4::from(body.local_from_world()).to_cols_array_2d(),
+            rotation: Mat4::from_quat(body.orientation).to_cols_array_2d(),
+            ..self
+        }
+    }
+}
+
 /// The static world and every body, packed end to end into shared buffers.
 pub struct PackedScene {
     pub nodes: Vec<GpuNode>,
@@ -117,7 +144,7 @@ pub struct PackedScene {
 /// One set of buffers rather than one per body: a body is small, and a second
 /// pair of bindings per body would cap the count at whatever the device allows
 /// rather than at what the frame budget allows.
-pub fn pack_bodies(world: &Contree, bodies: &[bevox_core::body::Body]) -> PackedScene {
+pub fn pack_bodies(world: &Contree, bodies: &[Body]) -> PackedScene {
     let world_volume = GpuVolume::from_contree(world);
     let mut nodes = world_volume.buffer_nodes();
     let mut voxels = world_volume.voxels;
@@ -130,14 +157,16 @@ pub fn pack_bodies(world: &Contree, bodies: &[bevox_core::body::Body]) -> Packed
         nodes.extend_from_slice(&volume.buffer_nodes());
         voxels.extend_from_slice(&volume.voxels);
 
-        out.push(GpuBody {
-            local_from_world: Mat4::from(body.local_from_world()).to_cols_array_2d(),
-            rotation: Mat4::from_quat(body.orientation).to_cols_array_2d(),
-            node_base,
-            voxel_base,
-            depth: body.volume.depth(),
-            extent: body.volume.extent(),
-        });
+        out.push(
+            GpuBody {
+                node_base,
+                voxel_base,
+                depth: body.volume.depth(),
+                extent: body.volume.extent(),
+                ..default()
+            }
+            .placed(body),
+        );
     }
 
     PackedScene { nodes, voxels, bodies: out }
@@ -153,7 +182,9 @@ pub struct GpuSceneData {
     pub nodes: Vec<GpuNode>,
     pub voxels: Vec<u32>,
     /// Every rigid body in the scene, packed after the static world in `nodes`
-    /// and `voxels`. Empty until something populates `VoxelScene` with bodies.
+    /// and `voxels`. The transforms are as of the last rebuild; the layout --
+    /// bases, depth, extent -- is what `SceneUpdate::bodies` re-places each
+    /// frame.
     pub bodies: Vec<GpuBody>,
     pub palette: Vec<[f32; 4]>,
     /// Reachability masks as low/high halves: WGSL has no 64-bit integer.
@@ -292,10 +323,10 @@ pub fn build_gpu_scene(
             return;
         }
     }
-    // No bodies yet: nothing in `VoxelScene` carries a body list. `pack_bodies`
-    // still runs so this path matches what a scene with bodies will produce,
-    // and an empty slice packs out to exactly the static world.
-    let packed = pack_bodies(&scene.tree, &[]);
+    // Bodies are geometry here. A body that only moved does not reach this
+    // line -- the generation gate above lets it through untouched -- and its
+    // new transform goes out in `SceneUpdate::bodies` instead.
+    let packed = pack_bodies(&scene.tree, &scene.bodies);
     // The scene's own field, not a fresh build. `VoxelScene` builds it once at
     // load and `apply_brush` keeps it current, so rebuilding here would both
     // discard that work and stall: 930 ms at extent 4096, on a path that also
@@ -440,6 +471,11 @@ pub struct SceneUpdate {
     pub node_high_water: u32,
     /// Packed voxel words in use.
     pub voxel_word_high_water: u32,
+    /// The whole body table, every frame, placed where each body is now.
+    ///
+    /// This is how a body moves without a rebuild: its geometry stays where the
+    /// last rebuild packed it, and only this table is rewritten.
+    pub bodies: Vec<GpuBody>,
 }
 
 impl Default for SceneUpdate {
@@ -451,6 +487,7 @@ impl Default for SceneUpdate {
             field: Vec::new(),
             node_high_water: 0,
             voxel_word_high_water: 0,
+            bodies: Vec::new(),
         }
     }
 }
@@ -532,24 +569,34 @@ pub fn stage_scene_update(scene: &mut VoxelScene) -> SceneUpdate {
         field,
         node_high_water: arena.nodes().len() as u32,
         voxel_word_high_water: arena.voxels().len().div_ceil(4) as u32,
+        bodies: Vec::new(),
     };
 
     scene.tree.arena_mut().clear_dirty();
     update
 }
 
-/// Drains the scene's dirty ranges once per frame.
+/// Drains the scene's dirty ranges once per frame, and re-places every body.
 ///
 /// Runs every frame, not only on edits: the resource it writes must be empty on
 /// a quiet frame, or the render world would rewrite the last edit forever.
+///
+/// The body table takes its layout from `gpu` -- where the last rebuild put
+/// each body's geometry -- and its transforms from the live scene. That is why
+/// a body that only moves needs no generation bump. Bodies are matched by
+/// index, so one added or removed without a bump is not in the table until the
+/// rebuild that bump asks for.
 pub fn stage_scene_update_system(
     mut commands: Commands,
     scene: Option<ResMut<VoxelScene>>,
+    gpu: Res<GpuSceneData>,
 ) {
     let Some(mut scene) = scene else {
         return;
     };
-    commands.insert_resource(stage_scene_update(&mut scene));
+    let mut update = stage_scene_update(&mut scene);
+    update.bodies = gpu.bodies.iter().zip(&scene.bodies).map(|(g, b)| g.placed(b)).collect();
+    commands.insert_resource(update);
 }
 
 #[cfg(test)]
@@ -675,7 +722,14 @@ mod tests {
         // the edit under test touched.
         tree.arena_mut().clear_dirty();
         let field = DistanceField::build(&tree);
-        VoxelScene { tree, materials: MaterialTable::new(), generation: 1, field, field_dirty: None }
+        VoxelScene {
+            tree,
+            materials: MaterialTable::new(),
+            generation: 1,
+            field,
+            field_dirty: None,
+            bodies: Vec::new(),
+        }
     }
 
     /// Painting must update the field in the same frame as the voxels, or the
@@ -810,6 +864,7 @@ mod tests {
             generation: 1,
             field,
             field_dirty: None,
+            bodies: Vec::new(),
         });
         app.update();
 
@@ -862,6 +917,7 @@ mod tests {
             generation: 1,
             field,
             field_dirty: None,
+            bodies: Vec::new(),
         });
         app.update();
 
@@ -965,5 +1021,63 @@ mod tests {
         assert_eq!(packed.nodes, plain.buffer_nodes());
         assert_eq!(packed.voxels, plain.voxels);
         assert!(packed.bodies.is_empty());
+    }
+
+    /// A body that moves must reach the table without the geometry being
+    /// rebuilt. Rebuilding would also put the new transform in the table, so
+    /// the table alone cannot tell the right path from the expensive one: the
+    /// change tick on `GpuSceneData` is what says no rebuild happened.
+    #[test]
+    fn a_moved_body_refreshes_the_table_without_a_geometry_rebuild() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<GpuSceneData>()
+            .add_systems(
+                Update,
+                (build_gpu_scene, stage_scene_update_system.after(build_gpu_scene)),
+            );
+
+        let tree = Contree::empty(3);
+        let field = DistanceField::build(&tree);
+        let body = bevox_core::body::Body::new(
+            Contree::empty(2),
+            Vec3::new(4.0, 5.0, 6.0),
+            Quat::IDENTITY,
+        );
+        app.insert_resource(VoxelScene {
+            tree,
+            materials: MaterialTable::new(),
+            generation: 1,
+            field,
+            field_dirty: None,
+            bodies: vec![body],
+        });
+        app.update();
+        let built = app.world().get_resource_change_ticks::<GpuSceneData>().unwrap().changed;
+
+        // Move it and turn it, and leave the generation alone.
+        {
+            let mut scene = app.world_mut().resource_mut::<VoxelScene>();
+            scene.bodies[0].position = Vec3::new(9.0, 1.0, 2.0);
+            scene.bodies[0].orientation = Quat::from_euler(glam::EulerRot::XYZ, 0.4, 0.9, -0.2);
+        }
+        app.update();
+
+        let gpu = app.world().resource::<GpuSceneData>();
+        assert_eq!(gpu.generation, 1);
+        assert_eq!(
+            app.world().get_resource_change_ticks::<GpuSceneData>().unwrap().changed,
+            built,
+            "moving a body rebuilt GpuSceneData; only the body table should have changed"
+        );
+
+        let scene = app.world().resource::<VoxelScene>();
+        let expected = pack_bodies(&scene.tree, &scene.bodies).bodies;
+        let table = &app.world().resource::<SceneUpdate>().bodies;
+        assert_eq!(
+            bytemuck::cast_slice::<GpuBody, u8>(table),
+            bytemuck::cast_slice::<GpuBody, u8>(&expected),
+            "the body table does not place the body where it is now"
+        );
     }
 }
