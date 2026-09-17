@@ -83,6 +83,10 @@ pub mod march_flags {
     /// CPU-only: the shader never reads this bit. It changes which bodies are
     /// uploaded and the count beside them, not how any of them is marched.
     pub const CULL_BODIES: u32 = 32;
+    /// Skip a body for pixels outside its screen rectangle, before its table
+    /// entry is read or the ray transformed. Read by the shader, unlike
+    /// `CULL_BODIES`.
+    pub const BODY_RECT: u32 = 64;
     /// What the app runs. Each optimisation joins this only once it has measured
     /// faster while staying bit-identical.
     ///

@@ -1,5 +1,6 @@
 //! Bind group layout, compute pipeline and the dispatch that runs it.
 
+use crate::cull::GpuBodyRect;
 use crate::upload::{
     ExtractedMarchCamera, GpuBody, GpuSceneData, MarchTarget, MarchUniform, SceneUpdate,
     WorldRegion, march_flags,
@@ -35,7 +36,7 @@ pub const BEAM_CAPACITY: u32 = (7680 / BEAM_SCALE) * (4320 / BEAM_SCALE);
 /// compile error and no parity test catches it -- the test harness builds its
 /// own layout, so it kept passing while the app could not create its pipeline
 /// at all. `the_layout_declares_every_binding_the_shader_uses` is the gate.
-pub const MARCH_BINDING_COUNT: usize = 9;
+pub const MARCH_BINDING_COUNT: usize = 10;
 
 /// Voxel data budget on the GPU. Checked at upload; exceeding it is an error,
 /// never an allocation attempt.
@@ -135,6 +136,8 @@ pub struct MarchBuffers {
     pub beam: Buffer,
     pub field: Buffer,
     pub bodies: Buffer,
+    /// One `GpuBodyRect` per entry of `bodies`, in the same order.
+    pub body_rects: Buffer,
     pub built_from: BuiltFrom,
 }
 
@@ -172,21 +175,26 @@ pub fn can_reuse_buffers(
         })
 }
 
-/// This frame's uniform and the body table it marches: `camera` looking at
-/// `scene`, with `placed` culled under `flags` and at most `MAX_BODIES` of what
-/// is left marched.
+/// This frame's uniform, the body table it marches and each body's screen
+/// rectangle: `camera` looking at `scene` through a target of `size`, with
+/// `placed` culled under `flags` and at most `MAX_BODIES` of what is left
+/// marched.
 ///
-/// Returned together so the count and the table cannot come from different
-/// lists. The cull compacts the table; a count taken from `placed` would march
-/// past the entries written, into stale ones. Write the table this returns and
-/// nothing else. The cap applies after the cull, to visible bodies.
+/// Returned together so the count, the table and the rectangles cannot come
+/// from different lists. The cull compacts the table; a count taken from
+/// `placed` would march past the entries written, into stale ones, and a
+/// rectangle list built apart from it would pair a body with another's. Write
+/// what this returns and nothing else. The cap applies after the cull, to
+/// visible bodies.
 pub fn frame_uniform(
     scene: &GpuSceneData,
     camera: &ExtractedMarchCamera,
     placed: &[GpuBody],
     flags: u32,
-) -> (MarchUniform, Vec<GpuBody>) {
-    let table = crate::cull::bodies_to_march(placed, &scene.body_local_bounds, camera, flags);
+    size: UVec2,
+) -> (MarchUniform, Vec<GpuBody>, Vec<GpuBodyRect>) {
+    let (table, rects) =
+        crate::cull::bodies_to_march(placed, &scene.body_local_bounds, camera, flags, size);
     let uniform = MarchUniform {
         world_from_clip: camera.world_from_clip.to_cols_array_2d(),
         camera_position: camera.position.extend(0.0).to_array(),
@@ -197,7 +205,7 @@ pub fn frame_uniform(
         // `bevox_core::distance_field::CELL_VOXELS` about how big a cell is.
         field_params: [scene.field_edge, bevox_core::distance_field::CELL_VOXELS, 0, 0],
     };
-    (uniform, table)
+    (uniform, table, rects)
 }
 
 pub fn init_march_pipeline(
@@ -230,6 +238,11 @@ pub fn init_march_pipeline(
             storage_buffer_read_only_sized(false, NonZero::new(4)),
             // Rigid bodies: array<GpuBody>, one element minimum.
             storage_buffer_read_only_sized(false, NonZero::new(size_of::<GpuBody>() as u64)),
+            // Body screen rectangles: array<GpuBodyRect>, one element minimum.
+            // The compute stage's eighth storage buffer, and wgpu's default
+            // max_storage_buffers_per_shader_stage is 8: no room for another
+            // storage binding without raising the device limits.
+            storage_buffer_read_only_sized(false, NonZero::new(size_of::<GpuBodyRect>() as u64)),
         ),
     );
 
@@ -269,10 +282,23 @@ pub fn prepare_march_buffers(
     update: Option<Res<SceneUpdate>>,
     camera: Option<Res<ExtractedMarchCamera>>,
     existing: Option<Res<MarchBuffers>>,
+    target: Option<Res<MarchTarget>>,
+    images: Res<RenderAssets<GpuImage>>,
 ) {
     let (Some(scene), Some(camera)) = (scene, camera) else {
         return;
     };
+    // The rectangles are in the pixels of the texture `dispatch_march` binds,
+    // which the shader measures with `textureDimensions`: read from that same
+    // `GpuImage`, not from `MarchTarget`'s recorded size, which could lag it.
+    // Image assets are prepared before this set runs and not again before the
+    // dispatch, so both see the same texture this frame. With no image yet,
+    // nothing is dispatched this frame, so the rectangles written are never
+    // read; they are rewritten every frame. Not a return: that would drop this
+    // frame's edits.
+    let size = target
+        .and_then(|t| images.get(&t.image))
+        .map_or(UVec2::ONE, |i| UVec2::new(i.texture.width(), i.texture.height()));
 
     // Anything `can_reuse_buffers` refuses falls through to the rebuild below,
     // which re-packs the bodies past a larger region.
@@ -282,12 +308,16 @@ pub fn prepare_march_buffers(
         // Every frame, edit or not: a body that moved changed only this table,
         // so it is rewritten here while its geometry stays put. Culled, it may
         // be shorter than the buffer, which was built for every body; entries
-        // past it are stale, and the uniform's count stops before them.
+        // past it are stale, and the uniform's count stops before them. The
+        // rectangles too, and even for a body that did not move: they follow
+        // the camera.
         let placed = update.as_deref().map_or(&scene.bodies, |u| &u.bodies);
-        let (uniform_value, table) = frame_uniform(&scene, &camera, placed, march_flags::DEFAULT);
+        let (uniform_value, table, rects) =
+            frame_uniform(&scene, &camera, placed, march_flags::DEFAULT, size);
         queue.write_buffer(&buffers.uniform, 0, bytemuck::bytes_of(&uniform_value));
         if !table.is_empty() {
             queue.write_buffer(&buffers.bodies, 0, bytemuck::cast_slice(&table));
+            queue.write_buffer(&buffers.body_rects, 0, bytemuck::cast_slice(&rects));
         }
 
         if let Some(update) = update {
@@ -342,10 +372,12 @@ pub fn prepare_march_buffers(
     node_bytes.resize(node_capacity as usize * size_of::<GpuNode>(), 0);
     let mut voxel_bytes = bytemuck::cast_slice(&scene.voxels).to_vec();
     voxel_bytes.resize(voxel_word_capacity as usize * 4, 0);
-    let (uniform_value, table) =
-        frame_uniform(&scene, &camera, &scene.bodies, march_flags::DEFAULT);
+    let (uniform_value, table, rects) =
+        frame_uniform(&scene, &camera, &scene.bodies, march_flags::DEFAULT, size);
     let mut body_bytes = bytemuck::cast_slice(&table).to_vec();
     body_bytes.resize(body_capacity as usize * size_of::<GpuBody>(), 0);
+    let mut rect_bytes = bytemuck::cast_slice(&rects).to_vec();
+    rect_bytes.resize(body_capacity as usize * size_of::<GpuBodyRect>(), 0);
 
     commands.insert_resource(MarchBuffers {
         uniform: device.create_buffer_with_data(&BufferInitDescriptor {
@@ -397,6 +429,11 @@ pub fn prepare_march_buffers(
             contents: &body_bytes,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         }),
+        body_rects: device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("bevox_body_rects"),
+            contents: &rect_bytes,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        }),
         built_from: BuiltFrom { generation: scene.generation, world_region: scene.world_region },
     });
 }
@@ -435,6 +472,7 @@ pub fn dispatch_march(
             buffers.beam.as_entire_binding(),
             buffers.field.as_entire_binding(),
             buffers.bodies.as_entire_binding(),
+            buffers.body_rects.as_entire_binding(),
         )),
     );
 
@@ -634,8 +672,9 @@ mod tests {
     fn the_uploaded_uniform_marches_no_more_than_the_cap() {
         let camera = ExtractedMarchCamera { world_from_clip: Mat4::IDENTITY, position: Vec3::ZERO };
         let bodies = vec![GpuBody::default(); MAX_BODIES + 1];
-        let (uniform, _) =
-            frame_uniform(&GpuSceneData::default(), &camera, &bodies, march_flags::DEFAULT);
+        let scene = GpuSceneData { body_local_bounds: vec![None; bodies.len()], ..default() };
+        let (uniform, ..) =
+            frame_uniform(&scene, &camera, &bodies, march_flags::DEFAULT, UVec2::ONE);
         assert_eq!(uniform.volume_params[3], MAX_BODIES as u32);
     }
 
@@ -662,15 +701,18 @@ mod tests {
         let scene = GpuSceneData { body_local_bounds: vec![cube; 2], ..default() };
         let cull = march_flags::DEFAULT | march_flags::CULL_BODIES;
 
-        let (uniform, table) = frame_uniform(&scene, &camera, &[behind], cull);
+        let size = UVec2::new(160, 90);
+        let (uniform, table, rects) = frame_uniform(&scene, &camera, &[behind], cull, size);
         assert!(table.is_empty(), "a body behind the camera was kept");
         assert_eq!(uniform.volume_params[3], 0, "the count includes a body the cull removed");
+        assert!(rects.is_empty(), "a rectangle was kept for a body the cull removed");
 
         // Behind first: capped before the cull, the one marched slot would go
         // to the body the cull then drops, and nothing would be drawn.
         assert!(MAX_BODIES < 2, "this case no longer reaches past the cap");
-        let (uniform, table) = frame_uniform(&scene, &camera, &[behind, ahead], cull);
+        let (uniform, table, rects) = frame_uniform(&scene, &camera, &[behind, ahead], cull, size);
         assert_eq!(bytemuck::cast_slice::<GpuBody, u8>(&table), bytemuck::bytes_of(&ahead));
+        assert_eq!(rects, [crate::cull::screen_rect(cube.unwrap(), &ahead, camera.world_from_clip, size)]);
         assert_eq!(uniform.volume_params[3], 1);
     }
 

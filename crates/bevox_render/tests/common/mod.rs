@@ -13,6 +13,7 @@ use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
 use bevox_core::gpu::GpuNode;
 use bevox_core::material::{Material, MaterialId, MaterialTable};
+use bevox_render::cull::GpuBodyRect;
 use glam::{Mat4, UVec3, Vec3};
 use wgpu::util::DeviceExt;
 
@@ -210,6 +211,9 @@ pub struct Prepared {
     /// the same image while marching bodies the cull removed -- and a
     /// benchmark would still pay for them. A gate compares this with the cull.
     pub body_count: u32,
+    /// The rectangles uploaded, one per marched body, in table order.
+    pub body_rects: Vec<GpuBodyRect>,
+    body_rect_buffer: wgpu::Buffer,
     width: u32,
     height: u32,
 }
@@ -262,14 +266,18 @@ impl Prepared {
         // body list packs out to exactly the static world, so this is also the
         // path every pre-bodies test still runs.
         let packed = bevox_render::upload::pack_bodies(tree, bodies);
+        let texture = storage_target(device, width, height);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         // Through the app's own cull, so the gates test what the app runs. The
         // count below is this table's length, never the packed one's: culled,
-        // the table is compacted and shorter.
-        let table = bevox_render::cull::bodies_to_march(
+        // the table is compacted and shorter. The rectangles are sized from the
+        // texture the shader writes, as the app sizes them.
+        let (table, body_rects) = bevox_render::cull::bodies_to_march(
             &packed.bodies,
             &packed.body_local_bounds,
             &bevox_render::upload::ExtractedMarchCamera { world_from_clip, position: eye },
             flags,
+            glam::UVec2::new(texture.width(), texture.height()),
         );
         let uniform = TestUniform {
             world_from_clip: world_from_clip.to_cols_array_2d(),
@@ -362,13 +370,19 @@ impl Prepared {
             contents: &body_bytes,
             usage: wgpu::BufferUsages::STORAGE,
         });
+        // Sized and zero-filled like the body table.
+        let mut rect_bytes: Vec<u8> = bytemuck::cast_slice(&body_rects).to_vec();
+        rect_bytes.resize(packed.bodies.len().max(1) * size_of::<GpuBodyRect>(), 0);
+        let body_rect_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("body_rects"),
+            contents: &rect_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("march"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
-        let texture = storage_target(device, width, height);
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // An explicit layout, not an auto-derived one. With `layout: None` naga
         // derives the layout from the bindings an entry point actually uses, so
@@ -383,6 +397,7 @@ impl Prepared {
                 storage_entry(3, 16),
                 storage_entry(7, 4),
                 storage_entry(8, size_of::<bevox_render::upload::GpuBody>() as u64),
+                storage_entry(9, size_of::<GpuBodyRect>() as u64),
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -452,6 +467,7 @@ impl Prepared {
                 wgpu::BindGroupEntry { binding: 6, resource: beam_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: field_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: body_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: body_rect_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&view),
@@ -492,6 +508,8 @@ impl Prepared {
             field_buffer,
             timestamps,
             body_count: uniform.volume_params[3],
+            body_rects,
+            body_rect_buffer,
             width,
             height,
         }
@@ -595,6 +613,12 @@ impl Prepared {
         let mut encoder = device.create_command_encoder(&Default::default());
         self.encode(&mut encoder, false);
         read_texture(device, queue, encoder, &self.texture, self.width, self.height)
+    }
+
+    /// Replaces the uploaded rectangles, so a gate can show the shader reads
+    /// them. `body_rects` is left as built.
+    pub fn overwrite_body_rects(&self, queue: &wgpu::Queue, rects: &[GpuBodyRect]) {
+        queue.write_buffer(&self.body_rect_buffer, 0, bytemuck::cast_slice(rects));
     }
 
     /// Writes a staged update exactly the way `prepare_march_buffers` does.

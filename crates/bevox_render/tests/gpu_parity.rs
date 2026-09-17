@@ -1173,9 +1173,11 @@ fn a_scene_with_no_bodies_is_bit_identical_with_bodies_enabled() {
             &device, &queue, &shader, entry, world_from_clip, eye, &tree, width,
             height, march_flags::DEFAULT & !march_flags::BODIES,
         );
+        // With the rectangles on too: the loop runs zero times, and the
+        // rectangle buffer is one zeroed entry nothing reads.
         let with = run_march_flagged(
             &device, &queue, &shader, entry, world_from_clip, eye, &tree, width,
-            height, march_flags::DEFAULT | march_flags::BODIES,
+            height, march_flags::DEFAULT | march_flags::BODIES | march_flags::BODY_RECT,
         );
         let differing = without.chunks(4).zip(with.chunks(4)).filter(|(a, b)| a != b).count();
         assert_eq!(
@@ -1595,8 +1597,9 @@ fn culling_bodies_outside_the_view_leaves_output_bit_identical() {
     let packed = bevox_render::upload::pack_bodies(&world, &bodies);
     let camera = bevox_render::upload::ExtractedMarchCamera { world_from_clip, position: eye };
     let kept: Vec<u32> = bevox_render::cull::bodies_to_march(
-        &packed.bodies, &packed.body_local_bounds, &camera, cull,
+        &packed.bodies, &packed.body_local_bounds, &camera, cull, glam::UVec2::new(width, height),
     )
+    .0
     .iter()
     .map(|g| g.node_base)
     .collect();
@@ -1642,5 +1645,143 @@ fn culling_bodies_outside_the_view_leaves_output_bit_identical() {
         }
         let differing = without.chunks(4).zip(with.chunks(4)).filter(|(a, b)| a != b).count();
         assert_eq!(differing, 0, "{entry}: culling bodies changed {differing} pixels");
+    }
+}
+
+/// Skipping a body for pixels outside its screen rectangle must change no pixel.
+///
+/// Turned cubes near, far, and straddling each of the four screen edges, plus
+/// one behind the camera first in the list: with culling on as well, the table
+/// is compacted, and rectangles built apart from it would pair each body with
+/// its neighbour's. The rectangles are mostly disjoint, so a body tested against
+/// another's loses pixels.
+///
+/// Identical images alone would also pass an early-out that never fires. So
+/// each visible body's rectangle must exclude pixels the loop would otherwise
+/// have marched it for, and shrinking every uploaded rectangle to one pixel
+/// must change the image: the shader really reads them and skips.
+#[test]
+fn skipping_bodies_outside_their_screen_rectangles_leaves_output_bit_identical() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    // Not square, so a transposed axis in the rectangle cannot hide.
+    let (width, height) = (128u32, 80u32);
+    let eye = Vec3::new(128.0, 60.0, 40.0);
+    let view = Mat4::look_at_rh(eye, eye + Vec3::Z, Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.6, 0.1, 500.0);
+    let world_from_clip = (projection * view).inverse();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let world = body_world(&[]);
+
+    // Looking down +Z with Y up, world +X is screen left and +Y is up. At depth
+    // d the half-height is d * tan(0.45) and the half-width 1.6 times that, so
+    // each straddler's centre sits on its edge.
+    let d = 60.0;
+    let half_h = d * 0.45f32.tan();
+    let half_w = half_h * 1.6;
+    // On the brick grid, so its occupied bounds are its voxels exactly and a
+    // rectangle a pixel short of them drops body pixels. `body_cube` is off the
+    // grid and bounded up to three voxels loose, which hides a short rectangle.
+    let mut dense = DenseVolume::new(64).unwrap();
+    for z in 24..40 {
+        for y in 24..40 {
+            for x in 24..40 {
+                dense.set(UVec3::new(x, y, z), MaterialId(1));
+            }
+        }
+    }
+    let cube = dense.into_contree();
+    assert_eq!(
+        bevox_core::body::occupied_bounds(&cube),
+        Some((UVec3::splat(24), UVec3::splat(40))),
+        "the cube's bounds are loose, so a rectangle short of the body could pass"
+    );
+    let turned = Quat::from_euler(glam::EulerRot::XYZ, 0.4, 0.8, -0.3);
+    let place =
+        |offset: Vec3| Body::new(cube.clone(), eye + offset - turned * Vec3::splat(32.0), turned);
+    let bodies = [
+        place(Vec3::new(0.0, 0.0, -40.0)),
+        place(Vec3::new(-10.0, 0.0, 50.0)),
+        place(Vec3::new(half_w, 0.0, d)),
+        place(Vec3::new(0.0, half_h, d)),
+        place(Vec3::new(0.0, -half_h, d)),
+        place(Vec3::new(-half_w, 0.0, d)),
+        place(Vec3::new(15.0, -5.0, 200.0)),
+    ];
+    let mut stats = MarchStats::default();
+    for (i, body) in bodies.iter().enumerate().skip(1) {
+        let seen = (0..width * height).any(|p| {
+            let dir = ray_direction(world_from_clip, eye, p % width, p / width, width, height);
+            body.march_world(eye, dir, 1000.0, &mut stats).is_some()
+        });
+        assert!(seen, "body {i} is meant to be on screen, but no pixel sees it");
+    }
+
+    let base = march_flags::DEFAULT & !march_flags::CULL_BODIES & !march_flags::BODY_RECT;
+    let rect = base | march_flags::BODY_RECT;
+    let rect_and_cull = rect | march_flags::CULL_BODIES;
+    let prepare = |entry: &str, flags| {
+        Prepared::new(
+            &device, &shader, entry, &world, world_from_clip, eye, width, height, flags, &bodies,
+        )
+    };
+
+    // The straddlers really reach their edges. Unculled, table index i is body i.
+    let r = prepare("march_identity", rect).body_rects;
+    assert_eq!(
+        (r[2].min[0], r[3].min[1], r[4].max[1], r[5].max[0]),
+        (0, 0, height - 1, width - 1),
+        "the edge bodies do not reach the left, top, bottom and right edges: {r:?}"
+    );
+
+    for entry in ["march_identity", "march_normal", "march"] {
+        let without = prepare(entry, base).read_back(&device, &queue);
+        if entry == "march_identity" {
+            // Material 1 is the cube's; the floor is another.
+            let body_pixels = without.chunks(4).filter(|px| px[1] > 0 && px[0] == 1).count();
+            assert!(body_pixels > 100, "only {body_pixels} body pixels; the comparison is vacuous");
+        }
+        for flags in [rect, rect_and_cull] {
+            let prepared = prepare(entry, flags);
+            let rects = &prepared.body_rects;
+            assert_eq!(rects.len(), prepared.body_count as usize, "{entry}: one rectangle per body");
+            // Unculled, the body behind the camera leads the table with the
+            // whole screen, as it must.
+            let visible = if flags & march_flags::CULL_BODIES != 0 { &rects[..] } else { &rects[1..] };
+            assert_eq!(visible.len(), bodies.len() - 1);
+            let excluded: Vec<u32> = visible
+                .iter()
+                .map(|r| width * height - (r.max[0] + 1 - r.min[0]) * (r.max[1] + 1 - r.min[1]))
+                .collect();
+            eprintln!("{entry} (flags {flags}): pixels each visible body is skipped for: {excluded:?}");
+            for (i, (r, n)) in visible.iter().zip(&excluded).enumerate() {
+                assert!(
+                    *n > 0,
+                    "{entry}: visible body {i}'s rectangle {r:?} excludes no pixel, so the \
+                     early-out never fires for it"
+                );
+            }
+            let with = prepared.read_back(&device, &queue);
+            let differing = without.chunks(4).zip(with.chunks(4)).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                differing, 0,
+                "{entry} (flags {flags}): skipping bodies outside their rectangles changed \
+                 {differing} pixels"
+            );
+
+            if entry == "march_identity" {
+                let one_pixel = vec![bevox_render::cull::GpuBodyRect::default(); rects.len()];
+                prepared.overwrite_body_rects(&queue, &one_pixel);
+                let shrunk = prepared.read_back(&device, &queue);
+                let changed = without.chunks(4).zip(shrunk.chunks(4)).filter(|(a, b)| a != b).count();
+                assert!(
+                    changed > 100,
+                    "flags {flags}: one-pixel rectangles changed only {changed} pixels, so the \
+                     shader is not skipping on them"
+                );
+            }
+        }
     }
 }

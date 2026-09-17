@@ -5,7 +5,7 @@
 //! this.
 
 use crate::upload::{ExtractedMarchCamera, GpuBody, march_flags};
-use glam::{Mat4, UVec3, Vec3, Vec4, Vec4Swizzles};
+use glam::{Mat4, UVec2, UVec3, Vec2, Vec3, Vec4, Vec4Swizzles};
 
 /// A body's bounding sphere in world space.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -84,46 +84,98 @@ impl Frustum {
     }
 }
 
-/// The table entries for the bodies this frustum could see, in table order.
-///
-/// Compacted: each `GpuBody` carries its own geometry bases, so dropping entries
-/// leaves the rest valid. Any other per-body array must be built from the same
-/// kept indices, in the same order.
-pub fn visible_bodies(table: &[GpuBody], bounds: &[BodyBound], frustum: &Frustum) -> Vec<GpuBody> {
-    table
-        .iter()
-        .zip(bounds)
-        .filter(|(_, b)| frustum.sees(**b))
-        .map(|(g, _)| *g)
-        .collect()
+/// A body's footprint on screen, in pixels, inclusive at both ends.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuBodyRect {
+    pub min: [u32; 2],
+    pub max: [u32; 2],
 }
 
-/// The body table to march this frame: `placed` whole, or, when `flags` carry
-/// `CULL_BODIES`, only the bodies `camera` could see.
+/// The pixels a body can cover: its eight world-space corners projected and
+/// rounded outward, padded by one.
+///
+/// Inverts `primary_ray`'s mapping exactly. A corner at or behind the camera
+/// has no meaningful projection, so the body gets the whole screen -- only
+/// conservative answers are allowed.
+///
+/// `size` must be the dimensions of the texture the shader writes, which is
+/// what `primary_ray` maps pixels with.
+pub fn screen_rect(local: (UVec3, UVec3), body: &GpuBody, world_from_clip: Mat4, size: UVec2) -> GpuBodyRect {
+    let whole = GpuBodyRect { min: [0, 0], max: [size.x - 1, size.y - 1] };
+    let clip_from_world = world_from_clip.inverse();
+    let world_from_local = Mat4::from_cols_array_2d(&body.local_from_world).inverse();
+    let (lo, hi) = (local.0.as_vec3(), local.1.as_vec3());
+
+    let mut min = Vec2::splat(f32::INFINITY);
+    let mut max = Vec2::splat(f32::NEG_INFINITY);
+    for i in 0..8 {
+        let corner = Vec3::new(
+            if i & 1 == 0 { lo.x } else { hi.x },
+            if i & 2 == 0 { lo.y } else { hi.y },
+            if i & 4 == 0 { lo.z } else { hi.z },
+        );
+        let clip = clip_from_world * world_from_local.transform_point3(corner).extend(1.0);
+        if clip.w <= 1e-6 {
+            return whole;
+        }
+        let ndc = clip.xy() / clip.w;
+        let px = Vec2::new(
+            (ndc.x + 1.0) * 0.5 * size.x as f32 - 0.5,
+            (1.0 - ndc.y) * 0.5 * size.y as f32 - 0.5,
+        );
+        min = min.min(px);
+        max = max.max(px);
+    }
+
+    let clamp = |v: f32, n: u32| (v.max(0.0) as u32).min(n - 1);
+    GpuBodyRect {
+        min: [clamp(min.x.floor() - 1.0, size.x), clamp(min.y.floor() - 1.0, size.y)],
+        max: [clamp(max.x.ceil() + 1.0, size.x), clamp(max.y.ceil() + 1.0, size.y)],
+    }
+}
+
+/// The body table to march this frame, and each kept body's screen rectangle:
+/// `placed` whole, or, when `flags` carry `CULL_BODIES`, only the bodies
+/// `camera` could see.
 ///
 /// The one cull both the render world and the test harness call, so the gates
 /// test what the app runs. Flags are a parameter, not `DEFAULT`, so the harness
 /// can render one scene with culling on and off in the same process.
 ///
+/// The table is compacted: each `GpuBody` carries its own geometry bases, so
+/// dropping entries leaves the rest valid. The rectangles are built here, from
+/// the same kept bodies in the same order, so the shader's body `i` is never
+/// tested against another body's rectangle. They are built whatever the flags;
+/// only the shader decides whether to read them. A body with no bound gets the
+/// whole screen.
+///
 /// The shader's body count must be taken from the length of what this returns,
-/// never from `placed`: the table is compacted, and a count from the full list
-/// would march entries past the ones written. A body with no voxels has no
-/// bound and is never marched.
+/// never from `placed`: a count from the full list would march entries past the
+/// ones written. A body with no voxels has no bound and is never marched when
+/// culling.
+///
+/// `size` is the dimensions of the texture this frame's dispatch writes.
 pub fn bodies_to_march(
     placed: &[GpuBody],
     local_bounds: &[Option<(UVec3, UVec3)>],
     camera: &ExtractedMarchCamera,
     flags: u32,
-) -> Vec<GpuBody> {
-    if flags & march_flags::CULL_BODIES == 0 {
-        return placed.to_vec();
-    }
-    let (kept, bounds): (Vec<GpuBody>, Vec<BodyBound>) = placed
+    size: UVec2,
+) -> (Vec<GpuBody>, Vec<GpuBodyRect>) {
+    debug_assert!(placed.len() <= local_bounds.len());
+    let cull = flags & march_flags::CULL_BODIES != 0;
+    let frustum = Frustum::from_camera(camera.world_from_clip, camera.position);
+    placed
         .iter()
         .zip(local_bounds)
-        .filter_map(|(g, local)| local.map(|l| (*g, world_bound(l, g))))
-        .unzip();
-    visible_bodies(&kept, &bounds, &Frustum::from_camera(camera.world_from_clip, camera.position))
+        .filter_map(|(g, local)| match local {
+            Some(l) if cull && !frustum.sees(world_bound(*l, g)) => None,
+            Some(l) => Some((*g, screen_rect(*l, g, camera.world_from_clip, size))),
+            None if cull => None,
+            None => Some((*g, GpuBodyRect { min: [0, 0], max: [size.x - 1, size.y - 1] })),
+        })
+        .unzip()
 }
 
 #[cfg(test)]
@@ -266,8 +318,79 @@ mod tests {
         assert!((bound.radius - Vec3::new(8.0, 4.0, 10.0).length() * 0.5).abs() < 1e-5);
     }
 
+    /// A placed table entry and a 16-voxel box as its local bounds.
+    fn cube_body(position: Vec3, orientation: Quat) -> (GpuBody, (UVec3, UVec3)) {
+        let volume = bevox_core::contree::Contree::empty(3);
+        let body = Body::new(volume, position, orientation);
+        (GpuBody::default().placed(&body), (UVec3::splat(24), UVec3::splat(40)))
+    }
+
+    /// The rectangle must cover every pixel whose ray hits the body's box. It is
+    /// checked against the same pixel-to-ray mapping `primary_ray` uses, so a
+    /// rectangle a pixel short is caught here rather than as a missing column on
+    /// screen.
+    ///
+    /// The oracle is the box, not the bounding sphere: the rectangle is built
+    /// from the box's corners, and the sphere's footprint is wider.
+    #[test]
+    fn the_rectangle_covers_every_pixel_that_sees_the_body() {
+        let size = UVec2::new(160, 90);
+        let eye = Vec3::new(32.0, 32.0, -80.0);
+        // Turned about the box's centre, so it stays in view.
+        let turned = Quat::from_euler(glam::EulerRot::XYZ, 0.4, 0.8, -0.3);
+        let bodies = [
+            cube_body(Vec3::ZERO, Quat::IDENTITY),
+            cube_body(Vec3::splat(32.0) - turned * Vec3::splat(32.0), turned),
+        ];
+        for world_from_clip in [standard(eye, Vec3::splat(32.0)), reverse_z(eye, Vec3::splat(32.0))] {
+            for (body, local) in &bodies {
+                let rect = screen_rect(*local, body, world_from_clip, size);
+                let local_from_world = Mat4::from_cols_array_2d(&body.local_from_world);
+                let (lo, hi) = (local.0.as_vec3(), local.1.as_vec3());
+
+                let mut inside = 0;
+                for y in 0..size.y {
+                    for x in 0..size.x {
+                        let ndc = Vec2::new(
+                            (x as f32 + 0.5) / size.x as f32 * 2.0 - 1.0,
+                            1.0 - (y as f32 + 0.5) / size.y as f32 * 2.0,
+                        );
+                        let far = world_from_clip * Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
+                        let dir = (far.xyz() / far.w - eye).normalize();
+                        // Slab test in the body's frame.
+                        let origin = local_from_world.transform_point3(eye);
+                        let inv = local_from_world.transform_vector3(dir).recip();
+                        let (t0, t1) = ((lo - origin) * inv, (hi - origin) * inv);
+                        let (enter, exit) = (t0.min(t1).max_element(), t0.max(t1).min_element());
+                        if enter <= exit && exit >= 0.0 {
+                            inside += 1;
+                            assert!(
+                                x >= rect.min[0] && x <= rect.max[0] && y >= rect.min[1] && y <= rect.max[1],
+                                "pixel ({x}, {y}) can see the body but lies outside the rectangle {rect:?}"
+                            );
+                        }
+                    }
+                }
+                assert!(inside > 50, "only {inside} pixels see the body; the test is not exercising the rectangle");
+            }
+        }
+    }
+
+    /// Straddling the camera plane must not produce a garbage rectangle from a
+    /// corner behind the camera.
+    #[test]
+    fn a_body_around_the_camera_gets_the_whole_screen() {
+        let size = UVec2::new(160, 90);
+        let eye = Vec3::new(32.0, 32.0, 32.0);
+        let (body, local) = cube_body(Vec3::ZERO, Quat::IDENTITY);
+        let rect = screen_rect(local, &body, standard(eye, Vec3::new(32.0, 32.0, 100.0)), size);
+        assert_eq!(rect.min, [0, 0]);
+        assert_eq!(rect.max, [size.x - 1, size.y - 1]);
+    }
+
     /// Off, every entry is marched as packed. On, an empty body and one out of
-    /// view are dropped, and what is kept stays in table order.
+    /// view are dropped, and what is kept stays in table order. Either way each
+    /// rectangle is its own body's.
     #[test]
     fn bodies_to_march_drops_only_what_the_flag_and_the_view_allow() {
         let eye = Vec3::ZERO;
@@ -282,8 +405,17 @@ mod tests {
         let table = [at(-50.0, 0), at(50.0, 1), at(-60.0, 2), at(-70.0, 3)];
         let bounds = [cube, cube, None, cube];
 
+        let size = UVec2::new(160, 90);
         let ids = |flags| {
-            let kept = bodies_to_march(&table, &bounds, &camera, flags);
+            let (kept, rects) = bodies_to_march(&table, &bounds, &camera, flags, size);
+            let own: Vec<GpuBodyRect> = kept
+                .iter()
+                .map(|g| match bounds[g.node_base as usize] {
+                    Some(local) => screen_rect(local, g, camera.world_from_clip, size),
+                    None => GpuBodyRect { min: [0, 0], max: [size.x - 1, size.y - 1] },
+                })
+                .collect();
+            assert_eq!(rects, own, "a rectangle is not its own body's");
             kept.iter().map(|g| g.node_base).collect::<Vec<_>>()
         };
         assert_eq!(ids(march_flags::DEFAULT & !march_flags::CULL_BODIES), [0, 1, 2, 3]);

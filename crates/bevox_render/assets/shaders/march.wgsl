@@ -21,6 +21,7 @@ const FLAG_MASK_FILTER: u32 = 2u;
 const FLAG_BEAM: u32 = 4u;
 const FLAG_DISTANCE_FIELD: u32 = 8u;
 const FLAG_BODIES: u32 = 16u;
+const FLAG_BODY_RECT: u32 = 64u;
 
 @group(0) @binding(0) var<uniform> view: MarchUniform;
 @group(0) @binding(1) var<storage, read> nodes: array<vec4<u32>>;
@@ -49,6 +50,12 @@ struct GpuBody {
     extent: u32,
 };
 @group(0) @binding(8) var<storage, read> bodies: array<GpuBody>;
+// Each body's screen footprint in pixels, inclusive, in the same order as
+// `bodies`. A separate 16-byte array rather than a field of GpuBody, so testing
+// it cannot load the whole 144-byte entry. The eighth storage buffer in the
+// compute stage, wgpu's default limit: no room for another without raising it.
+struct GpuBodyRect { min: vec2<u32>, max: vec2<u32> };
+@group(0) @binding(9) var<storage, read> body_rects: array<GpuBodyRect>;
 
 const BRICK_EDGE: u32 = 4u;
 const CHILDREN: u32 = 64u;
@@ -503,13 +510,26 @@ fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
 /// means the same thing in both. The normal comes back through the rotation
 /// alone -- putting a normal through the full affine would add the translation
 /// and point it nowhere.
-fn compose_bodies(origin: vec3<f32>, dir: vec3<f32>, world_hit: Hit, max_dist: f32) -> Hit {
+///
+/// `id` is the pixel this primary ray belongs to, for the screen rectangles.
+/// Primary rays only: a rectangle is a primary-ray footprint, so a shadow ray
+/// must never reach this.
+fn compose_bodies(origin: vec3<f32>, dir: vec3<f32>, world_hit: Hit, max_dist: f32, id: vec2<u32>) -> Hit {
     var best = world_hit;
     var limit = max_dist;
     if best.hit { limit = best.t; }
 
     let count = view.volume_params.w;
     for (var i = 0u; i < count; i = i + 1u) {
+        // Cheaper than the read and the two transforms below, and ahead of
+        // them. `traverse_at`'s slab test already rejects a ray that misses the
+        // body's box, but only after that work has been paid.
+        if flag_enabled(FLAG_BODY_RECT) {
+            let r = body_rects[i];
+            if id.x < r.min.x || id.x > r.max.x || id.y < r.min.y || id.y > r.max.y {
+                continue;
+            }
+        }
         let b = bodies[i];
         let local_origin = (b.local_from_world * vec4<f32>(origin, 1.0)).xyz;
         let local_dir = (b.local_from_world * vec4<f32>(dir, 0.0)).xyz;
@@ -761,7 +781,7 @@ fn primary_hit(id: vec3<u32>, size: vec2<u32>) -> Hit {
         // body march from them would skip every body standing in the empty
         // static space they jumped over. The world hit's absolute `t` still
         // bounds the search, because nothing behind it can be seen.
-        hit = compose_bodies(view.camera_position.xyz, dir, hit, max_ray_distance());
+        hit = compose_bodies(view.camera_position.xyz, dir, hit, max_ray_distance(), id.xy);
     }
     return hit;
 }
