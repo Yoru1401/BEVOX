@@ -7,14 +7,33 @@
 
 use crate::contree::Contree;
 use crate::march::{Hit, MarchStats, march};
+use crate::material::MaterialTable;
+use crate::physics::mass::{MassProperties, mass_properties};
 use glam::{Affine3A, Quat, UVec3, Vec3};
 
-/// A voxel volume placed in the world by a rigid transform.
+/// A voxel volume placed in the world by a rigid transform, and the state that
+/// moves it.
 #[derive(Clone, Debug)]
 pub struct Body {
     pub volume: Contree,
+    /// Where `com` is in the world: the point the body turns about.
     pub position: Vec3,
     pub orientation: Quat,
+    /// Centre of mass in volume coordinates.
+    ///
+    /// Zero until `recompute`, which leaves a body built by `new` placed
+    /// exactly as it was before bodies had mass.
+    pub com: Vec3,
+    /// Zero until `recompute`. A body with no mass is not simulated.
+    pub mass: MassProperties,
+    /// Voxels per second.
+    pub velocity: Vec3,
+    /// About `com`, in world axes.
+    ///
+    /// Stored instead of angular velocity because, with no torque, it is
+    /// exactly constant, which is what lets the conservation gate demand exact
+    /// equality.
+    pub angular_momentum: Vec3,
 }
 
 impl Body {
@@ -25,12 +44,28 @@ impl Body {
              so `t` would stop meaning the same distance in the body's frame and the renderer's \
              nearest-hit composition would pick the wrong surface"
         );
-        Self { volume, position, orientation }
+        Self {
+            volume,
+            position,
+            orientation,
+            com: Vec3::ZERO,
+            mass: MassProperties::default(),
+            velocity: Vec3::ZERO,
+            angular_momentum: Vec3::ZERO,
+        }
     }
 
-    /// Volume space to world space.
+    /// Volume space to world space: about `com`, which sits at `position`.
+    ///
+    /// Written as one rotation and one translation rather than composed with a
+    /// translation by `-com`. With `com` zero it is then exactly the matrix a
+    /// body had before it had mass, which every render test's placement
+    /// depends on.
     pub fn world_from_local(&self) -> Affine3A {
-        Affine3A::from_rotation_translation(self.orientation, self.position)
+        Affine3A::from_rotation_translation(
+            self.orientation,
+            self.position - self.orientation * self.com,
+        )
     }
 
     /// World space to volume space.
@@ -54,6 +89,24 @@ impl Body {
         stats: &mut MarchStats,
     ) -> Option<Hit> {
         march(&self.volume, self.world_from_local(), origin, dir, max_dist, false, stats)
+    }
+
+    /// Recomputes mass properties after the volume changed, or for the first
+    /// time. The pivot moves to the new centre of mass and `position` moves
+    /// with it, so every voxel stays where it was in the world.
+    ///
+    /// Returns `false`, and leaves the body massless, when nothing in the
+    /// volume weighs anything: such a body should be removed.
+    pub fn recompute(&mut self, materials: &MaterialTable) -> bool {
+        let voxels = self.volume.voxels();
+        let Some((mass, com)) = mass_properties(&voxels, materials) else {
+            self.mass = MassProperties::default();
+            return false;
+        };
+        self.position += self.orientation * (com - self.com);
+        self.com = com;
+        self.mass = mass;
+        true
     }
 }
 
@@ -122,6 +175,68 @@ mod tests {
             }
         }
         dense.into_contree()
+    }
+
+    /// Recomputing moves the pivot, never the voxels. Milestone 4's brush edits
+    /// recompute a body in mid-air and must not make it jump.
+    #[test]
+    fn recompute_keeps_every_voxel_where_it_was() {
+        let materials = crate::physics::fixtures::materials();
+        // An L, so the centre of mass is nowhere near the volume's corner or
+        // its middle.
+        let mut voxels = Vec::new();
+        for x in 0..8 {
+            voxels.push((UVec3::new(x, 0, 0), MaterialId(1)));
+        }
+        for y in 1..6 {
+            voxels.push((UVec3::new(0, y, 0), MaterialId(2)));
+        }
+        let orientation = Quat::from_euler(glam::EulerRot::XYZ, 0.4, -1.1, 0.7);
+        let mut body =
+            Body::new(Contree::from_voxels(16, &voxels), Vec3::new(5.0, -3.0, 9.0), orientation);
+
+        let world = |b: &Body, list: &[(UVec3, MaterialId)]| -> Vec<Vec3> {
+            list.iter()
+                .map(|(p, _)| b.world_from_local().transform_point3(p.as_vec3() + 0.5))
+                .collect()
+        };
+        let before = world(&body, &voxels);
+        assert!(body.recompute(&materials));
+        assert_ne!(body.com, Vec3::ZERO, "the pivot did not move, so this proves nothing");
+        for (a, b) in before.iter().zip(world(&body, &voxels)) {
+            assert!((*a - b).length() < 1e-4, "recompute moved a voxel from {a:?} to {b:?}");
+        }
+
+        // Erase the upright of the L. The pivot moves again; the rest stays put.
+        let base: Vec<_> = voxels.iter().copied().filter(|(p, _)| p.y == 0).collect();
+        let before = world(&body, &base);
+        let com = body.com;
+        body.volume = Contree::from_voxels(16, &base);
+        assert!(body.recompute(&materials));
+        assert_ne!(body.com, com, "the edit did not move the pivot, so this proves nothing");
+        for (a, b) in before.iter().zip(world(&body, &base)) {
+            assert!((*a - b).length() < 1e-4, "an edit moved a voxel from {a:?} to {b:?}");
+        }
+    }
+
+    #[test]
+    fn a_body_with_no_voxels_does_not_recompute() {
+        let mut body = Body::new(Contree::empty(2), Vec3::ZERO, Quat::IDENTITY);
+        assert!(!body.recompute(&crate::physics::fixtures::materials()));
+        assert_eq!(body.mass.mass, 0.0);
+    }
+
+    /// Every render test builds bodies with `new` and never recomputes them.
+    /// Their placement must be the exact matrix it was before bodies had mass.
+    #[test]
+    fn a_body_never_recomputed_is_placed_exactly_as_before() {
+        let orientation = Quat::from_euler(glam::EulerRot::XYZ, 0.3, 0.9, -0.4);
+        let position = Vec3::new(12.5, -4.0, 30.0);
+        let body = Body::new(cube(), position, orientation);
+        assert_eq!(
+            body.world_from_local(),
+            Affine3A::from_rotation_translation(orientation, position)
+        );
     }
 
     /// An untransformed body is marched exactly as the bare volume is, or the

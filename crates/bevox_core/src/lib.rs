@@ -11,5 +11,6 @@ pub mod mask_table;
 pub mod material;
 pub mod node;
 pub mod normal;
+pub mod physics;
 pub mod testing;
 pub mod vox;
