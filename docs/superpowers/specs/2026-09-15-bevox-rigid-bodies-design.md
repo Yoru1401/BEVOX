@@ -1,16 +1,29 @@
 # BEVOX Rigid Bodies — Design
 
-Voxel chunks that detach from the static world, fall, tumble, and come to rest —
+Voxel chunks that detach from the static world, fall, tumble and come to rest,
 rendered by the same ray marcher that draws everything else.
 
-This is new scope. The milestone-8 spec deliberately excluded physics; nothing
+This is new scope. The milestone-8 spec deliberately excluded physics, so nothing
 here is a deferred item being picked up. It is a second subsystem built on the
 first.
 
+> **Revised 2026-09-17.** Collision, integration, materials and the milestones
+> were rebuilt to follow Douglas Dwyer's voxel physics engine, as shown in his
+> devlogs, at Flori's request. The Provenance section at the end separates what
+> his devlogs show from what this design fills in. The first version's
+> surface-voxel queries and plain semi-implicit Euler are replaced.
+
 ## What this is for
 
-Carve the supports out from under a wall and the wall should fall over, not hang
-in the air. That is the whole goal. Everything below serves it.
+Carve the supports out from under a wall, and the wall should fall over rather
+than hang in the air. Bodies are always voxels: a piece of terrain that an edit
+disconnects becomes a body, as in Dwyer's engine. Everything below serves that.
+
+Two interactions come later but constrain the design now:
+
+- **Picking up bodies.** A mouse grab drives the body through a joint.
+- **Editing bodies with the brush.** Painting grows a body, erasing shrinks it,
+  and pieces that end up disconnected split into separate bodies.
 
 ## The one property that makes this tractable
 
@@ -18,145 +31,297 @@ in the air. That is the whole goal. Everything below serves it.
 
 The CPU marcher has taken `volume_to_world: Affine3A` since milestone 2 and been
 handed `IDENTITY` at every call site. That hedge was placed for exactly this.
-Marching a transformed volume means transforming the ray into the volume's local
-frame, marching, and transforming the hit back.
+Marching a transformed volume means transforming the ray into the volume's
+local frame, marching, and transforming the hit back.
 
 Because the transform is rigid, **`t` is preserved exactly** between world and
-local space. A distance along the ray means the same thing in both. That is what
-lets the renderer compose the static world and any number of bodies by simply
-keeping the nearest hit — no depth buffer, no re-projection, no epsilon.
+local space: a distance along the ray means the same thing in both. That is what
+lets the renderer compose the static world and any number of bodies by keeping
+the nearest hit, with no depth buffer, no re-projection and no epsilon.
 
-Allow scale and that property dies: `t` scales per body, the comparison needs a
-division, and every existing parity test's notion of distance stops being shared.
-Scale is therefore out, permanently, not deferred.
+Allow scale and that property dies. `t` would scale per body, the comparison
+would need a division, and every existing parity test's notion of distance would
+stop being shared. Scale is therefore out permanently, not deferred.
 
 ## Rendering
 
 The shader marches the static world, then each body in turn, and keeps the
-nearest hit.
+nearest hit. Normals return through the rotation only.
 
-```
-hit = traverse(world_ray)
-for each body:
-    local = body.world_to_local * world_ray
-    body_hit = traverse_body(local)
-    if body_hit.t < hit.t: hit = body_hit (normal rotated back to world)
-```
+Per ray this is `1 + N` marches, so **the body count is capped**, and the cap is a
+measured number rather than an aspiration. Body culling (milestone 1b) made a
+body cheap:
 
-Per ray this is `1 + N` marches, so **the body count is capped** and the cap is a
-number in the uniform, not an aspiration. Bodies are small — a collapsed wall
-section is hundreds of voxels, not millions — so each body march terminates
-quickly, but the cap is what stops a pathological scene from quadratic blowup.
+- **Off-screen bodies:** a CPU frustum cull drops them entirely.
+- **On-screen bodies:** a per-pixel screen rectangle skips a body's read and
+  transform outside its footprint.
 
-Shadow rays go through the same composition, or bodies cast no shadows and the
-lie is visible immediately.
+`MAX_BODIES` is 16 at 1280x720 on a GTX 1650. The measurements are in
+`docs/superpowers/plans/2026-09-17-bevox-body-culling.md`.
 
-Each body owns its own `Contree`. Bodies are small, so their arenas are small,
-and packing them into the existing node and voxel buffers behind a per-body base
-offset costs one indirection and avoids a second set of bindings.
+Bodies do not cast shadows yet. When they do, shadow rays must compose bodies
+without the frustum cull, because a body just off screen can shadow what is on
+it.
+
+Each body owns its own `Contree`, packed into the shared node and voxel buffers
+behind a per-body base offset.
+
+## Materials
+
+`Material` gains physics columns as the milestones need them:
+
+- **`density`** (milestone 2). A `u16`, so `Material` can still derive `Eq`. A
+  voxel's mass is its material's density, in relative units: only ratios
+  between bodies, and against a joint's force later, are observable.
+- **`friction` and `restitution`** (milestone 3). Per material, so one body can
+  slide or bounce differently depending on which of its voxels touches.
 
 ## Mass properties
 
-Computed from voxel occupancy, once, when a body is created:
+Computed from voxel occupancy, weighted by density, by a function that can be
+**re-run whenever the volume changes**, not only at creation:
 
-- **mass** — voxel count times a per-material density
-- **centre of mass** — the occupancy-weighted mean, which becomes the body's
-  local origin so the transform rotates about the right point
-- **inertia tensor** — summed per voxel with the parallel-axis theorem, then
-  inverted once and stored
+- **Mass:** the sum of voxel densities.
+- **Centre of mass:** the density-weighted mean of voxel centres. It becomes the
+  point the body rotates about:
+  `world_from_local = T(position) · R(orientation) · T(-com)`, where `position`
+  is the centre of mass in world space.
+- **Inertia tensor:** summed per voxel about the centre of mass, from the exact
+  unit-cube inertia plus the parallel-axis term. It is inverted once and stored.
 
-A body whose centre of mass is not its local origin tumbles wrongly in a way
-that looks almost right, which is the worst kind of wrong. Re-centring at
-creation is not an optimisation.
+A body whose centre of mass is not its pivot tumbles wrongly in a way that looks
+almost right, which is the worst kind of wrong.
 
-## Integration
+**Recomputing after an edit keeps the body's voxels where they are in the
+world.** If the centre of mass moves by `Δ` in local space, `position` moves by
+`orientation · Δ`. A body left with no voxels is removed.
 
-Semi-implicit Euler. Orientation as a quaternion, renormalised every step;
-angular velocity in world space with the inertia tensor rotated into it each
-step. Fixed timestep with an accumulator, because a variable step makes
-restitution and resting contact frame-rate dependent, and a voxel scene's frame
-time varies by 3x depending on where the camera looks.
+## Voxel classification
 
-## Collision
+Each solid voxel of a body is labelled by counting the axes along which it has
+solid neighbours on **both** sides:
 
-Against the static world first; body against body last, because it is the part
-most easily deferred and the least visible.
+| Axes | Label | Collision shape |
+|---|---|---|
+| 0 | corner | sphere of radius 0.5 |
+| 1 | edge | cylinder of radius 0.5 along that axis, one voxel long |
+| 2 | face | full slab on its exposed axis |
+| 3 | interior | none: it can never be touched first |
 
-A body's **surface voxels** are the only candidates — an interior voxel cannot
-touch anything an exterior one does not touch first. They are found once at
-creation.
+The labels are computed with the mass properties and re-run on every edit.
+Static-world voxels are classified on demand, from their neighbours in the
+tree, and only inside a body's bounding box: the world is too large to label in
+advance.
 
-For each surface voxel, its world position queries the static volume. The
-distance field already built for empty-space skipping is a conservative
-free-radius oracle: a body whose whole bounding sphere sits inside one field
-cell's promised cube cannot be touching anything, and that rejects most bodies
-most frames for the cost of one lookup.
+## Collision detection
 
-Contacts resolve with impulses: restitution along the normal, Coulomb friction
-in the tangent plane, and a positional correction for penetration that does not
-feed energy back in. Resting contact is where naive impulse solvers jitter, and
-the honest fix is a small penetration slop plus a bias, not more iterations.
+Once per physics tick, for every pair that can touch:
 
-## Detachment
+1. **Broadphase.**
+   - Take the world-space axis-aligned bounding box of the body's rotated
+     occupied bounds, grown by the speculative margin.
+   - Against the world, if one distance-field cell's promised free cube contains
+     that box, the body touches nothing this tick.
+   - Otherwise the box bounds which world voxels are considered.
+   - Between bodies (milestone 3), the two boxes must overlap.
+2. **Candidates.** Collisions between two voxel volumes happen only between a
+   corner and any voxel, or between two edges. So the pairs tested are:
+   - corners of A against voxels of B;
+   - corners of B against voxels of A;
+   - edges of A against edges of B.
 
-An edit that removes voxels can disconnect part of the structure. Finding the
-disconnected part is a connected-components pass over the affected region, which
-is why it is the last milestone rather than the first: it is the piece most
-coupled to edit throughput, and a single paint already stages about 2.2 MB of
-distance-field data at extent 4096.
+   Faces never test against faces. The corners around a face cover that
+   contact.
+3. **Lookup.** A candidate voxel's centre is transformed into the other side's
+   grid, and the 2x2x2 voxels nearest that point are examined.
+4. **Pair test.** The two rounded shapes from the classification table are
+   tested: sphere against sphere, plane or cylinder, and cylinder against
+   cylinder. Each test gives:
+   - **signed separation:** negative is penetration; positive up to the margin
+     makes a speculative contact;
+   - **normal:** not restricted to the grid axes;
+   - **anchor point** on each body.
+5. **Key.** Each contact is keyed by the pair of voxel coordinates, which is
+   what makes warm starting possible.
 
-Until then bodies are spawned deliberately, which is enough to build and test
-everything else.
+Rounding corners and edges while keeping faces flat avoids both failure modes
+Dwyer describes:
+
+- **Axis-aligned boxes** are not rotation-invariant, which gives wrong normals
+  and jitter.
+- **Pure spheres** let bodies sink into each other's gaps and add false
+  friction.
+
+## Integration and solving
+
+Temporal Gauss-Seidel (TGS), on Bevy's `FixedUpdate` at 64 Hz. One tick:
+
+1. **Detect** contacts once (above).
+2. **Warm start.** Apply each contact's accumulated impulse from the previous
+   tick where its key matches, and drop the rest.
+3. **Substeps.** Repeat `SUBSTEPS` times (4 to start) with `h = dt / SUBSTEPS`,
+   **without re-detecting**:
+   1. Apply external forces: `v += g·h`.
+   2. Solve velocity constraints. For each contact, compute the normal impulse
+      including the angular terms (`r × n` through the world inverse inertia),
+      clamp the accumulated total to be non-negative, and apply it to linear
+      velocity and angular momentum. Each substep recomputes a contact's current
+      separation from how far its anchors have moved since detection.
+   3. Integrate positions: `x += v·h`, and orientation from
+      `ω = R·I⁻¹·Rᵀ·L`, renormalised.
+
+**State.** A body stores linear velocity and **world-space angular momentum
+`L`**, not angular velocity. With no torque, `L` is exactly constant, so the
+conservation gate can demand exact conservation. Physics state lives in `Body`
+itself, not in a parallel array, so splitting or removing a body cannot
+desynchronise the two.
+
+**No separate position-correction pass.** Pushing a resting body up after
+gravity moves it down makes it jitter at float precision. Penetration is instead
+removed by a soft bias inside the velocity constraint, above a small slop.
+
+**Tunnelling.** No continuous collision detection. Speculative contacts give an
+approaching body a constraint before it arrives, and a velocity cap keeps a
+tick's travel within the margin. `SUBSTEPS`, the slop, the bias factor, the
+margin and the cap are named constants, tuned against the resting gate.
+
+**Units.** Voxels and seconds. `GRAVITY = 9.81 / VOXEL_METRES` voxels/s², where
+`VOXEL_METRES` (0.1 to start) is a tuning knob for how heavy falls feel.
+
+**Leaving the world.** Voxels outside the static tree's extent are empty to
+detection. A body entirely below the world is removed.
+
+**Edits to the world** need no special handling. Detection reads the live tree
+every tick, so erasing the ground under a resting body drops it on the next
+tick.
+
+## Detachment and body edits
+
+An edit that removes voxels can disconnect part of a structure, in the static
+world or in a body. Detachment finds the disconnected parts with a depth-first
+search using **6-connectivity** (face neighbours only), over the tree's
+**uniform nodes rather than individual voxels**: a uniform solid node is
+connected within itself, so a large solid region is one graph node, not
+thousands. Each part that no longer touches the main piece becomes its own
+body. Its voxels are removed from the source and its mass properties are
+computed.
+
+Body edits go through the same path:
+
+- **Painting onto a body** grows it and recomputes it.
+- **Erasing from a body** recomputes it and runs the same split, so a body cut in
+  two becomes two bodies.
+
+Detachment is coupled to edit throughput. A single paint already stages about
+2.2 MB of distance-field data at extent 4096, so the search is bounded to the
+affected region.
+
+## Joints and the mouse grab
+
+Every joint is one error function `C` of the constrained bodies' transforms,
+satisfied when `C = 0`. Its gradient `J` gives the constraint direction. The
+constraint impulse `λ` comes from the same expression for every joint type, and
+the TGS solver handles joints and contacts together.
+
+**The mouse grab is a joint** that drives the grabbed point, and the body's
+rotation, toward a target in front of the camera. It is not an explicit spring:
+Dwyer's spring version bounced and was unstable, and the joint replaced it.
+
+A joint on a body that splits must follow the piece that holds its anchor voxel.
 
 ## Testing
 
-The project's existing discipline applies unchanged and is what this design is
-shaped around:
+The project's existing discipline applies unchanged:
 
-- **CPU reference first.** Mass properties, integration and contact resolution
-  are pure functions of numbers and are tested without a GPU or a window.
+- **CPU reference first.** Mass properties, classification, pair tests and the
+  solver are pure functions, tested without a GPU or a window.
 - **Bit-identity.** A scene with zero bodies must render bit-identically to the
-  same scene before this work existed. The composition loop is a defect if it
-  changes a pixel of a body-free scene.
+  same scene before this work existed.
 - **Conservation as a gate.** A body with no gravity and no contacts must
-  conserve linear and angular momentum to float tolerance over thousands of
-  steps. This is the test that catches an integrator that looks right.
-- **A body at rest must stay at rest.** Drop a body on a floor and its height
-  after ten thousand steps must equal its height after one thousand. Jitter is
-  the characteristic failure of every impulse solver and it hides from short
-  tests.
-- **Every performance claim is interleaved A/B/A in one session**, drift
-  reported, as everywhere else in this project.
+  conserve linear and angular momentum over thousands of ticks.
+- **A body at rest must stay at rest.** Drop a body on a floor. Its height after
+  ten thousand ticks must equal its height after one thousand, and at rest the
+  normal impulse per tick must match its weight. Jitter hides from short tests.
+- **Every performance claim is interleaved A/B/A in one session**, with drift
+  reported. Any change to the ray-march shader re-runs the static-world bench,
+  because a driver codegen cliff once cost 48% with identical pixels.
 
-And one lesson this project paid for four times over: **a test whose scene or
-camera cannot reach the code it names is worse than no test**, because it reads
-as coverage. Every gate here states what it would fail against, and the ones
-guarding correctness are checked by deliberately breaking the code they guard.
+One lesson this project paid for many times over: **a test whose scene or camera
+cannot reach the code it names is worse than no test**, because it reads as
+coverage. Every gate states what it would fail against, and the ones guarding
+correctness are checked by deliberately breaking the code they guard.
 
 ## Milestones
 
 | # | Deliverable | What it proves |
 |---|---|---|
-| 1 | A transformed body volume rendered, composed with the static world | The renderer can do this at all, and cheaply |
-| 2 | Mass properties, integration, gravity, and a body resting on the floor | The physics is right in isolation |
-| 3 | Full contact resolution: friction, restitution, angular response | A body tumbles and settles convincingly |
-| 4 | Detachment — carving a support spawns a body | The thing this was for |
-| 5 | Body against body | Piles, not just single objects |
+| 1 | A transformed body volume rendered, composed with the static world | The renderer can do this at all |
+| 1b | Body culling; cap raised to 16 | Bodies are cheap enough to have several |
+| 2 | Material density, recomputable mass properties, voxel classification, rounded-voxel contacts against the world, TGS solver with angular response and warm starting, gravity | A body lands, tumbles and rests on real terrain |
+| 3 | Friction and restitution per material; body against body | Bodies slide, bounce and pile |
+| 4 | Detachment from the world, and brush editing of bodies with splitting | The thing this was for |
+| 5 | Joints, and the mouse grab as a joint | Bodies can be picked up |
 
-Milestone 1 first because the rendering is the part that could prove
-unaffordable, and everything else is wasted if it does. It carries a hardcoded
-spin so it can be seen working before any physics exists.
+Deferred until a measurement asks for them: sleeping, merging settled debris
+back into the terrain, fracture on hard impacts, and multithreading. Dwyer's
+engine has all four.
 
 ## What this deliberately does not do
 
-No scale on body transforms, ever — see above; it is load-bearing, not a
-simplification.
+- **Scale on body transforms, ever.** See above; it is load-bearing, not a
+  simplification.
+- **Soft bodies and fluids.**
+- **Continuous collision detection.** Speculative contacts and a velocity cap
+  are the answer until something demonstrates otherwise.
+- **Sleeping and islands, until measurement shows they are needed.**
 
-No soft bodies, no fluids, no constraints or joints. No sleeping or islands
-until measurement shows they are needed. No continuous collision detection: a
-fast enough body will tunnel, and the fixed timestep plus a velocity cap is the
-answer until something demonstrates otherwise.
+## Provenance
 
-No re-voxelisation of a settled body back into the static world. It is the
-obvious way to stop paying for a body that has stopped moving, and it is a
-milestone of its own once there is something to measure.
+What Douglas Dwyer's devlogs show, and where. His engine is not open source, so
+this list is all that is known of it here:
+
+- **#20, [Coding rigid body physics for voxels](https://www.youtube.com/watch?v=byP6cA71Cgw).**
+  - Corner and edge voxels, with collisions only corner against voxel and edge
+    against edge, after Teardown's approach.
+  - A voxel centre transformed into the other volume, checking the nearest 8
+    voxels.
+  - An iterative contact solver after Millington's *Game Physics Engine
+    Development*.
+  - Mouse dragging.
+  - Disconnected terrain becoming bodies.
+- **#26, [My voxel physics engine was BROKEN](https://www.youtube.com/watch?v=R9bror0oqR0).**
+  - Corner, edge, face and interior labels.
+  - Rounded corners and edges with full faces, using sphere, plane and cylinder
+    tests, after spheres and axis-aligned boxes both failed.
+  - A TGS loop: detect, then substeps of forces, velocity constraints and
+    position integration, reusing contacts.
+  - Warm starting keyed by the colliding voxel coordinates.
+  - A separate position pass dropped for causing jitter.
+  - Per-material density, friction and restitution.
+  - Fracturing.
+  - Voxel objects that can be edited and break apart.
+- **#30, [Adding joints to my physics engine](https://www.youtube.com/watch?v=RvhYKj9kEP8).**
+  - Joints as an error function `C`, Jacobian `J` and impulse `λ`.
+  - The mouse grab moved from an unstable explicit-Euler spring to a joint that
+    constrains position and rotation.
+  - Joints following the body that holds them after a split.
+- **#12, [Chopping trees DOWN](https://www.youtube.com/watch?v=5e8ut4NgF-8).**
+  - Connected-component labelling by depth-first search, 6-connected, over the
+    homogeneous nodes of his sparse voxel octree, with a dense bitmap of visited
+    nodes.
+- **#13, [OPTIMIZING my physics engine](https://www.youtube.com/watch?v=b_d-0EyOuVg).**
+  - Sleeping.
+  - Merging debris back into the terrain when out of view.
+  - Multithreading.
+
+Filled in by this design, **not** shown in his devlogs:
+
+- the exact pair-test formulas and rounding radii;
+- the soft bias and slop;
+- speculative contacts and the velocity cap;
+- the substep count;
+- the distance-field broadphase;
+- storing angular momentum instead of angular velocity;
+- the centre-of-mass pivot formula;
+- `u16` density;
+- the tick rate.
