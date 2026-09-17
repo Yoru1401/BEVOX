@@ -43,25 +43,25 @@ pub const MARCH_BINDING_COUNT: usize = 10;
 pub const VOXEL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Bodies the march composes. Past this, bodies are still packed and uploaded
-/// but not marched: the count the shader loops over is clamped to it.
+/// but not marched: the count the shader loops over is clamped to it, after the
+/// cull, so it caps visible bodies.
 ///
-/// Set from `bodies_are_measured_against_none` in `tests/gpu_bench.rs` on a GTX
-/// 1650, 2026-09-17. At 1280x720 from the bench camera the static world marches
-/// in 11.80 ms and each body adds 3.17 ms -- the least-squares slope over 0, 1,
-/// 4 and 16 bodies, A/B/A with drift at most 0.01 ms -- so 1.5 bodies fit a
-/// 16.7 ms frame beside it: one. A body costs 27% of the static march, and 16
-/// bodies behind the camera, which no ray enters, still cost 89% of what 16 in
-/// view do. So most of the cost is paid per pixel per body, before any
-/// rejection: reading the body entry, two matrix-vector transforms, and the
-/// call whose root slab test is already a bounding-box test. That per-pixel
-/// cost likely scales with resolution, so this cap is tied to 1280x720.
+/// Still one, and now because of the static world rather than the bodies. Set
+/// from `bodies_are_measured_against_none` in `tests/gpu_bench.rs` on a GTX
+/// 1650, 2026-09-17, at 1280x720 from the bench camera. With `DEFAULT`'s cull
+/// and rectangles a visible body adds 0.506 ms wall / 0.559 ms GPU -- the
+/// least-squares slope over 0, 1, 4 and 16 bodies, about 3% of the static
+/// march; 0.885 / 1.003 ms with neither, in the same run. But the static world
+/// marched in 17.23 ms wall / 16.89 ms GPU in that run, already past a 16.7 ms
+/// frame, which leaves room for no body. It regressed on this branch: 15.69 ms
+/// at 5a43911 against 12.89 / 12.43 ms at 85370de, the commit before the
+/// exact-tie and camera-relative traversal changes, A/B/A across the two builds
+/// (GPU 15.44 against 13.35 / 12.91).
 ///
-/// Raise this only after a body can be rejected before it is read and
-/// transformed, more cheaply than that read, transform and slab test, and the
-/// benchmark has been re-run. Candidates, roughly cheapest first: a CPU frustum
-/// cull, a per-body screen rectangle, a world-space sphere or box, the ray
-/// origin transformed once per body per frame, the slab test hoisted out of the
-/// call. The plan's Measurements section has the reasoning.
+/// Raise this once the static world is back under the frame with room to
+/// spare, re-running the benchmark. Most of the per-body cost is paid per
+/// pixel, so the arithmetic is tied to 1280x720. The plan's Measurements
+/// section has the numbers.
 ///
 /// The test harness writes its own uniform and is not capped, which is what
 /// lets the benchmark measure past this.
@@ -673,28 +673,15 @@ mod tests {
         assert!(!can_reuse_buffers(BUILT, &scene, Some(&update_at(1, 1))));
     }
 
-    /// `bodies_past_the_cap_are_not_marched` proves the clamp; this proves the
-    /// uniform the app uploads goes through it.
-    #[test]
-    fn the_uploaded_uniform_marches_no_more_than_the_cap() {
-        let camera = ExtractedMarchCamera { offset_from_clip: Mat4::IDENTITY, position: Vec3::ZERO };
-        let bodies = vec![GpuBody::default(); MAX_BODIES + 1];
-        let scene = GpuSceneData { body_local_bounds: vec![None; bodies.len()], ..default() };
-        let (uniform, ..) =
-            frame_uniform(&scene, &camera, &bodies, march_flags::DEFAULT, UVec2::ONE);
-        assert_eq!(uniform.volume_params[3], MAX_BODIES as u32);
-    }
-
-    /// The count the shader loops over is the length of the culled table, not
-    /// of the bodies placed. Counted from the placed list, a culled scene marches
-    /// entries past the ones written.
-    #[test]
-    fn the_uniform_counts_the_culled_table_and_caps_after_the_cull() {
-        let eye = Vec3::ZERO;
-        let view = Mat4::look_at_rh(eye, -Vec3::Z, Vec3::Y);
+    /// A reverse-Z camera at the origin looking down -Z, an 8-voxel body 50
+    /// ahead of it and the same body 50 behind, and that body's local bounds.
+    fn camera_and_bodies() -> (ExtractedMarchCamera, GpuBody, GpuBody, (UVec3, UVec3)) {
+        let view = Mat4::look_at_rh(Vec3::ZERO, -Vec3::Z, Vec3::Y);
         let projection = Mat4::perspective_infinite_reverse_rh(0.9, 16.0 / 9.0, 0.1);
-        let camera =
-            ExtractedMarchCamera { offset_from_clip: (projection * view).inverse(), position: eye };
+        let camera = ExtractedMarchCamera {
+            offset_from_clip: (projection * view).inverse(),
+            position: Vec3::ZERO,
+        };
         let at = |z: f32| {
             let body = bevox_core::body::Body::new(
                 bevox_core::contree::Contree::empty(2),
@@ -703,9 +690,31 @@ mod tests {
             );
             GpuBody::default().placed(&body)
         };
-        let (ahead, behind) = (at(-50.0), at(50.0));
-        let cube = Some((UVec3::ZERO, UVec3::splat(8)));
-        let scene = GpuSceneData { body_local_bounds: vec![cube; 2], ..default() };
+        (camera, at(-50.0), at(50.0), (UVec3::ZERO, UVec3::splat(8)))
+    }
+
+    /// `bodies_past_the_cap_are_not_marched` proves the clamp; this proves the
+    /// uniform the app uploads, with the app's flags, goes through it.
+    #[test]
+    fn the_uploaded_uniform_marches_no_more_than_the_cap() {
+        let (camera, ahead, _, cube) = camera_and_bodies();
+        let bodies = vec![ahead; MAX_BODIES + 1];
+        let scene = GpuSceneData { body_local_bounds: vec![Some(cube); bodies.len()], ..default() };
+        let (uniform, table, _) =
+            frame_uniform(&scene, &camera, &bodies, march_flags::DEFAULT, UVec2::new(160, 90));
+        // Every body is in view, so whether or not `DEFAULT` culls, only the
+        // cap can stop the count short of them all.
+        assert_eq!(table.len(), bodies.len(), "a body in view was culled; this case no longer reaches past the cap");
+        assert_eq!(uniform.volume_params[3], MAX_BODIES as u32);
+    }
+
+    /// The count the shader loops over is the length of the culled table, not
+    /// of the bodies placed. Counted from the placed list, a culled scene marches
+    /// entries past the ones written.
+    #[test]
+    fn the_uniform_counts_the_culled_table_and_caps_after_the_cull() {
+        let (camera, ahead, behind, cube) = camera_and_bodies();
+        let scene = GpuSceneData { body_local_bounds: vec![Some(cube); 2 * MAX_BODIES + 1], ..default() };
         let cull = march_flags::DEFAULT | march_flags::CULL_BODIES;
 
         let size = UVec2::new(160, 90);
@@ -714,20 +723,18 @@ mod tests {
         assert_eq!(uniform.volume_params[3], 0, "the count includes a body the cull removed");
         assert!(rects.is_empty(), "a rectangle was kept for a body the cull removed");
 
-        // Behind first: capped before the cull, the one marched slot would go
-        // to the body the cull then drops, and nothing would be drawn.
-        assert!(MAX_BODIES < 2, "this case no longer reaches past the cap");
-        let (uniform, table, rects) = frame_uniform(&scene, &camera, &[behind, ahead], cull, size);
-        assert_eq!(bytemuck::cast_slice::<GpuBody, u8>(&table), bytemuck::bytes_of(&ahead));
-        let own = crate::cull::screen_rect(
-            cube.unwrap(),
-            &ahead,
-            camera.offset_from_clip.inverse(),
-            eye,
-            size,
-        );
-        assert_eq!(rects, [own]);
-        assert_eq!(uniform.volume_params[3], 1);
+        // A cap's worth behind first, then one more than the cap ahead, so the
+        // case reaches past the cap at any value. Capped before the cull, every
+        // marched slot would go to a body the cull then drops, and nothing would
+        // be drawn; capped after it, the cap's worth of bodies ahead are.
+        let placed = [vec![behind; MAX_BODIES], vec![ahead; MAX_BODIES + 1]].concat();
+        let (uniform, table, rects) = frame_uniform(&scene, &camera, &placed, cull, size);
+        let kept = vec![ahead; MAX_BODIES + 1];
+        assert_eq!(bytemuck::cast_slice::<GpuBody, u8>(&table), bytemuck::cast_slice::<GpuBody, u8>(&kept));
+        let own =
+            crate::cull::screen_rect(cube, &ahead, camera.offset_from_clip.inverse(), Vec3::ZERO, size);
+        assert_eq!(rects, vec![own; MAX_BODIES + 1]);
+        assert_eq!(uniform.volume_params[3], MAX_BODIES as u32);
     }
 
     #[test]

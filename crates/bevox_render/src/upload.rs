@@ -103,7 +103,20 @@ pub mod march_flags {
     /// body-free scene nothing -- the composition loop runs zero times, and
     /// the zero-body parity gate proves such a scene bit-identical with it on.
     /// What each body costs is measured separately.
-    pub const DEFAULT: u32 = DDA | MASK_FILTER | BEAM | DISTANCE_FIELD | BODIES;
+    ///
+    /// `CULL_BODIES` and `BODY_RECT` both earned it in
+    /// `bodies_are_measured_against_none` (GTX 1650, 1280x720, bench camera,
+    /// 2026-09-17), each A/B/A directly against neither on the same sixteen
+    /// bodies, wall / GPU. The cull saves 4.80 / 3.54 ms on bodies behind the
+    /// camera (drift 0.54 / 2.10) and is within drift where it culls nothing.
+    /// The rectangle saves 7.42 / 7.79 ms on bodies in view (drift 0.04 / 0.74)
+    /// and 2.93 / 2.88 ms on tight ones (drift 0.19 / 0.67). Alone it costs
+    /// 0.70 ms wall on bodies behind the camera (drift 0.36), which get the
+    /// whole screen, and the cull removes those: together they save 4.12 /
+    /// 4.26 ms there. Neither changes a pixel, and a body-free scene runs
+    /// neither.
+    pub const DEFAULT: u32 =
+        DDA | MASK_FILTER | BEAM | DISTANCE_FIELD | BODIES | CULL_BODIES | BODY_RECT;
 }
 
 /// The sun direction the renderer and the parity tests share.

@@ -197,7 +197,8 @@ fn optimisations_are_measured_against_the_baseline() {
         ("dda+mask+beam", march_flags::DDA | march_flags::MASK_FILTER | march_flags::BEAM),
         ("field", march_flags::DISTANCE_FIELD),
         // `DEFAULT`, whatever it currently holds -- today that is all four
-        // optimisations plus `BODIES`, which a body-free scene never runs.
+        // optimisations plus `BODIES`, `CULL_BODIES` and `BODY_RECT`, which a
+        // body-free scene never runs.
         ("default", march_flags::DEFAULT),
     ] {
         let variant = make(flags);
@@ -656,25 +657,58 @@ fn building_the_field_is_timed() {
     }
 }
 
-/// Sixteen copies of the parity tests' 16-voxel cube, a 4x4 grid `ahead`
-/// voxels in front of the bench camera. At 120 that is the open corridor, clear
-/// of the floor and the columns, so each is on screen and unoccluded; at -120
-/// it is behind the camera, where every ray misses every body's box. Turned
-/// off-axis, as the demo body spins, rather than meeting every ray square-on.
-fn bench_bodies(eye: Vec3, ahead: f32) -> Vec<bevox_core::body::Body> {
-    let cube = body_cube();
+/// Sixteen copies of `cube`, a 4x4 grid `ahead` voxels in front of the bench
+/// camera, each placed so its local point `middle` lands on the grid. At 120
+/// that is the open corridor, clear of the floor and the columns, so each is on
+/// screen and unoccluded; at -120 it is behind the camera, where every ray
+/// misses every body's box. Turned off-axis, as the demo body spins, rather
+/// than meeting every ray square-on.
+fn bench_bodies(eye: Vec3, ahead: f32, cube: &Contree, middle: f32) -> Vec<bevox_core::body::Body> {
     let orientation = glam::Quat::from_euler(glam::EulerRot::XYZ, 0.4, 0.7, 0.0);
     let mut bodies = Vec::new();
     for row in 0..4 {
         for column in 0..4 {
             let centre = eye
                 + Vec3::new((column as f32 - 1.5) * 40.0, 8.0 + (row as f32 - 1.5) * 24.0, ahead);
-            // The cube spans 25..41 of its volume, so its centre is local 33.
-            let position = centre - orientation * Vec3::splat(33.0);
+            let position = centre - orientation * Vec3::splat(middle);
             bodies.push(bevox_core::body::Body::new(cube.clone(), position, orientation));
         }
     }
     bodies
+}
+
+/// A/B/A of `variant` against `baseline` on both clocks: wall, then GPU (median
+/// of seven readings after one untimed dispatch), each as (a1, b, a2) medians.
+fn aba_both(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    baseline: &Prepared,
+    variant: &Prepared,
+) -> [(f32, f32, f32); 2] {
+    let gpu_ms = |p: &Prepared| {
+        p.dispatch(device, queue);
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let mut t: Vec<f32> =
+            (0..7).map(|_| p.dispatch_timed(device, queue).expect("timestamps").total()).collect();
+        median(&mut t)
+    };
+    [compare_aba(device, queue, baseline, variant), aba(baseline, variant, gpu_ms)]
+}
+
+/// One bench row, and what B adds over the mean of its bracketing A readings,
+/// on the wall clock and the GPU's.
+fn row_text(r: [(f32, f32, f32); 2]) -> (String, f32, f32) {
+    let added = |(a1, b, a2): (f32, f32, f32)| b - (a1 + a2) * 0.5;
+    let [(a1, b, a2), (g1, gb, g2)] = r;
+    let text = format!(
+        "wall {b:6.2} ms vs {a1:.2}/{a2:.2} (drift {:.2}) = {:+6.2} ms | \
+         gpu {gb:6.2} ms vs {g1:.2}/{g2:.2} (drift {:.2}) = {:+6.2} ms",
+        (a1 - a2).abs(),
+        added(r[0]),
+        (g1 - g2).abs(),
+        added(r[1]),
+    );
+    (text, added(r[0]), added(r[1]))
 }
 
 /// What composing rigid bodies costs, and so how many the frame can afford.
@@ -698,9 +732,20 @@ fn bench_bodies(eye: Vec3, ahead: f32) -> Vec<bevox_core::body::Body> {
 /// ray that traverses it from what it costs a ray that never comes near it,
 /// which is the question a bounding-volume rejection test would answer.
 ///
+/// Another puts sixteen tight bodies where the visible ones are: the same
+/// 16-voxel cube, but filling a 16-voxel volume instead of sitting in a 64 one,
+/// so no ray enters a body's box and misses its voxels. Also not in the slope.
+///
+/// Every row runs under each combination of the two body rejections --
+/// neither, `CULL_BODIES`, `BODY_RECT`, both -- on top of `DEFAULT` with both
+/// removed, and each combination's image is asserted identical to neither's.
+/// Each 16-body row then measures every rejection A/B/A directly against
+/// neither on the same bodies, so a rejection's gain is read from one
+/// comparison rather than from the difference of two.
+///
 /// Run with `cargo test --release -p bevox_render --test gpu_bench bodies --
-/// --ignored --nocapture`. `MAX_BODIES` in `bevox_render::pipeline` is set from
-/// its output.
+/// --ignored --nocapture`. `MAX_BODIES` in `bevox_render::pipeline` and
+/// `march_flags::DEFAULT` are set from its output.
 #[test]
 #[ignore]
 fn bodies_are_measured_against_none() {
@@ -716,79 +761,118 @@ fn bodies_are_measured_against_none() {
     let (tree, extent) = bench_scene();
     let (eye, offset_from_clip) = bench_camera(extent);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
-    let (ahead, behind) = (bench_bodies(eye, 120.0), bench_bodies(eye, -120.0));
-    let make = |bodies: &[bevox_core::body::Body]| {
+    // The cube spans 25..41 of its 64 volume, so its middle is local 33.
+    let loose = body_cube();
+    let mut dense = bevox_core::dense::DenseVolume::new(16).expect("16 is a volume extent");
+    for z in 0..16 {
+        for y in 0..16 {
+            for x in 0..16 {
+                dense.set(UVec3::new(x, y, z), MaterialId(1));
+            }
+        }
+    }
+    let tight = dense.into_contree();
+    let ahead = bench_bodies(eye, 120.0, &loose, 33.0);
+    let behind = bench_bodies(eye, -120.0, &loose, 33.0);
+    let tight_ahead = bench_bodies(eye, 120.0, &tight, 8.0);
+
+    let base = march_flags::DEFAULT & !(march_flags::CULL_BODIES | march_flags::BODY_RECT);
+    let combos = [
+        ("neither", base),
+        ("cull", base | march_flags::CULL_BODIES),
+        ("rect", base | march_flags::BODY_RECT),
+        ("both", base | march_flags::CULL_BODIES | march_flags::BODY_RECT),
+    ];
+    let make = |flags: u32, bodies: &[bevox_core::body::Body]| {
         Prepared::new(
-            &device, &shader, "march", &tree, offset_from_clip, eye, 1280, 720,
-            march_flags::DEFAULT, bodies,
+            &device, &shader, "march", &tree, offset_from_clip, eye, 1280, 720, flags, bodies,
         )
     };
-    // Median of seven GPU readings, after one untimed dispatch.
-    let gpu_ms = |p: &Prepared| {
-        p.dispatch(&device, &queue);
-        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-        let mut t: Vec<f32> =
-            (0..7).map(|_| p.dispatch_timed(&device, &queue).expect("timestamps").total()).collect();
-        median(&mut t)
-    };
 
-    let baseline = make(&[]);
+    let baseline = make(base, &[]);
     let empty_image = baseline.read_back(&device, &queue);
 
-    println!("scene: extent {extent}, 1280x720, bench camera, flags DEFAULT, 16-voxel cube bodies");
+    println!(
+        "scene: extent {extent}, 1280x720, bench camera, flags DEFAULT without CULL_BODIES and \
+         BODY_RECT ({base}) plus each combination; loose = 16-voxel cube in a 64 volume, tight = \
+         16-voxel cube filling a 16 volume"
+    );
     let mut previous_coverage = 0;
     let (mut statics, mut gpu_statics) = (Vec::new(), Vec::new());
-    let mut points = Vec::new();
-    for (n, visible) in [(0usize, true), (1, true), (4, true), (16, true), (16, false)] {
-        let variant = make(&(if visible { &ahead } else { &behind })[..n]);
-        let coverage = empty_image
-            .chunks(4)
-            .zip(variant.read_back(&device, &queue).chunks(4))
-            .filter(|(a, b)| a != b)
-            .count();
+    // Per combination: (count, wall added, gpu added) for each visible loose row.
+    let mut points = vec![Vec::new(); combos.len()];
+    for (label, bodies, visible, in_slope) in [
+        ("0 bodies", &ahead[..0], true, true),
+        ("1 body", &ahead[..1], true, true),
+        ("4 bodies", &ahead[..4], true, true),
+        ("16 bodies", &ahead[..], true, true),
+        ("16 behind the camera", &behind[..], false, false),
+        ("16 tight", &tight_ahead[..], true, false),
+    ] {
+        let variants: Vec<Prepared> = combos.iter().map(|&(_, f)| make(f, bodies)).collect();
+        let image = variants[0].read_back(&device, &queue);
+        for ((name, _), v) in combos.iter().zip(&variants).skip(1) {
+            assert!(v.read_back(&device, &queue) == image, "{label}: {name} changed the image");
+        }
+        let coverage =
+            empty_image.chunks(4).zip(image.chunks(4)).filter(|(a, b)| a != b).count();
         assert!(
-            if n == 0 || !visible { coverage == 0 } else { coverage > previous_coverage },
-            "{n} bodies (visible: {visible}) changed {coverage} pixels after {previous_coverage}"
+            match (bodies.is_empty() || !visible, in_slope) {
+                (true, _) => coverage == 0,
+                (false, true) => coverage > previous_coverage,
+                (false, false) => coverage > 0,
+            },
+            "{label} changed {coverage} pixels after {previous_coverage}"
         );
-        previous_coverage = coverage;
+        if in_slope {
+            previous_coverage = coverage;
+        }
 
-        let (a1, b, a2) = compare_aba(&device, &queue, &baseline, &variant);
-        let (g1, gb, g2) = aba(&baseline, &variant, gpu_ms);
-        let (wall, gpu) = (b - (a1 + a2) * 0.5, gb - (g1 + g2) * 0.5);
-        println!(
-            "{n:>2} bodies{}: wall {b:6.2} ms vs {a1:.2}/{a2:.2} (drift {:.2}) = {wall:+6.2} ms | \
-             gpu {gb:6.2} ms vs {g1:.2}/{g2:.2} (drift {:.2}) = {gpu:+6.2} ms | {coverage:>6} px changed",
-            if visible { "" } else { " behind the camera" },
-            (a1 - a2).abs(),
-            (g1 - g2).abs(),
-        );
-        assert!(b > 0.0 && gb > 0.0, "{n} bodies: the timer returned nothing");
-        statics.extend([a1, a2]);
-        gpu_statics.extend([g1, g2]);
-        if visible {
-            points.push((n as f32, wall, gpu));
+        for (((name, flags), v), points) in combos.iter().zip(&variants).zip(&mut points) {
+            // The cull must drop exactly the bodies behind the camera, or this
+            // row times something other than what it is labelled.
+            let culled = flags & march_flags::CULL_BODIES != 0 && !visible;
+            assert_eq!(v.body_count as usize, if culled { 0 } else { bodies.len() }, "{label} {name}");
+
+            let r = aba_both(&device, &queue, &baseline, v);
+            let (text, wall, gpu) = row_text(r);
+            println!("{label:>20} {name:>7}: {text} | {coverage:>6} px changed, {} marched", v.body_count);
+            assert!(r[0].1 > 0.0 && r[1].1 > 0.0, "{label} {name}: the timer returned nothing");
+            statics.extend([r[0].0, r[0].2]);
+            gpu_statics.extend([r[1].0, r[1].2]);
+            if in_slope {
+                points.push((bodies.len() as f32, wall, gpu));
+            }
+        }
+        if bodies.len() == 16 {
+            for ((name, _), v) in combos.iter().zip(&variants).skip(1) {
+                let (text, ..) = row_text(aba_both(&device, &queue, &variants[0], v));
+                println!("{label:>20} {name:>7} against neither: {text}");
+            }
         }
     }
 
     // Least-squares slope of the added cost against the body count.
-    let slope = |pick: fn(&(f32, f32, f32)) -> f32| {
+    let slope = |points: &[(f32, f32, f32)], pick: fn(&(f32, f32, f32)) -> f32| {
         let mean_n = points.iter().map(|p| p.0).sum::<f32>() / points.len() as f32;
         let mean_y = points.iter().map(pick).sum::<f32>() / points.len() as f32;
         let covariance: f32 = points.iter().map(|p| (p.0 - mean_n) * (pick(p) - mean_y)).sum();
         let variance: f32 = points.iter().map(|p| (p.0 - mean_n).powi(2)).sum();
         covariance / variance
     };
-    let (per_body, gpu_per_body) = (slope(|p| p.1), slope(|p| p.2));
     let static_wall = median(&mut statics);
     let static_gpu = median(&mut gpu_statics);
-    println!(
-        "static world: wall {static_wall:.2} ms, gpu {static_gpu:.2} ms\n\
-         per body (slope over 0/1/4/16): wall {per_body:.3} ms = {:.1}% of the static march, \
-         gpu {gpu_per_body:.3} ms = {:.1}%\n\
-         bodies that fit a 16.7 ms frame beside the static world: wall {:.1}, gpu {:.1}",
-        per_body / static_wall * 100.0,
-        gpu_per_body / static_gpu * 100.0,
-        (16.7 - static_wall) / per_body,
-        (16.7 - static_gpu) / gpu_per_body,
-    );
+    println!("static world: wall {static_wall:.2} ms, gpu {static_gpu:.2} ms");
+    for ((name, _), points) in combos.iter().zip(&points) {
+        let (per_body, gpu_per_body) = (slope(points, |p| p.1), slope(points, |p| p.2));
+        println!(
+            "{name:>7}: per visible body (slope over 0/1/4/16): wall {per_body:.3} ms = {:.1}% of \
+             the static march, gpu {gpu_per_body:.3} ms = {:.1}%; bodies that fit a 16.7 ms frame \
+             beside the static world: wall {:.1}, gpu {:.1}",
+            per_body / static_wall * 100.0,
+            gpu_per_body / static_gpu * 100.0,
+            (16.7 - static_wall) / per_body,
+            (16.7 - static_gpu) / gpu_per_body,
+        );
+    }
 }
