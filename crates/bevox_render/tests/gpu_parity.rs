@@ -40,10 +40,12 @@ fn parity_scene() -> Contree {
 
 
 
-/// Same ray construction the shader performs, so both sides march the same rays.
+/// Same ray construction the shader performs, operation for operation, so both
+/// sides march the same rays bit for bit: the pixel centre as an exact integer
+/// times an explicit reciprocal.
 fn ray_direction(world_from_clip: Mat4, eye: Vec3, x: u32, y: u32, w: u32, h: u32) -> Vec3 {
-    let ndc_x = (x as f32 + 0.5) / w as f32 * 2.0 - 1.0;
-    let ndc_y = 1.0 - (y as f32 + 0.5) / h as f32 * 2.0;
+    let ndc_x = ((2 * x + 1) as f32 - w as f32) * (1.0 / w as f32);
+    let ndc_y = (h as f32 - (2 * y + 1) as f32) * (1.0 / h as f32);
     let far = world_from_clip * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
     (far.truncate() / far.w - eye).normalize()
 }

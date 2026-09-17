@@ -351,10 +351,11 @@ mod tests {
                 let mut inside = 0;
                 for y in 0..size.y {
                     for x in 0..size.x {
+                        // As `primary_ray` builds it, operation for operation.
                         let ndc = Vec2::new(
-                            (x as f32 + 0.5) / size.x as f32 * 2.0 - 1.0,
-                            1.0 - (y as f32 + 0.5) / size.y as f32 * 2.0,
-                        );
+                            (2 * x + 1) as f32 - size.x as f32,
+                            size.y as f32 - (2 * y + 1) as f32,
+                        ) * (Vec2::ONE / size.as_vec2());
                         let far = world_from_clip * Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
                         let dir = (far.xyz() / far.w - eye).normalize();
                         // Slab test in the body's frame.

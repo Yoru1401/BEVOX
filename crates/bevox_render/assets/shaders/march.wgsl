@@ -148,10 +148,12 @@ struct Frame {
     // so it has nothing to remember.
     visited_lo: u32,
     visited_hi: u32,
-    // DDA resume point: the cell last descended into and its entry distance.
-    // Storing the cursor rather than the whole DDA state keeps the frame small,
-    // at the cost of recomputing three boundary distances on re-entry. A frame
-    // twelve words wider would cost occupancy, which is the thing being bought.
+    // DDA resume point, packed by `pack_cursor`: the cell the ray was in at the
+    // distance last descended at, the tie state there and the child descended
+    // into; and that distance. Storing the cursor rather than the whole DDA
+    // state keeps the frame small, at the cost of recomputing three boundary
+    // distances on re-entry. A frame twelve words wider would cost occupancy,
+    // which is the thing being bought.
     cursor: u32,
     cursor_t: f32,
 };
@@ -182,12 +184,75 @@ fn cell_exit(t: vec3<f32>) -> f32 {
 /// The next cell along, stepping every axis whose exit plane is reached at the
 /// same distance.
 ///
-/// At an exact corner or edge crossing, stepping one axis at a time lands in a
-/// cell the ray only touches and reaches the diagonal neighbour a step later.
-/// Moving diagonally is both cheaper (no branches) and closer to what the ray
-/// does; no test distinguishes the two, so this is robustness, not a fix.
+/// At an exact corner or edge crossing this moves diagonally, into the cell the
+/// ray goes on through. The cells it only touches there are not skipped:
+/// `touched_child` visits them, because the scan path and the CPU reference
+/// count a touch as a crossing.
 fn step_cell(cell: vec3<i32>, t: vec3<f32>, t_out: f32, stepv: vec3<i32>) -> vec3<i32> {
     return cell + select(vec3<i32>(0), stepv, t == vec3<f32>(t_out));
+}
+
+/// Axes whose exit plane is reached at `t_out`, as bits x = 1, y = 2, z = 4.
+fn axis_bits(hit: vec3<bool>) -> u32 {
+    return select(0u, 1u, hit.x) | select(0u, 2u, hit.y) | select(0u, 4u, hit.z);
+}
+
+fn in_node(c: vec3<i32>) -> bool {
+    return all(c >= vec3<i32>(0)) && all(c <= vec3<i32>(3));
+}
+
+/// Tie state for DDA: bits 0-2 are the axes whose planes into the current cell
+/// the ray crosses at exactly the current distance, and bit 3 marks a frame's
+/// entry, where the cell behind across all of them is touched too.
+const TIE_ENTRY: u32 = 8u;
+
+/// The occupied child the scan path would take next among the cells the ray
+/// touches at the distance it enters `cell`, or CHILDREN for none. Children
+/// with an index below `after` were already descended into.
+///
+/// The scan and the CPU reference take every child whose slab the ray touches,
+/// nearest first and, at equal distance, lowest index first. At an exact edge
+/// or corner crossing several children share that distance: `cell` and, for
+/// each subset of the tied axes, the cell behind it across those planes, which
+/// the ray only grazes. Behind across all of them is the cell the ray came from,
+/// entered earlier -- except on entering a frame, where it is grazed too.
+fn touched_child(node: vec4<u32>, cell: vec3<i32>, stepv: vec3<i32>, ties: u32, after: u32) -> u32 {
+    let axes = ties & 7u;
+    if axes == 0u {
+        // No tie: only the cell entered. The common case, kept to one test.
+        if in_node(cell) {
+            let i = index_of_cell(cell);
+            if i >= after && has_child(node, i) { return i; }
+        }
+        return CHILDREN;
+    }
+    var best = CHILDREN;
+    for (var s = 0u; s < 8u; s = s + 1u) {
+        if (s & axes) != s || (s == axes && (ties & TIE_ENTRY) == 0u) { continue; }
+        let back = vec3<i32>(i32(s & 1u), i32((s >> 1u) & 1u), i32((s >> 2u) & 1u));
+        let c = cell - stepv * back;
+        if !in_node(c) { continue; }
+        let i = index_of_cell(c);
+        if i < after || i >= best || !has_child(node, i) { continue; }
+        best = i;
+    }
+    return best;
+}
+
+/// Packs a DDA resume point. The cell may lie one outside the node on any axis
+/// -- a crossing out of the node can still graze a cell inside it -- so each
+/// coordinate is stored offset by one, in three bits.
+fn pack_cursor(cell: vec3<i32>, ties: u32, after: u32) -> u32 {
+    let c = vec3<u32>(cell + vec3<i32>(1));
+    return c.x | (c.y << 3u) | (c.z << 6u) | (ties << 9u) | (after << 13u);
+}
+
+fn cursor_cell(cursor: u32) -> vec3<i32> {
+    return vec3<i32>(
+        i32(cursor & 7u),
+        i32((cursor >> 3u) & 7u),
+        i32((cursor >> 6u) & 7u),
+    ) - vec3<i32>(1);
 }
 
 fn index_of_cell(c: vec3<i32>) -> u32 {
@@ -259,8 +324,15 @@ fn entry_normal(origin: vec3<f32>, inv_dir: vec3<f32>, lo: vec3<f32>, hi: vec3<f
 /// The static world is this with both bases zero. A body's root sits at
 /// `node_base` and its arena slot n at `node_base + 1 + n`, which is the same
 /// root-first layout the static world uses, just offset.
+///
+/// `t_start` is where along the ray the walk begins, from `origin` itself: a
+/// seed that proved the space before it empty. Every distance is still measured
+/// from `origin`, so each plane is reached at the same float distance with or
+/// without the seed. A walk from an origin moved to the seed point rounds those
+/// distances differently, and where a ray crosses a voxel edge exactly that
+/// picked a different voxel.
 fn traverse_at(
-    origin: vec3<f32>, dir: vec3<f32>, max_dist: f32,
+    origin: vec3<f32>, dir: vec3<f32>, t_start: f32, max_dist: f32,
     node_base: u32, voxel_base: u32, depth: u32, extent: u32,
 ) -> Hit {
     // Float division by zero yields infinity in WGSL, which is exactly what the
@@ -269,7 +341,7 @@ fn traverse_at(
     let inv_dir = vec3<f32>(1.0) / dir;
 
     let root_slab = ray_box(origin, inv_dir, vec3<f32>(0.0), vec3<f32>(f32(extent)));
-    if !root_slab.hit {
+    if !root_slab.hit || t_start > root_slab.t_exit {
         return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0), false);
     }
 
@@ -282,7 +354,7 @@ fn traverse_at(
         nodes[node_base],
         vec3<u32>(0u),
         depth - 1u,
-        max(root_slab.t_enter, 0.0),
+        max(root_slab.t_enter, t_start),
         root_slab.t_exit,
         0u,
         0u,
@@ -382,8 +454,12 @@ fn traverse_at(
                 select(-1, 1, dir.z > 0.0),
             );
 
+            // `cell` is the cell the ray is in just after `t_cur`; `ties` and
+            // `after` say which cells it touches at `t_cur` are still to visit.
             var cell: vec3<i32>;
             var t_cur: f32;
+            var ties: u32;
+            var after: u32;
             if frame.cursor == NO_CURSOR {
                 t_cur = frame.t_enter;
                 let p = origin + dir * t_cur;
@@ -392,12 +468,16 @@ fn traverse_at(
                     vec3<i32>(0),
                     vec3<i32>(3),
                 );
+                // Entering exactly on an inner plane grazes the cell behind it.
+                let near = node_lo + vec3<f32>(cell + max(-stepv, vec3<i32>(0))) * cell_size;
+                ties = axis_bits((near - origin) * inv_dir == vec3<f32>(t_cur)) | TIE_ENTRY;
+                after = 0u;
             } else {
-                // Resuming: step past the cell already descended into.
-                let resume = cell_of_index(frame.cursor);
-                let tm = cell_exits(origin, dir, inv_dir, node_lo, cell_size, resume, stepv);
-                t_cur = cell_exit(tm);
-                cell = step_cell(resume, tm, t_cur, stepv);
+                // Resuming at the distance last descended at, past that child.
+                cell = cursor_cell(frame.cursor);
+                ties = (frame.cursor >> 9u) & 15u;
+                after = (frame.cursor >> 13u) & 127u;
+                t_cur = frame.cursor_t;
             }
 
             // A ray crosses at most a handful of cells in a 4x4x4 grid; the
@@ -406,24 +486,33 @@ fn traverse_at(
             loop {
                 guard = guard + 1u;
                 if guard > CHILDREN { break; }
-                if cell.x < 0 || cell.y < 0 || cell.z < 0
-                    || cell.x > 3 || cell.y > 3 || cell.z > 3 { break; }
                 if t_cur > frame.t_exit || t_cur > max_dist { break; }
 
-                let i = index_of_cell(cell);
-                let tm = cell_exits(origin, dir, inv_dir, node_lo, cell_size, cell, stepv);
-                let t_out = cell_exit(tm);
-
-                if has_child(frame.node, i) {
+                let i = touched_child(frame.node, cell, stepv, ties, after);
+                if i != CHILDREN {
+                    let child_cell = cell_of_index(i);
                     best_i = i;
                     best_t = max(t_cur, frame.t_enter);
-                    best_exit = min(t_out, frame.t_exit);
-                    best_origin = frame.origin + vec3<u32>(cell) * step_size;
-                    stack[sp].cursor = i;
+                    if all(child_cell == cell) {
+                        let tm = cell_exits(origin, dir, inv_dir, node_lo, cell_size, cell, stepv);
+                        best_exit = min(cell_exit(tm), frame.t_exit);
+                    } else {
+                        // Only grazed: its slab ends where it begins.
+                        best_exit = min(t_cur, frame.t_exit);
+                    }
+                    best_origin = frame.origin + vec3<u32>(child_cell) * step_size;
+                    stack[sp].cursor = pack_cursor(cell, ties, i + 1u);
                     stack[sp].cursor_t = t_cur;
                     break;
                 }
 
+                if !in_node(cell) { break; }
+                let tm = cell_exits(origin, dir, inv_dir, node_lo, cell_size, cell, stepv);
+                let t_out = cell_exit(tm);
+                let crossed = axis_bits(tm == vec3<f32>(t_out));
+                // One plane crossed grazes nothing new: behind it is this cell.
+                ties = select(0u, crossed, countOneBits(crossed) > 1u);
+                after = 0u;
                 t_cur = t_out;
                 cell = step_cell(cell, tm, t_out, stepv);
             }
@@ -466,9 +555,25 @@ fn traverse_at(
         // the filter would erase it from the scene.
         if flag_enabled(FLAG_MASK_FILTER) && is_subdivided(child) {
             let child_cell_size = f32(step_size) * 0.25;
+            let child_lo = vec3<f32>(best_origin);
             let point = origin + dir * best_t;
+            let entered = clamp(
+                vec3<i32>(floor((point - child_lo) / child_cell_size)),
+                vec3<i32>(0),
+                vec3<i32>(3),
+            );
+            // Entering exactly on an inner plane grazes the cell behind it, as
+            // DDA's entry does: ask from that cell, which reaches everything the
+            // one ahead does and itself, or the grazed voxel is filtered away.
+            let stepv = vec3<i32>(
+                select(-1, 1, dir.x > 0.0),
+                select(-1, 1, dir.y > 0.0),
+                select(-1, 1, dir.z > 0.0),
+            );
+            let near = child_lo + vec3<f32>(entered + max(-stepv, vec3<i32>(0))) * child_cell_size;
+            let grazed = (near - origin) * inv_dir == vec3<f32>(best_t);
             let cell = clamp(
-                vec3<i32>(floor((point - vec3<f32>(best_origin)) / child_cell_size)),
+                entered - select(vec3<i32>(0), stepv, grazed),
                 vec3<i32>(0),
                 vec3<i32>(3),
             );
@@ -499,8 +604,8 @@ fn traverse_at(
 /// The static world, at its fixed place in the shared buffers. Every existing
 /// call site and every parity test is pinned to this function, so it must stay
 /// exactly what it was before bodies existed.
-fn traverse(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> Hit {
-    return traverse_at(origin, dir, max_dist, 0u, 0u, view.volume_params.x, view.volume_params.y);
+fn traverse(origin: vec3<f32>, dir: vec3<f32>, t_start: f32, max_dist: f32) -> Hit {
+    return traverse_at(origin, dir, t_start, max_dist, 0u, 0u, view.volume_params.x, view.volume_params.y);
 }
 
 /// The nearest of the static world's hit and every body's.
@@ -534,7 +639,7 @@ fn compose_bodies(origin: vec3<f32>, dir: vec3<f32>, world_hit: Hit, max_dist: f
         let local_origin = (b.local_from_world * vec4<f32>(origin, 1.0)).xyz;
         let local_dir = (b.local_from_world * vec4<f32>(dir, 0.0)).xyz;
 
-        let h = traverse_at(local_origin, local_dir, limit, b.node_base, b.voxel_base, b.depth, b.extent);
+        let h = traverse_at(local_origin, local_dir, 0.0, limit, b.node_base, b.voxel_base, b.depth, b.extent);
         if h.hit && h.t < limit {
             best = h;
             best.face_normal = (b.rotation * vec4<f32>(h.face_normal, 0.0)).xyz;
@@ -620,10 +725,15 @@ fn max_ray_distance() -> f32 {
 
 /// Ray direction for a pixel. Shared so both entry points march identical rays.
 fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
+    // (2 * id + 1 - size) / size: the pixel centre in [-1, 1]. An exact integer
+    // difference times an explicit reciprocal, so no compiler can reorder it.
+    // Written as `(id + 0.5) / size * 2 - 1`, the GPU driver divided by
+    // multiplying with the rounded reciprocal and landed 2 ulp from the CPU
+    // mirror's true division, which moved a ray across a voxel edge.
     let ndc = vec2<f32>(
-        (f32(id.x) + 0.5) / f32(size.x) * 2.0 - 1.0,
-        1.0 - (f32(id.y) + 0.5) / f32(size.y) * 2.0,
-    );
+        f32(2u * id.x + 1u) - f32(size.x),
+        f32(size.y) - f32(2u * id.y + 1u),
+    ) * (vec2<f32>(1.0) / vec2<f32>(size));
     let far = view.world_from_clip * vec4<f32>(ndc, 1.0, 1.0);
     return normalize(far.xyz / far.w - view.camera_position.xyz);
 }
@@ -699,7 +809,7 @@ fn traverse_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
     if flag_enabled(FLAG_DISTANCE_FIELD) {
         t_seed = skip_empty_space(origin, dir, vec3<f32>(1.0) / dir, 0.0, max_dist);
     }
-    return traverse(origin + dir * t_seed, dir, max_dist - t_seed).hit;
+    return traverse(origin, dir, t_seed, max_dist).hit;
 }
 
 fn beam_dims(size: vec2<u32>) -> vec2<u32> {
@@ -728,7 +838,7 @@ fn beam_prepass(@builtin(global_invocation_id) id: vec3<u32>) {
     let bd = beam_dims(textureDimensions(output));
     if id.x >= bd.x || id.y >= bd.y { return; }
 
-    let hit = traverse(view.camera_position.xyz, primary_ray(id, bd), max_ray_distance());
+    let hit = traverse(view.camera_position.xyz, primary_ray(id, bd), 0.0, max_ray_distance());
     let cap = beam_safe_distance(bd);
     var seed = cap;
     if hit.hit {
@@ -757,9 +867,9 @@ fn beam_seed(id: vec3<u32>, size: vec2<u32>) -> f32 {
 
 /// The camera ray for this pixel, started wherever the prepass proved empty.
 ///
-/// The seed offsets the ray origin rather than being threaded into `traverse`
-/// as a start parameter. `traverse` is the function every parity test pins;
-/// a seed inside it would put the optimisation within the thing being verified.
+/// The seed is where the walk starts, not a new origin: `traverse_at` says why.
+/// A seed of zero is the unseeded walk exactly, which is what every parity test
+/// pins.
 fn primary_hit(id: vec3<u32>, size: vec2<u32>) -> Hit {
     let dir = primary_ray(id, size);
     var t_seed = 0.0;
@@ -769,10 +879,7 @@ fn primary_hit(id: vec3<u32>, size: vec2<u32>) -> Hit {
     if flag_enabled(FLAG_DISTANCE_FIELD) {
         t_seed = skip_empty_space(view.camera_position.xyz, dir, vec3<f32>(1.0) / dir, t_seed, max_ray_distance());
     }
-    let origin = view.camera_position.xyz + dir * t_seed;
-    var hit = traverse(origin, dir, max_ray_distance() - t_seed);
-    // Measured from the offset origin; callers want it absolute.
-    hit.t = hit.t + t_seed;
+    var hit = traverse(view.camera_position.xyz, dir, t_seed, max_ray_distance());
     if flag_enabled(FLAG_BODIES) {
         // From the camera over the whole ray, not from the seeded origin. The
         // beam seed and the distance-field skip are static-world accelerators:
