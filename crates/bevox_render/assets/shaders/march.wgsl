@@ -217,27 +217,46 @@ const TIE_ENTRY: u32 = 8u;
 /// each subset of the tied axes, the cell behind it across those planes, which
 /// the ray only grazes. Behind across all of them is the cell the ray came from,
 /// entered earlier -- except on entering a frame, where it is grazed too.
+///
+/// Those cells are a box, one or two coordinates per axis, so they are built as
+/// a 64-bit child mask and the lowest set bit left after the node's mask and
+/// `after` is the answer. No loop and no branch per cell, on purpose: written as
+/// a loop over the subsets of the tied axes, this function slowed the GTX 1650
+/// driver's code for the whole traversal -- the scan path, which never calls it,
+/// went from 38 to 57 ms at 1280x720, and DDA from 13 to 18. Unrolling that loop
+/// was slower still. Rare as ties are, the size of this code is what costs.
 fn touched_child(node: vec4<u32>, cell: vec3<i32>, stepv: vec3<i32>, ties: u32, after: u32) -> u32 {
-    let axes = ties & 7u;
-    if axes == 0u {
-        // No tie: only the cell entered. The common case, kept to one test.
-        if in_node(cell) {
-            let i = index_of_cell(cell);
-            if i >= after && has_child(node, i) { return i; }
-        }
-        return CHILDREN;
+    let tied = (vec3<u32>(ties) & vec3<u32>(1u, 2u, 4u)) != vec3<u32>(0u);
+    let xs = coord_bit(cell.x) | select(0u, coord_bit(cell.x - stepv.x), tied.x);
+    let ys = coord_bit(cell.y) | select(0u, coord_bit(cell.y - stepv.y), tied.y);
+    let zs = coord_bit(cell.z) | select(0u, coord_bit(cell.z - stepv.z), tied.z);
+    // Index x + 4y + 16z: rows of x replicated at each y, planes at each z.
+    let plane = xs * spread4(ys);
+    var lo = select(0u, plane, (zs & 1u) != 0u) | select(0u, plane << 16u, (zs & 2u) != 0u);
+    var hi = select(0u, plane, (zs & 4u) != 0u) | select(0u, plane << 16u, (zs & 8u) != 0u);
+    let came_from = cell - stepv * vec3<i32>(tied);
+    if (ties & 7u) != 0u && (ties & TIE_ENTRY) == 0u && in_node(came_from) {
+        let i = index_of_cell(came_from);
+        if i < 32u { lo = lo & ~(1u << i); } else { hi = hi & ~(1u << (i - 32u)); }
     }
-    var best = CHILDREN;
-    for (var s = 0u; s < 8u; s = s + 1u) {
-        if (s & axes) != s || (s == axes && (ties & TIE_ENTRY) == 0u) { continue; }
-        let back = vec3<i32>(i32(s & 1u), i32((s >> 1u) & 1u), i32((s >> 2u) & 1u));
-        let c = cell - stepv * back;
-        if !in_node(c) { continue; }
-        let i = index_of_cell(c);
-        if i < after || i >= best || !has_child(node, i) { continue; }
-        best = i;
-    }
-    return best;
+    // Indices from `after` up. Shift amounts are masked and the arms selected,
+    // because `select` evaluates both and a shift of 32 or more is invalid.
+    lo = lo & node_mask_lo(node) & select(0u, ~0u << (after & 31u), after < 32u);
+    hi = hi & node_mask_hi(node)
+        & select(select(0u, ~0u << ((after - 32u) & 31u), after < 64u), ~0u, after < 32u);
+    if lo != 0u { return firstTrailingBit(lo); }
+    if hi != 0u { return 32u + firstTrailingBit(hi); }
+    return CHILDREN;
+}
+
+/// One bit for which of a node's coordinates 0..3 `c` is, or 0 outside them.
+fn coord_bit(c: i32) -> u32 {
+    return ((1u << u32(clamp(c + 1, 0, 5))) >> 1u) & 15u;
+}
+
+/// A 4-bit coordinate set, bit k moved to bit 4k.
+fn spread4(b: u32) -> u32 {
+    return (b & 1u) | ((b & 2u) << 3u) | ((b & 4u) << 6u) | ((b & 8u) << 9u);
 }
 
 /// Packs a DDA resume point. The cell may lie one outside the node on any axis
