@@ -7,7 +7,7 @@
 
 use crate::contree::Contree;
 use crate::march::{Hit, MarchStats, march};
-use glam::{Affine3A, Quat, Vec3};
+use glam::{Affine3A, Quat, UVec3, Vec3};
 
 /// A voxel volume placed in the world by a rigid transform.
 #[derive(Clone, Debug)]
@@ -54,6 +54,53 @@ impl Body {
         stats: &mut MarchStats,
     ) -> Option<Hit> {
         march(&self.volume, self.world_from_local(), origin, dir, max_dist, false, stats)
+    }
+}
+
+/// The tightest box holding a volume's geometry, in its own voxel coordinates:
+/// minimum inclusive, maximum exclusive. `None` for an empty volume.
+///
+/// Node-granular: it stops at the first node that is uniform or no larger than
+/// a brick, so it can be up to one brick loose per side. That is conservative,
+/// which is the only direction a cull may err in, and tight enough that a small
+/// body is not bounded as its whole volume.
+pub fn occupied_bounds(tree: &Contree) -> Option<(UVec3, UVec3)> {
+    let mut lo = UVec3::splat(u32::MAX);
+    let mut hi = UVec3::ZERO;
+    let mut any = false;
+    grow_bounds(tree, tree.root(), tree.depth() - 1, UVec3::ZERO, &mut lo, &mut hi, &mut any);
+    any.then_some((lo, hi))
+}
+
+fn grow_bounds(
+    tree: &Contree,
+    node: crate::node::Node,
+    level: u32,
+    origin: UVec3,
+    lo: &mut UVec3,
+    hi: &mut UVec3,
+    any: &mut bool,
+) {
+    if node.is_empty() {
+        return;
+    }
+    let extent = crate::contree::level_extent(level);
+    // A brick-sized or uniform node takes its whole box. Level 0 is a brick, so
+    // this also stops the walk before voxel children, which live in another
+    // arena and have no `Node` to recurse on.
+    if level == 0 || !node.is_subdivided() {
+        *lo = lo.min(origin);
+        *hi = hi.max(origin + UVec3::splat(extent));
+        *any = true;
+        return;
+    }
+    let step = crate::contree::level_extent(level - 1);
+    for i in 0..crate::node::CHILDREN {
+        if let Some(slot) = node.child_slot(i) {
+            // Inverse of child_index: x + y * 4 + z * 16.
+            let c = UVec3::new(i % 4, (i / 4) % 4, i / 16);
+            grow_bounds(tree, tree.arena().node(slot), level - 1, origin + c * step, lo, hi, any);
+        }
     }
 }
 
@@ -208,6 +255,60 @@ mod tests {
             "a unit direction came out of the transform with length {}",
             local.length()
         );
+    }
+
+    #[test]
+    fn an_empty_volume_has_no_bounds() {
+        assert_eq!(occupied_bounds(&Contree::empty(3)), None);
+    }
+
+    /// The bound must contain every occupied voxel. That is the whole promise:
+    /// a cull that trusts a bound missing a voxel removes a body that is on
+    /// screen, and the pixels change.
+    #[test]
+    fn the_bounds_contain_every_occupied_voxel() {
+        let mut rng = crate::testing::XorShift64::new(9_17);
+        let mut voxels = Vec::new();
+        for _ in 0..60 {
+            voxels.push((
+                UVec3::new(rng.next_below(64), rng.next_below(64), rng.next_below(64)),
+                MaterialId(1),
+            ));
+        }
+        let tree = Contree::from_voxels(64, &voxels);
+        let (lo, hi) = occupied_bounds(&tree).expect("the volume has voxels");
+        for (p, _) in &voxels {
+            assert!(
+                p.cmpge(lo).all() && p.cmplt(hi).all(),
+                "voxel {p:?} lies outside the bounds {lo:?}..{hi:?}"
+            );
+        }
+    }
+
+    /// Node-granular, so conservative by at most one brick (4 voxels) per side
+    /// -- and no looser, or a small body is bounded as a large one and the
+    /// rectangle cull stops helping.
+    ///
+    /// Builds its own cube rather than using `cube()`. That helper fills 24..40,
+    /// which is aligned to the brick grid and so collapses to uniform nodes whose
+    /// boxes happen to be exact -- it would not exercise the rounding at all.
+    /// 25..41 is deliberately off-grid, so the bound must round outward.
+    #[test]
+    fn the_bounds_are_tight_to_within_a_brick() {
+        let mut dense = DenseVolume::new(64).unwrap();
+        for z in 25..41 {
+            for y in 25..41 {
+                for x in 25..41 {
+                    dense.set(UVec3::new(x, y, z), MaterialId(1));
+                }
+            }
+        }
+        let tree = dense.into_contree();
+        let (lo, hi) = occupied_bounds(&tree).expect("the cube has voxels");
+        for axis in 0..3 {
+            assert!(lo[axis] <= 25 && lo[axis] + 4 > 25, "min {lo:?} is looser than a brick");
+            assert!(hi[axis] >= 41 && hi[axis] < 41 + 4, "max {hi:?} is looser than a brick");
+        }
     }
 
     /// The frames must point the way their names say. A ray march can hide a
