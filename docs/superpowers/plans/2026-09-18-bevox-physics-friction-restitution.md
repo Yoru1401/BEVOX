@@ -781,6 +781,43 @@ Tell Flori what to try: `cargo run -p bevox`, then `F` to drop cubes. A cube pus
 
 ---
 
+## Measurements
+
+2026-09-18, Intel Core i5-10400, release build:
+
+```
+16 bodies: falling 0.0071 ms/tick, resting 0.8394 ms/tick (median)
+```
+
+Against milestone 2's `0.0052` falling and `0.8074` resting, from a different
+process. That says friction and restitution did not change the cost by much; it
+does not say by how much, and no A/B/A was run because no comparison is claimed.
+
+**Tuning:** none of the plan's constants moved. Two things changed in the design
+instead, both because a gate caught them.
+
+- **The restitution pass is swept four times, not applied once** (new constant
+  `RESTITUTION_SWEEPS = 4`). With one sweep, each of a flat landing's four corner
+  contacts pushed the whole body to the bounce target on its own, so the body
+  left the floor faster than it arrived: apex 3.85 voxels where 0.8 restitution
+  over a 4-voxel drop predicts 2.56. Sweeping, with each contact allowed to give
+  impulse back down to what it carried before the bounce, converges to 2.56. The
+  break check that restores the single sweep reproduces 3.85 exactly.
+- **`RESTITUTION_THRESHOLD` was written, measured inert, and deleted.** The
+  reasoning for it is standard: slow contacts must not bounce, or a bouncy body
+  buzzes forever. It does not apply here, because a bounce is written against the
+  speed the body *arrived* with, and a body in sustained contact arrives at
+  nearly zero. Removing it changed no gate, including a new one that drops a
+  0.99-restitution body and watches it settle. Rather than keep a constant no
+  test could justify, it went, with a comment in `solver.rs` saying what would
+  bring it back.
+
+**One gate could not see what it named,** and this is recorded rather than
+patched over: `a_bouncy_body_still_settles` passes with or without the
+threshold. That is what prompted the near-elastic gate above, which also passes
+either way. Both gates are kept because they guard settling itself, which the
+sweep fix does affect.
+
 ## Milestone check
 
 A body slides to a stop on stone in the distance Coulomb friction predicts, keeps sliding on ice, bounces to about `e^2` of its drop height on rubber, and still settles rather than buzzing. Every gate is proven by a deliberate break.

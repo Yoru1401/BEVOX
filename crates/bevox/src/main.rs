@@ -279,6 +279,18 @@ fn demo_scene() -> (Contree, MaterialTable) {
             }
         }
     }
+    // A slippery strip and a bouncy patch in the floor's top layer, so a
+    // dropped body shows friction and restitution without any editing.
+    for z in 0..64 {
+        for x in 8..24 {
+            dense.set(UVec3::new(x, 5, z), MaterialId(3)); // ice
+        }
+    }
+    for z in 40..56 {
+        for x in 40..56 {
+            dense.set(UVec3::new(x, 5, z), MaterialId(4)); // rubber
+        }
+    }
     for z in 28..36 {
         for y in 6..26 {
             for x in 28..36 {
@@ -308,6 +320,20 @@ fn demo_scene() -> (Contree, MaterialTable) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The demo floor has an ice strip and a rubber patch, so dropping bodies
+    /// shows friction and bounce without editing anything.
+    #[test]
+    fn the_demo_scene_has_something_slippery_and_something_bouncy() {
+        let (tree, materials) = demo_scene();
+        let has = |m: MaterialId| {
+            (0..64).any(|x| (0..64).any(|z| tree.get(UVec3::new(x, 5, z)) == m))
+        };
+        assert!(has(MaterialId(3)), "no ice on the floor");
+        assert!(has(MaterialId(4)), "no rubber on the floor");
+        assert_eq!(materials.get(MaterialId(3)).friction, 4);
+        assert_eq!(materials.get(MaterialId(4)).restitution, 80);
+    }
 
     /// The system steps the scene's bodies, and a body leaving the world bumps
     /// the generation, because the packed buffers hold the body list.
