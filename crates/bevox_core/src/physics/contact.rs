@@ -678,17 +678,76 @@ mod tests {
         let lower = placed(cube(4, 4), centre, turn);
         let upper = placed(cube(4, 4), centre + turn * Vec3::new(0.0, 4.0, 0.0), turn);
         let contacts = detect_pair(&upper, &lower, &materials, 0.1);
-        let flat = detect_pair(
-            &placed(cube(4, 4), centre + Vec3::new(0.0, 4.0, 0.0), Quat::IDENTITY),
-            &placed(cube(4, 4), centre, Quat::IDENTITY),
-            &materials,
-            0.1,
-        );
-        assert_eq!(contacts.len(), flat.len(), "turning changed the contact count");
+        // The same twelve contacts as the flat pair, named by the same voxels.
+        assert_eq!(contacts.len(), 12, "{contacts:#?}");
+        for corner in [[0, 0, 0], [3, 0, 0], [0, 0, 3], [3, 0, 3]] {
+            assert!(
+                contacts.iter().any(|c| c.key.mine == corner),
+                "no contact at the upper cube's corner {corner:?}"
+            );
+        }
         for c in &contacts {
             assert!((c.normal - turn * Vec3::Y).length() < 1e-3, "normal {:?}", c.normal);
             assert!(c.separation.abs() < 1e-3, "separation {}", c.separation);
         }
+    }
+
+    /// A narrow pillar of a body standing on a wide one touches where the
+    /// pillar's bottom corner meets the flat top: the other body has no corner
+    /// there, so only this body's corners can find it. The mirror of the test
+    /// below, and between them they pin both corner loops: each alone would
+    /// still find every corner-to-corner touch, because both loops see those.
+    #[test]
+    fn a_corner_of_this_body_meets_a_face() {
+        let materials = materials();
+        let pillar_voxels: Vec<_> =
+            (0..4).map(|y| (UVec3::new(0, y, 0), MaterialId(1))).collect();
+        let pillar = placed(
+            Contree::from_voxels(4, &pillar_voxels),
+            Vec3::new(32.0, 14.0, 32.0),
+            Quat::IDENTITY,
+        );
+        let base = placed(cube(4, 4), Vec3::new(32.0, 10.0, 32.0), Quat::IDENTITY);
+        let contacts = detect_pair(&pillar, &base, &materials, 0.1);
+        assert_eq!(contacts.len(), 1, "{contacts:#?}");
+        let c = contacts[0];
+        assert_eq!(c.key.mine, [0, 0, 0], "the pillar touched with {:?}", c.key.mine);
+        assert!(
+            c.key.theirs[1] == 3 && c.key.theirs != [0, 3, 0],
+            "the base touched with a corner, so this proves nothing: {:?}",
+            c.key.theirs
+        );
+        assert!((c.normal - Vec3::Y).length() < TOLERANCE, "normal {:?}", c.normal);
+        assert!(c.separation.abs() < TOLERANCE, "separation {}", c.separation);
+    }
+
+    /// A body resting on a narrow pillar of a body touches it where the pillar's
+    /// top corner meets the flat underside: there is no corner of the upper body
+    /// at that point, so only the other body's corners can find it. The normal
+    /// still has to point up into the upper body.
+    #[test]
+    fn a_corner_of_the_other_body_meets_a_face() {
+        let materials = materials();
+        let pillar_voxels: Vec<_> =
+            (0..4).map(|y| (UVec3::new(0, y, 0), MaterialId(1))).collect();
+        let pillar = placed(
+            Contree::from_voxels(4, &pillar_voxels),
+            Vec3::new(32.0, 10.0, 32.0),
+            Quat::IDENTITY,
+        );
+        // Centred over the pillar, so its top meets the middle of the underside.
+        let top = placed(cube(4, 4), Vec3::new(32.0, 14.0, 32.0), Quat::IDENTITY);
+        let contacts = detect_pair(&top, &pillar, &materials, 0.1);
+        assert_eq!(contacts.len(), 1, "{contacts:#?}");
+        let c = contacts[0];
+        assert_eq!(c.key.theirs, [0, 3, 0], "the pillar touched with {:?}", c.key.theirs);
+        assert!(
+            c.key.mine[1] == 0 && c.key.mine != [0, 0, 0],
+            "the upper body touched with a corner, so this proves nothing: {:?}",
+            c.key.mine
+        );
+        assert!((c.normal - Vec3::Y).length() < TOLERANCE, "normal {:?}", c.normal);
+        assert!(c.separation.abs() < TOLERANCE, "separation {}", c.separation);
     }
 
     /// Bodies that do not overlap are not compared voxel by voxel.
