@@ -9,6 +9,7 @@
 //! Units are voxels and seconds.
 
 pub mod classify;
+pub mod contact;
 pub mod mass;
 
 use glam::Vec3;
@@ -67,6 +68,19 @@ pub(crate) mod fixtures {
         for z in 0..n {
             for y in 0..n {
                 for x in 0..n {
+                    voxels.push((UVec3::new(x, y, z), MaterialId(1)));
+                }
+            }
+        }
+        Contree::from_voxels(extent, &voxels)
+    }
+
+    /// A world whose layers `ys` are solid material 1 across the whole volume.
+    pub fn slab(extent: u32, ys: std::ops::Range<u32>) -> Contree {
+        let mut voxels = Vec::new();
+        for z in 0..extent {
+            for y in ys.clone() {
+                for x in 0..extent {
                     voxels.push((UVec3::new(x, y, z), MaterialId(1)));
                 }
             }

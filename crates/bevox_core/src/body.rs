@@ -9,8 +9,10 @@ use crate::contree::Contree;
 use crate::march::{Hit, MarchStats, march};
 use crate::material::MaterialTable;
 use crate::physics::classify::{Features, features};
+use crate::physics::contact::ContactKey;
 use crate::physics::mass::{MassProperties, mass_properties};
 use glam::{Affine3A, Quat, UVec3, Vec3};
+use std::collections::HashMap;
 
 /// A voxel volume placed in the world by a rigid transform, and the state that
 /// moves it.
@@ -38,6 +40,9 @@ pub struct Body {
     /// Corner and edge voxels, the only ones tested for contact. Empty until
     /// `recompute`.
     pub features: Features,
+    /// Each contact's accumulated normal impulse from the last tick, for warm
+    /// starting. Cleared by `recompute`, whose voxels may have moved.
+    pub warm: HashMap<ContactKey, f32>,
 }
 
 impl Body {
@@ -57,6 +62,7 @@ impl Body {
             velocity: Vec3::ZERO,
             angular_momentum: Vec3::ZERO,
             features: Features::default(),
+            warm: HashMap::new(),
         }
     }
 
@@ -103,6 +109,7 @@ impl Body {
     /// Returns `false`, and leaves the body massless, when nothing in the
     /// volume weighs anything: such a body should be removed.
     pub fn recompute(&mut self, materials: &MaterialTable) -> bool {
+        self.warm.clear();
         let voxels = self.volume.voxels();
         let Some((mass, com)) = mass_properties(&voxels, materials) else {
             self.mass = MassProperties::default();

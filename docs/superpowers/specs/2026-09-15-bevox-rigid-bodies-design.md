@@ -133,7 +133,11 @@ Once per physics tick, for every pair that can touch:
    Faces never test against faces. The corners around a face cover that
    contact.
 3. **Lookup.** A candidate voxel's centre is transformed into the other side's
-   grid, and the 2x2x2 voxels nearest that point are examined.
+   grid, and every voxel within `ceil(margin + 0.5)` of the voxel containing it
+   is examined: 3x3x3 at rest, 5x5x5 at the speed cap. Dwyer's devlog says the
+   nearest 8. That misses speculative contacts, and a corner resting exactly one
+   voxel above a floor sits on its tie boundary, so the contact would come and
+   go from tick to tick and warm starting would lose it.
 4. **Pair test.** The two rounded shapes from the classification table are
    tested: sphere against sphere, plane or cylinder, and cylinder against
    cylinder. Each test gives:
@@ -317,6 +321,10 @@ this list is all that is known of it here:
 Filled in by this design, **not** shown in his devlogs:
 
 - the exact pair-test formulas and rounding radii;
+- the lookup reach;
+- the ownership rules that report each touch once;
+- the unbiased relax solve after each substep's position update, after Erin
+  Catto's soft-step solver in Box2D v3;
 - the soft bias and slop;
 - speculative contacts and the velocity cap;
 - the substep count;
