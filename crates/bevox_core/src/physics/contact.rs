@@ -48,6 +48,11 @@ pub struct Contact {
     pub anchor: Vec3,
     /// Where that point was in the world at detection.
     pub world_point: Vec3,
+    /// The contact point relative to the OTHER body's centre of mass, in its
+    /// own axes. Zero against the world, which does not move.
+    pub other_anchor: Vec3,
+    /// Where that point was in the world at detection. Zero against the world.
+    pub other_point: Vec3,
     /// Coulomb friction between the two voxels that touch.
     pub friction: f32,
     /// How much of the approach speed a bounce keeps.
@@ -215,6 +220,9 @@ fn keep(
         separation,
         anchor,
         world_point,
+        // The world does not move, so it has no anchor to track.
+        other_anchor: Vec3::ZERO,
+        other_point: Vec3::ZERO,
         friction,
         restitution,
     });
@@ -350,6 +358,115 @@ pub fn detect(
     let mut contacts: Vec<Contact> = found.into_values().collect();
     contacts.sort_unstable_by_key(|c| c.key);
     contacts
+}
+
+/// Whether two world-space boxes overlap.
+pub fn boxes_overlap(a: (Vec3, Vec3), b: (Vec3, Vec3)) -> bool {
+    a.0.cmple(b.1).all() && b.0.cmple(a.1).all()
+}
+
+/// Every contact between two bodies within `margin`, belonging to `a`.
+///
+/// Runs in `b`'s frame, where `b`'s voxels are axis-aligned, exactly as
+/// `detect` runs in the world's. Normals point from `b` into `a`.
+pub fn detect_pair(a: &Body, b: &Body, materials: &MaterialTable, margin: f32) -> Vec<Contact> {
+    let (Some(box_a), Some(box_b)) = (world_box(a, margin), world_box(b, margin)) else {
+        return Vec::new();
+    };
+    if !boxes_overlap(box_a, box_b) {
+        return Vec::new();
+    }
+    let b_from_a = b.local_from_world() * a.world_from_local();
+    let a_from_b = a.local_from_world() * b.world_from_local();
+    let reach = (margin + RADIUS).ceil() as i32;
+    let a_solid = |p: IVec3| solid_at(&a.volume, p);
+    let b_solid = |p: IVec3| solid_at(&b.volume, p);
+    let mut found = HashMap::new();
+
+    // A's corners against B's voxels.
+    for &u in &a.features.corners {
+        let q = b_from_a.transform_point3(u.as_vec3() + 0.5);
+        for k in around(q, reach) {
+            if !b_solid(k) {
+                continue;
+            }
+            if let Some((sep, n_b)) = sphere_vs_voxel(q, k.as_vec3() + 0.5, classify(b_solid, k)) {
+                let point_b = q - n_b * (RADIUS + sep * 0.5);
+                keep_pair(&mut found, a, b, materials, margin, u, k.as_uvec3(), n_b, sep, point_b);
+            }
+        }
+    }
+
+    // B's corners against A's voxels. The pair test answers in A's frame with
+    // the normal pointing from A into B, so it is reversed and carried into B's.
+    for &w in &b.features.corners {
+        let q = a_from_b.transform_point3(w.as_vec3() + 0.5);
+        for k in around(q, reach) {
+            if !a_solid(k) {
+                continue;
+            }
+            if let Some((sep, n_a)) = sphere_vs_voxel(q, k.as_vec3() + 0.5, classify(a_solid, k)) {
+                let point_a = q - n_a * (RADIUS + sep * 0.5);
+                let point_b = b_from_a.transform_point3(point_a);
+                let n_b = b_from_a.transform_vector3(-n_a);
+                keep_pair(&mut found, a, b, materials, margin, k.as_uvec3(), w, n_b, sep, point_b);
+            }
+        }
+    }
+
+    // A's edges against B's edges.
+    for &(u, axis) in &a.features.edges {
+        let p = b_from_a.transform_point3(u.as_vec3() + 0.5);
+        let d = b_from_a.transform_vector3(AXES[axis]);
+        for k in around(p, reach) {
+            if !b_solid(k) {
+                continue;
+            }
+            let Shape::Edge(b_axis) = classify(b_solid, k) else { continue };
+            if let Some((sep, n_b, point_b)) = edge_vs_edge(p, d, k.as_vec3() + 0.5, AXES[b_axis]) {
+                keep_pair(&mut found, a, b, materials, margin, u, k.as_uvec3(), n_b, sep, point_b);
+            }
+        }
+    }
+
+    let mut contacts: Vec<Contact> = found.into_values().collect();
+    contacts.sort_unstable_by_key(|c| c.key);
+    contacts
+}
+
+/// Records a contact between two bodies. `normal` and `point` arrive in B's
+/// frame, where the pair tests ran, and are carried into the world here.
+#[allow(clippy::too_many_arguments)]
+fn keep_pair(
+    found: &mut HashMap<ContactKey, Contact>,
+    a: &Body,
+    b: &Body,
+    materials: &MaterialTable,
+    margin: f32,
+    mine: UVec3,
+    theirs: UVec3,
+    normal: Vec3,
+    separation: f32,
+    point: Vec3,
+) {
+    if separation > margin {
+        return;
+    }
+    let key = ContactKey { other: b.id, mine: mine.to_array(), theirs: theirs.to_array() };
+    let world_point = b.world_from_local().transform_point3(point);
+    let ma = materials.get(a.volume.get(mine));
+    let mb = materials.get(b.volume.get(theirs));
+    found.entry(key).or_insert(Contact {
+        key,
+        normal: b.orientation * normal,
+        separation,
+        anchor: a.local_from_world().transform_point3(world_point) - a.com,
+        world_point,
+        other_anchor: point - b.com,
+        other_point: world_point,
+        friction: combine_friction(ma.friction, mb.friction),
+        restitution: combine_restitution(ma.restitution, mb.restitution),
+    });
 }
 
 #[cfg(test)]
@@ -519,6 +636,82 @@ mod tests {
         for c in on_stone {
             assert!((c.friction - 0.6).abs() < 1e-6, "stone against a gripping cube");
             assert!((c.restitution - 0.8).abs() < 1e-6);
+        }
+    }
+
+    /// Two cubes stacked exactly touch across the upper one's bottom face: at
+    /// its four corners, and along the rims, where both cubes' edge voxels meet.
+    ///
+    /// More contacts than a cube on a floor, which touches at four corners only.
+    /// A floor's top is all face voxels, which corners alone can reach; a small
+    /// cube's top is rim, and rim meets rim.
+    #[test]
+    fn a_cube_resting_on_a_cube_touches_across_its_bottom_face() {
+        let materials = materials();
+        let lower = placed(cube(4, 4), Vec3::new(32.0, 10.0, 32.0), Quat::IDENTITY);
+        let upper = placed(cube(4, 4), Vec3::new(32.0, 14.0, 32.0), Quat::IDENTITY);
+        let contacts = detect_pair(&upper, &lower, &materials, 0.1);
+        for c in &contacts {
+            assert_eq!(c.key.other, lower.id);
+            assert!((c.normal - Vec3::Y).length() < TOLERANCE, "normal {:?}", c.normal);
+            assert!(c.separation.abs() < TOLERANCE, "separation {}", c.separation);
+            assert_eq!(c.key.mine[1], 0, "the upper body touched with voxel {:?}", c.key.mine);
+            assert_eq!(c.key.theirs[1], 3, "the lower body touched with voxel {:?}", c.key.theirs);
+        }
+        for corner in [[0, 0, 0], [3, 0, 0], [0, 0, 3], [3, 0, 3]] {
+            assert!(
+                contacts.iter().any(|c| c.key.mine == corner),
+                "no contact at the upper cube's corner {corner:?}: {contacts:#?}"
+            );
+        }
+        // Four corners and the rims between them, each reported once.
+        assert_eq!(contacts.len(), 12, "{contacts:#?}");
+    }
+
+    /// Turning the pair as a whole turns the contact with it: the normal is the
+    /// same in the bodies' shared frame, whatever the world's axes are.
+    #[test]
+    fn a_turned_pair_touches_the_same_way() {
+        let materials = materials();
+        let turn = Quat::from_rotation_z(0.9);
+        let centre = Vec3::new(32.0, 20.0, 32.0);
+        let lower = placed(cube(4, 4), centre, turn);
+        let upper = placed(cube(4, 4), centre + turn * Vec3::new(0.0, 4.0, 0.0), turn);
+        let contacts = detect_pair(&upper, &lower, &materials, 0.1);
+        let flat = detect_pair(
+            &placed(cube(4, 4), centre + Vec3::new(0.0, 4.0, 0.0), Quat::IDENTITY),
+            &placed(cube(4, 4), centre, Quat::IDENTITY),
+            &materials,
+            0.1,
+        );
+        assert_eq!(contacts.len(), flat.len(), "turning changed the contact count");
+        for c in &contacts {
+            assert!((c.normal - turn * Vec3::Y).length() < 1e-3, "normal {:?}", c.normal);
+            assert!(c.separation.abs() < 1e-3, "separation {}", c.separation);
+        }
+    }
+
+    /// Bodies that do not overlap are not compared voxel by voxel.
+    #[test]
+    fn far_apart_bodies_have_no_contacts_and_no_overlap() {
+        let materials = materials();
+        let a = placed(cube(4, 4), Vec3::new(32.0, 10.0, 32.0), Quat::IDENTITY);
+        let b = placed(cube(4, 4), Vec3::new(32.0, 40.0, 32.0), Quat::IDENTITY);
+        assert!(!boxes_overlap(world_box(&a, 0.1).unwrap(), world_box(&b, 0.1).unwrap()));
+        assert!(detect_pair(&a, &b, &materials, 0.1).is_empty());
+    }
+
+    /// A pair's coefficients come from the two voxels, exactly as against the
+    /// world: an icy body on a gripping one is slippery.
+    #[test]
+    fn a_pair_takes_the_coefficients_of_both_voxels() {
+        let materials = materials();
+        let lower = placed(cube(4, 4), Vec3::new(32.0, 10.0, 32.0), Quat::IDENTITY);
+        let icy = placed(cube_of(4, 4, MaterialId(3)), Vec3::new(32.0, 14.0, 32.0), Quat::IDENTITY);
+        let contacts = detect_pair(&icy, &lower, &materials, 0.1);
+        assert!(!contacts.is_empty());
+        for c in contacts {
+            assert_eq!(c.friction, 0.0, "ice on stone should slide");
         }
     }
 
