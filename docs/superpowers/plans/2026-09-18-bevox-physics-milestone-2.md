@@ -1964,6 +1964,36 @@ Tell Flori how to try it: `cargo run -p bevox`. The startup cube falls. `F` drop
 
 ---
 
+## Measurements
+
+2026-09-18, Intel Core i5-10400, release build, `cargo test --release -p bevox_core a_tick_is_timed -- --ignored --nocapture --test-threads=1`:
+
+```
+16 bodies: falling 0.0052 ms/tick, resting 0.8074 ms/tick (median)
+```
+
+CPU time for one tick with 16 four-voxel cubes against a 64-extent slab. Not a
+frame time, and no comparison is claimed, so no A/B/A applies.
+
+**What it says.** Bodies in open air cost nothing: the distance field clears
+them in one lookup, so 16 falling bodies are 0.005 ms. Resting bodies cost 0.05
+ms each, about 5% of a 15.6 ms tick for all 16. That is detection, which rescans
+the body's box and reclassifies the world voxels under it every tick. Sleeping,
+which the spec defers until a measurement asks for it, is what would remove it;
+this is that measurement, for whenever body counts grow.
+
+**Tuning:** none. `SUBSTEPS = 4`, `SLOP = 0.02`, `BIAS = 0.2`, `MAX_PUSH = 20`,
+`MAX_TRAVEL = 1.25` and `BASE_MARGIN = 0.1` were the first values tried, and
+every gate passed on the first run.
+
+**One gate was blind and was fixed.** The tunnelling test's break (detect with
+`BASE_MARGIN` alone) passed at a start height of 40.0: capped, the body falls
+exactly 1.25 voxels per tick, and without the margin a corner is still caught
+while its centre is within 1.1 voxels above the floor voxel's centre. That
+window is narrower than the step, but most phases land in it anyway. From 40.65
+the steps straddle it, and the break then leaves the body at y = 9.98, under the
+floor. The test now starts there.
+
 ## Milestone check
 
 A body dropped into the scene lands on real voxel terrain, tumbles onto a face if it lands off balance, stays at rest without drifting over ten thousand ticks, and falls when the ground under it is erased. Every gate above has been proven by a deliberate break.

@@ -4,6 +4,8 @@ use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
 use bevox_core::distance_field::DistanceField;
 use bevox_core::material::{Material, MaterialId, MaterialTable};
+use bevox_core::physics::GRAVITY;
+use bevox_core::physics::solver::step;
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system, start_camera};
 use bevox_render::pick::pick_voxel;
@@ -47,10 +49,11 @@ fn main() {
         // the render world discards in favour of the snapshot -- which was
         // taken before that stroke. It is then lost until the next rebuild.
         .add_systems(Update, brush_input.after(fly_camera_system).before(build_gpu_scene))
-        // Before the rebuild, and so before the staging that follows it: a
-        // rebuild frame packs this frame's turn into the new buffers, and every
-        // other frame's table carries it too, rather than the last one.
-        .add_systems(Update, spin_bodies.before(build_gpu_scene))
+        // Fixed timestep: physics must not depend on the frame rate. Bevy runs
+        // `FixedUpdate` before `Update`, so a removal's generation bump lands
+        // before `build_gpu_scene`.
+        .add_systems(FixedUpdate, physics_system)
+        .add_systems(Update, drop_body_input.after(fly_camera_system).before(build_gpu_scene))
         .run();
 }
 
@@ -97,7 +100,9 @@ fn setup(mut commands: Commands) {
     // and a click on the body would paint or erase the world behind it.
     let forward = (look_at - eye).normalize();
     let right = forward.cross(Vec3::Y).normalize_or_zero();
-    let body = demo_body(eye + forward * 14.0 + right * 6.0);
+    let mut body = demo_body(eye + forward * 14.0 + right * 6.0, Quat::IDENTITY);
+    // With mass, it falls from there onto whatever is below it.
+    body.recompute(&materials);
 
     let field = DistanceField::build(&tree);
     commands.insert_resource(VoxelScene {
@@ -110,13 +115,14 @@ fn setup(mut commands: Commands) {
     });
 }
 
-/// A six-voxel cube of material 2 -- brick, in the demo palette -- centred on
-/// `centre`.
+/// A six-voxel cube of material 2 -- brick, in the demo palette -- whose middle
+/// is at `centre`, turned by `orientation`. Call `recompute` before simulating
+/// it.
 ///
 /// Off the 4-voxel brick grid (5..11 in a 16 volume) so its bricks are partial
 /// and it owns real voxel bytes, like the body the parity tests prove, rather
 /// than collapsing to uniform nodes.
-fn demo_body(centre: Vec3) -> Body {
+fn demo_body(centre: Vec3, orientation: Quat) -> Body {
     let mut dense = DenseVolume::new(16).unwrap();
     for z in 5..11 {
         for y in 5..11 {
@@ -125,31 +131,39 @@ fn demo_body(centre: Vec3) -> Body {
             }
         }
     }
-    Body::new(dense.into_contree(), centre - Vec3::splat(8.0), Quat::IDENTITY)
+    Body::new(dense.into_contree(), centre - orientation * Vec3::splat(8.0), orientation)
 }
 
-/// Turns the demo body, so the composition can be seen working before any
-/// physics exists. Milestone 2 replaces this with integration.
-///
-/// About the volume's centre, not its local origin: a body turns about its
-/// origin, which is a corner, and would otherwise swing through a sphere
-/// rather than spin in place. Recovering the centre from the position every
-/// step lets it creep by float error -- about 0.06 voxels over 100,000 frames,
-/// half an hour at 60 Hz -- which a stand-in for physics can afford.
-fn spin_bodies(time: Res<Time>, mut scene: ResMut<VoxelScene>) {
-    let turn = Quat::from_rotation_y(time.delta_secs() * 0.7)
-        * Quat::from_rotation_x(time.delta_secs() * 0.3);
-    for body in &mut scene.bodies {
-        let half = Vec3::splat(body.volume.extent() as f32 * 0.5);
-        let centre = body.world_from_local().transform_point3(half);
-        // Renormalised every step: a quaternion accumulated by repeated
-        // multiplication drifts off unit length, and the drift shows up as a
-        // body that slowly shears.
-        body.orientation = (turn * body.orientation).normalize();
-        body.position = centre - body.orientation * half;
-        // Only the transform changed, so `generation` stays put: the body
-        // table is re-uploaded every frame. Changing a body's geometry is
-        // what needs the bump.
+/// One physics tick for every body.
+fn physics_system(time: Res<Time>, mut scene: ResMut<VoxelScene>) {
+    let scene = &mut *scene;
+    if step(&mut scene.bodies, &scene.tree, &scene.field, GRAVITY, time.delta_secs()) {
+        // A body left the world. The body list is packed into the scene
+        // buffers, so they must be rebuilt.
+        scene.generation += 1;
+    }
+}
+
+/// `F` drops a tilted cube in front of the camera, to watch landing and
+/// settling again and again.
+fn drop_body_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    camera: Query<&GlobalTransform, With<Camera3d>>,
+    mut scene: ResMut<VoxelScene>,
+) {
+    if !keys.just_pressed(KeyCode::KeyF) {
+        return;
+    }
+    let Ok(transform) = camera.single() else {
+        return;
+    };
+    let tilt = Quat::from_euler(EulerRot::XYZ, 0.4, 0.7, 0.2);
+    let mut body =
+        demo_body(transform.translation() + transform.forward().as_vec3() * 16.0, tilt);
+    if body.recompute(&scene.materials) {
+        scene.bodies.push(body);
+        // A new body adds geometry to the packed buffers.
+        scene.generation += 1;
     }
 }
 
@@ -277,50 +291,35 @@ fn demo_scene() -> (Contree, MaterialTable) {
 mod tests {
     use super::*;
 
-    /// Many frames of spin must leave the orientation a rotation -- unit
-    /// length -- and leave the cube where it started.
+    /// The system steps the scene's bodies, and a body leaving the world bumps
+    /// the generation, because the packed buffers hold the body list.
     #[test]
-    fn a_spun_body_stays_unit_length_and_in_place() {
-        const STEPS: u32 = 100_000;
+    fn the_physics_system_moves_bodies_and_rebuilds_when_one_leaves() {
         let mut world = World::new();
         let mut time = Time::<()>::default();
-        time.advance_by(std::time::Duration::from_millis(16));
+        time.advance_by(std::time::Duration::from_secs_f64(1.0 / 64.0));
         world.insert_resource(time);
-        let tree = Contree::empty(2);
+        let (tree, materials) = demo_scene();
         let field = DistanceField::build(&tree);
-        let centre = Vec3::new(40.0, 21.0, 40.0);
+        let mut falling = demo_body(Vec3::new(20.0, 40.0, 20.0), Quat::IDENTITY);
+        assert!(falling.recompute(&materials));
+        let mut gone = demo_body(Vec3::new(20.0, -100.0, 20.0), Quat::IDENTITY);
+        assert!(gone.recompute(&materials));
         world.insert_resource(VoxelScene {
             tree,
-            materials: MaterialTable::new(),
+            materials,
             generation: 1,
             field,
             field_dirty: None,
-            bodies: vec![demo_body(centre)],
+            bodies: vec![falling, gone],
         });
 
-        let spin = world.register_system(spin_bodies);
-        world.run_system(spin).unwrap();
-        assert_ne!(
-            world.resource::<VoxelScene>().bodies[0].orientation,
-            Quat::IDENTITY,
-            "one step did not turn the body, so the checks below prove nothing"
-        );
-        for _ in 0..STEPS {
-            world.run_system(spin).unwrap();
-        }
+        let physics = world.register_system(physics_system);
+        world.run_system(physics).unwrap();
 
-        let body = &world.resource::<VoxelScene>().bodies[0];
-        let length = body.orientation.length();
-        assert!(
-            (length - 1.0).abs() < 1e-5,
-            "after {STEPS} steps the orientation has length {length}; the body would shear"
-        );
-        let now = body.world_from_local().transform_point3(Vec3::splat(8.0));
-        // Float creep is ~0.06 voxels at this step count. Swinging about the
-        // corner instead would carry the centre round a 14-voxel radius.
-        assert!(
-            (now - centre).length() < 0.1,
-            "the cube's centre wandered from {centre:?} to {now:?}"
-        );
+        let scene = world.resource::<VoxelScene>();
+        assert_eq!(scene.bodies.len(), 1, "the body below the world was not removed");
+        assert_eq!(scene.generation, 2, "removing a body did not ask for a rebuild");
+        assert!(scene.bodies[0].velocity.y < 0.0, "the body did not start to fall");
     }
 }
