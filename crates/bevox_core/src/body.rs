@@ -311,6 +311,41 @@ mod tests {
         }
     }
 
+    /// Neither test above can catch a transposed axis in the child-origin
+    /// decode: the random-voxel test spans close to the full 0..64 range on
+    /// every axis regardless of which range lands on which axis, and the
+    /// tightness cube is 25..41 on all three axes, so permuting axes leaves it
+    /// unchanged. A box with a different, non-overlapping range per axis makes
+    /// a swap between axes show up as a bound on the wrong values.
+    #[test]
+    fn the_bounds_do_not_transpose_axes() {
+        let mut dense = DenseVolume::new(64).unwrap();
+        for z in 50..54 {
+            for y in 4..8 {
+                for x in 25..41 {
+                    dense.set(UVec3::new(x, y, z), MaterialId(1));
+                }
+            }
+        }
+        let tree = dense.into_contree();
+        let (lo, hi) = occupied_bounds(&tree).expect("the box has voxels");
+        let within_a_brick = |lo: u32, hi: u32, min: u32, max: u32| {
+            lo <= min && lo + 4 > min && hi >= max && hi < max + 4
+        };
+        assert!(
+            within_a_brick(lo.x, hi.x, 25, 41),
+            "x bound {lo:?}..{hi:?} is not within a brick of 25..41"
+        );
+        assert!(
+            within_a_brick(lo.y, hi.y, 4, 8),
+            "y bound {lo:?}..{hi:?} is not within a brick of 4..8"
+        );
+        assert!(
+            within_a_brick(lo.z, hi.z, 50, 54),
+            "z bound {lo:?}..{hi:?} is not within a brick of 50..54"
+        );
+    }
+
     /// The frames must point the way their names say. A ray march can hide a
     /// swap when the geometry happens to be symmetric about the rotation; this
     /// cannot.
