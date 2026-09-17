@@ -8,7 +8,7 @@
 //! bias added, so pushing a body out of the floor does not make it bounce.
 
 use super::contact::{Contact, RADIUS, detect, world_box};
-use super::{BASE_MARGIN, BIAS, MAX_PUSH, MAX_TRAVEL, SLOP, SUBSTEPS};
+use super::{BASE_MARGIN, BIAS, MAX_PUSH, MAX_TRAVEL, RESTITUTION_SWEEPS, SLOP, SUBSTEPS};
 use crate::body::{Body, occupied_bounds};
 use crate::contree::Contree;
 use crate::distance_field::DistanceField;
@@ -69,6 +69,16 @@ fn step_body(
     let contacts = detect(body, tree, field, materials, travel + BASE_MARGIN);
     let mut impulses: Vec<ContactImpulse> =
         contacts.iter().map(|c| body.warm.get(&c.key).copied().unwrap_or_default()).collect();
+    // The speed the body arrives with, which the substeps are about to destroy.
+    // A bounce is written in terms of it, so it is recorded here.
+    let arrival = world_inverse_inertia(body) * body.angular_momentum;
+    let approach: Vec<f32> = contacts
+        .iter()
+        .map(|c| {
+            let r = lever(body, c);
+            (body.velocity + arrival.cross(r)).dot(c.normal)
+        })
+        .collect();
 
     for _ in 0..SUBSTEPS {
         body.velocity += gravity * h;
@@ -92,7 +102,48 @@ fn step_body(
         }
     }
 
+    // What the contacts carried while holding the body up, which is what warm
+    // starting wants next tick. The bounce below is a one-off: feeding it back
+    // would have the next tick's warm start kick the body again, and a body
+    // would keep almost all its speed instead of `restitution` of it.
     body.warm = contacts.iter().zip(&impulses).map(|(c, &i)| (c.key, i)).collect();
+
+    // Restitution last, after the substeps have removed the approach speed.
+    // Solving it inside them would fight the push-out bias.
+    //
+    // Swept several times rather than once, and each contact may give impulse
+    // back down to what it carried before. A single sweep has every contact of
+    // a flat landing push the whole body to the target on its own, four corners
+    // stacking to more than the body arrived with; sweeping lets the later ones
+    // take that back out.
+    let base: Vec<f32> = impulses.iter().map(|i| i.normal).collect();
+    let inv_inertia = world_inverse_inertia(body);
+    for _ in 0..RESTITUTION_SWEEPS {
+        for ((c, impulse), (&approach, &base)) in
+            contacts.iter().zip(impulses.iter_mut()).zip(approach.iter().zip(&base))
+        {
+            // A contact that never carried load is one the body never reached.
+            //
+            // No speed threshold here. One was tried, on the usual reasoning
+            // that slow contacts must not bounce or a body buzzes forever, and
+            // it changed nothing measurable: a bounce is written against the
+            // speed the body ARRIVED with, and a body in sustained contact
+            // arrives at nearly zero. Even at a restitution of 0.99 the body
+            // settles. It goes back in the day a test shows creep without it.
+            if c.restitution <= 0.0 || base == 0.0 {
+                continue;
+            }
+            let r = lever(body, c);
+            let omega = inv_inertia * body.angular_momentum;
+            let vn = (body.velocity + omega.cross(r)).dot(c.normal);
+            let target = -c.restitution * approach;
+            let k = inv_mass + (inv_inertia * r.cross(c.normal)).cross(r).dot(c.normal);
+            let total = (impulse.normal + (target - vn) / k).max(base);
+            let delta = total - impulse.normal;
+            impulse.normal = total;
+            push(body, inv_mass, c, c.normal * delta);
+        }
+    }
 }
 
 /// The inverse inertia tensor in world axes.
@@ -231,7 +282,7 @@ mod tests {
     use super::*;
     use crate::material::MaterialId;
     use crate::physics::GRAVITY;
-    use crate::physics::fixtures::{cube, materials, placed, slab, slab_of};
+    use crate::physics::fixtures::{cube, cube_of, materials, placed, slab, slab_of};
     use glam::EulerRot;
 
     const DT: f32 = 1.0 / 64.0;
@@ -439,6 +490,86 @@ mod tests {
             "still moving: spin {spin}, {:?}",
             body.velocity
         );
+    }
+
+    /// A bounce keeps `e` of the approach speed, so the body returns to about
+    /// `e^2` of its drop height. A dead floor keeps nothing.
+    #[test]
+    fn a_bouncy_body_returns_to_a_quarter_of_its_height() {
+        let materials = materials();
+        let apex = |floor: MaterialId, body_material: MaterialId| -> f32 {
+            let world = slab_of(64, 0..8, floor);
+            let field = DistanceField::build(&world);
+            let mut bodies = vec![placed(
+                cube_of(4, 4, body_material),
+                Vec3::new(32.0, 14.0, 32.0),
+                Quat::IDENTITY,
+            )];
+            let mut top: f32 = 0.0;
+            let mut landed = false;
+            for _ in 0..400 {
+                step(&mut bodies, &world, &field, &materials, GRAVITY, DT);
+                let y = bodies[0].position.y;
+                landed |= y < 10.2;
+                if landed {
+                    top = top.max(y - 10.0);
+                }
+            }
+            assert!(landed, "the body never reached the floor");
+            top
+        };
+
+        // Dropped 4 voxels onto a floor that keeps 0.8 of the approach speed:
+        // the first bounce reaches about 0.64 of 4 voxels.
+        let bounced = apex(MaterialId(4), MaterialId(1));
+        assert!((bounced - 2.56).abs() < 0.6, "bounced to {bounced}, expected about 2.56");
+
+        let dead = apex(MaterialId(1), MaterialId(1));
+        assert!(dead < 0.1, "a dead floor bounced the body {dead} voxels");
+    }
+
+    /// Below the threshold there is no bounce, or a bouncy body would buzz on
+    /// the floor forever instead of settling.
+    #[test]
+    fn a_bouncy_body_still_settles() {
+        let materials = materials();
+        let world = slab_of(64, 0..8, MaterialId(4));
+        let field = DistanceField::build(&world);
+        let mut bodies =
+            vec![placed(cube_of(4, 4, MaterialId(4)), Vec3::new(32.0, 12.0, 32.0), Quat::IDENTITY)];
+        run(&mut bodies, &world, &field, &materials, GRAVITY, 2000);
+        let settled = bodies[0].position.y;
+        assert!((settled - 10.0).abs() < 0.1, "settled at {settled}, not on the floor");
+        let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
+        for _ in 0..1000 {
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT);
+            low = low.min(bodies[0].position.y);
+            high = high.max(bodies[0].position.y);
+        }
+        assert!(high - low < 1e-3, "a bouncy body buzzed between {low} and {high}");
+    }
+
+    /// A nearly elastic body settles rather than trading micro-bounces forever.
+    ///
+    /// This is the threshold's gate: at 0.99, a bounce keeps almost everything,
+    /// so without a floor on what counts as an impact the body would still be
+    /// hopping thousands of ticks later.
+    #[test]
+    fn a_nearly_elastic_body_settles_rather_than_hopping_forever() {
+        let materials = materials();
+        let world = slab_of(64, 0..8, MaterialId(5));
+        let field = DistanceField::build(&world);
+        let mut bodies =
+            vec![placed(cube_of(4, 4, MaterialId(5)), Vec3::new(32.0, 11.0, 32.0), Quat::IDENTITY)];
+        run(&mut bodies, &world, &field, &materials, GRAVITY, 3000);
+        let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
+        for _ in 0..500 {
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT);
+            low = low.min(bodies[0].position.y);
+            high = high.max(bodies[0].position.y);
+        }
+        assert!(high - low < 1e-3, "still hopping between {low} and {high}");
+        assert!((low - 10.0).abs() < 0.1, "settled at {low}, not on the floor");
     }
 
     /// At the speed cap, a body falls onto a floor one voxel thick and does not

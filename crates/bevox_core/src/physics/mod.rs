@@ -42,6 +42,10 @@ pub const MAX_PUSH: f32 = 20.0;
 /// speculative contacts stand in for continuous collision detection.
 pub const MAX_TRAVEL: f32 = 1.25;
 
+/// Sweeps of the restitution pass. One is not enough: every contact of a flat
+/// landing would push the whole body to the bounce target by itself.
+pub const RESTITUTION_SWEEPS: u32 = 4;
+
 /// Speculative margin every body gets even at rest, in voxels.
 pub const BASE_MARGIN: f32 = 0.1;
 
@@ -56,7 +60,7 @@ pub(crate) mod fixtures {
     use glam::{Quat, UVec3, Vec3};
 
     /// Material 1 weighs 1000 and grips; 2 weighs 3000 and grips; 3 is
-    /// frictionless ice; 4 is bouncy.
+    /// frictionless ice; 4 is bouncy; 5 is nearly elastic.
     pub fn materials() -> MaterialTable {
         let mut table = MaterialTable::new();
         table
@@ -89,6 +93,14 @@ pub(crate) mod fixtures {
                 density: 1000,
                 friction: 60,
                 restitution: 80,
+            })
+            .unwrap();
+        table
+            .push(Material {
+                color: [250, 240, 120, 255],
+                density: 1000,
+                friction: 60,
+                restitution: 99,
             })
             .unwrap();
         table
