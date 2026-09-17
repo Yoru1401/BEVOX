@@ -710,140 +710,119 @@ No merge to master. Physics stays on its own branch until Flori says otherwise.
 
 ## Measurements
 
-2026-09-17, NVIDIA GeForce GTX 1650, headless, release builds, bench scene (extent 1024 floor and columns) at 1280x720 from the bench camera (close to geometry, looking along the floor). Every comparison is A/B/A, three rounds, medians, with the drift between the two A readings: wall clock over batches of 30 dispatches, GPU timestamps as the median of 7 readings.
+2026-09-17, NVIDIA GeForce GTX 1650, headless, release builds, bench scene (extent 1024 floor and columns) at 1280x720 from the bench camera (close to geometry, looking along the floor). Every comparison is interleaved within one invocation, with the drift between repeated readings of the same side: wall clock over batches of dispatches, GPU time from timestamp queries.
 
-### The static world regressed on this branch
+### The static world regressed on this branch, and was fixed
 
-Task 4 was to use the 11.80 ms static world from the previous milestone. The traversal changed after it: camera-relative rays, a new NDC formula, seeds as start distances instead of a moved origin, and exact-tie handling in the DDA and mask filter. So it was re-measured across those changes: release `gpu_bench` built at 85370de (the last commit before them, in a git worktree with its own target dir) and at 5a43911, run A, B, A in one command, each from its own checkout's `crates/bevox_render` so each reads its own shader:
+Task 4's first run found the static world (no bodies, `DEFAULT`) slower than before this branch's traversal changes. At 5a43911 it took 15.69 ms wall against 12.89 / 12.43 at 85370de (drift 0.46), and 15.44 ms GPU against 13.35 / 12.91. That was over a 16.7 ms frame on its own, so no body fit beside it. The raw numbers are in this file's history at e225213.
+
+**Bisect.** Release bench binaries were built at 85370de, 6b47b61, fdf0343, 5a43911 and e225213, then run round-robin for four rounds in one invocation. The whole jump is at 6b47b61, the exact-tie fix: the scan went from about 39 to 58 ms wall, and `DEFAULT` from about 12.7 to 18.8. The scan's pixel sum is identical across that commit, so the scan was paying for code it never runs.
+
+**Root cause: a driver optimisation cliff, not extra work.** In 6b47b61, `touched_child` searched a tie's grazed cells with a loop over the subsets of the tied axes. Ties are rare, so the loop almost never iterated, but its presence made the GTX 1650 driver compile the whole traversal worse. The evidence, from one binary with only the shader swapped:
+- Deleting only that loop took scan GPU time from 57.1 to 38.1 ms, against 37.7 at 85370de.
+- Reverting instead the start-distance seed, the mask-filter tie change or the NDC formula did not help: 59.2, 56.1 and 56.6 ms.
+- Unrolling the loop into eight calls was slower still, at 65.4 ms.
+- Splitting `traverse_at` by the DDA flag did not help the scan either, at 62.2 ms.
+
+**Fix (8b59104).** The grazed cells form a box, so `touched_child` now builds them as a 64-bit child mask and takes the lowest set bit. It is integer-only, with no loop. It was checked equal to the loop over 14.1M cases, and every bit-identity and tie gate is unchanged. Median of four interleaved rounds, wall / GPU ms:
 
 ```
-gpu_bench.exe optimisations the_dispatches_are_timed_by_the_gpu --include-ignored --nocapture --test-threads=1
+              scan           default
+  85370de     36.2 / 34.4    12.35 / 12.03
+  e225213     53.2 / 52.8    16.04 / 15.64
+  8b59104     37.2 / 35.5    11.99 / 11.76
 ```
 
-`record_the_baseline` times the scan (flags 0), not `DEFAULT`, so the `default` rows of `optimisations_are_measured_against_the_baseline` (wall, A/B/A against the scan inside each process) and `the_dispatches_are_timed_by_the_gpu` (GPU) are what was compared. `DEFAULT` was `DDA | MASK_FILTER | BEAM | DISTANCE_FIELD | BODIES` at both commits. Raw output, verbatim, harness lines trimmed:
-
-```
-===== A1 85370de =====
-          dda:  18.95 ms vs scan 34.03/34.12 (drift 0.09)  gain  15.13 ms ( 44.4%)   [gpu 18.93 ms]
-         mask:  30.48 ms vs scan 35.07/37.15 (drift 2.08)  gain   5.63 ms ( 15.6%)   [gpu 30.90 ms]
-     dda+mask:  16.43 ms vs scan 37.48/37.19 (drift 0.29)  gain  20.90 ms ( 56.0%)   [gpu 17.65 ms]
-         beam:  28.34 ms vs scan 40.00/39.96 (drift 0.04)  gain  11.64 ms ( 29.1%)   [gpu 28.15 ms = beam 0.91 + main 27.24]
-dda+mask+beam:  14.84 ms vs scan 40.47/41.47 (drift 1.00)  gain  26.13 ms ( 63.8%)   [gpu 13.87 ms = beam 0.29 + main 13.58]
-        field:  25.97 ms vs scan 41.32/40.54 (drift 0.78)  gain  14.96 ms ( 36.5%)   [gpu 23.33 ms]
-      default:  12.89 ms vs scan 41.24/40.59 (drift 0.65)  gain  28.03 ms ( 68.5%)   [gpu 13.45 ms = beam 0.30 + main 13.15]
-         scan:  40.570 ms total
-          dda:  20.663 ms total
-         mask:  38.301 ms total
-         beam:  32.290 ms total  (beam 0.935 + main 31.354)
-dda+mask+beam:  15.086 ms total  (beam 0.294 + main 14.792)
-        field:  25.021 ms total
-      default:  13.353 ms total  (beam 0.294 + main 13.059)
-===== B 5a43911 =====
-          dda:  22.43 ms vs scan 54.00/51.79 (drift 2.21)  gain  30.46 ms ( 57.6%)   [gpu 22.38 ms]
-         mask:  48.19 ms vs scan 52.88/51.41 (drift 1.47)  gain   3.96 ms (  7.6%)   [gpu 44.96 ms]
-     dda+mask:  21.93 ms vs scan 53.83/54.26 (drift 0.43)  gain  32.12 ms ( 59.4%)   [gpu 21.38 ms]
-         beam:  38.27 ms vs scan 52.24/52.56 (drift 0.33)  gain  14.13 ms ( 27.0%)   [gpu 37.08 ms = beam 0.96 + main 36.12]
-dda+mask+beam:  17.39 ms vs scan 52.08/52.20 (drift 0.12)  gain  34.75 ms ( 66.7%)   [gpu 17.16 ms = beam 0.35 + main 16.81]
-        field:  32.70 ms vs scan 52.63/52.54 (drift 0.09)  gain  19.88 ms ( 37.8%)   [gpu 32.12 ms]
-      default:  15.69 ms vs scan 52.05/52.41 (drift 0.36)  gain  36.54 ms ( 70.0%)   [gpu 16.45 ms = beam 0.35 + main 16.10]
-         scan:  51.837 ms total
-          dda:  23.240 ms total
-         mask:  48.744 ms total
-         beam:  37.296 ms total  (beam 0.954 + main 36.342)
-dda+mask+beam:  17.432 ms total  (beam 0.348 + main 17.084)
-        field:  32.845 ms total
-      default:  15.438 ms total  (beam 0.350 + main 15.087)
-===== A2 85370de =====
-          dda:  19.37 ms vs scan 36.00/35.82 (drift 0.17)  gain  16.54 ms ( 46.1%)   [gpu 21.78 ms]
-         mask:  31.14 ms vs scan 34.81/35.19 (drift 0.38)  gain   3.86 ms ( 11.0%)   [gpu 30.59 ms]
-     dda+mask:  17.01 ms vs scan 43.86/39.72 (drift 4.14)  gain  24.78 ms ( 59.3%)   [gpu 18.48 ms]
-         beam:  29.42 ms vs scan 35.94/46.53 (drift 10.60)  gain  11.82 ms ( 28.7%)   [gpu 24.76 ms = beam 0.95 + main 23.81]
-dda+mask+beam:  14.50 ms vs scan 37.49/35.41 (drift 2.08)  gain  21.95 ms ( 60.2%)   [gpu 13.71 ms = beam 0.30 + main 13.40]
-        field:  22.63 ms vs scan 35.78/35.29 (drift 0.48)  gain  12.91 ms ( 36.3%)   [gpu 21.90 ms]
-      default:  12.43 ms vs scan 38.97/38.64 (drift 0.32)  gain  26.38 ms ( 68.0%)   [gpu 11.96 ms = beam 0.29 + main 11.67]
-         scan:  43.389 ms total
-          dda:  19.150 ms total
-         mask:  30.633 ms total
-         beam:  28.722 ms total  (beam 0.948 + main 27.774)
-dda+mask+beam:  13.713 ms total  (beam 0.292 + main 13.421)
-        field:  22.038 ms total
-      default:  12.914 ms total  (beam 0.294 + main 12.620)
-```
-
-**`DEFAULT` with no bodies is 3.03 ms wall slower at 5a43911 (15.69 against 12.89 / 12.43, drift 0.46, +24%) and 2.30 ms GPU slower (15.44 against 13.35 / 12.91, drift 0.44, +17%).** The scan is slower too, by 9.86 ms GPU (51.84 against 40.57 / 43.39, drift 2.82), and the scan runs none of the DDA, mask-filter or seed code, so the DDA's tie loop cannot be the whole cause. Only the two ends were built, so this does not attribute the regression to 6b47b61, fdf0343 or 5a43911. Readings drift more between these processes than within one (A1's own scan rose from 34 to 41 ms during its run), so only the `default` and scan rows, whose differences clear that drift, are claimed.
+`DEFAULT` is back at, or slightly under, the static world from before the branch. **No gate can catch a cliff like this: the output is bit-identical either way, and only the bench shows it.** Any traversal change needs re-benching, not only re-testing.
 
 ### Bodies under each rejection
 
-`bodies_are_measured_against_none` in `crates/bevox_render/tests/gpu_bench.rs`:
+`bodies_are_measured_against_none` in `crates/bevox_render/tests/gpu_bench.rs`, at 8b59104:
 
 ```
 cargo test --release -p bevox_render --test gpu_bench bodies -- --ignored --nocapture --test-threads=1
 ```
 
-Flags are `DEFAULT` without `CULL_BODIES` and `BODY_RECT` (31), plus each combination of the two. Every row is A/B/A against the zero-body scene at 31. "Loose" bodies are the parity tests' 16-voxel cube (25..41 in a 64 volume, so node-granular occupied bounds 24..44). "Tight" bodies are a 16-voxel cube filling a 16 volume, which packs to a single uniform root, placed where the loose cubes are. All are turned off-axis in a 4x4 grid 120 voxels ahead in the open corridor, or 120 behind. For every row, the test asserts that each combination's image is identical to neither's and that the marched count is 0 exactly where the cull should remove bodies. Each 16-body row then measures every combination A/B/A directly against neither. Raw output, verbatim:
+**Flags.** `DEFAULT` without `CULL_BODIES` and `BODY_RECT` (31), plus each combination of the two. Every row is A/B/A against the zero-body scene at 31.
+
+**Bodies.**
+- "Loose" bodies are the parity tests' 16-voxel cube: 25..41 in a 64 volume, with node-granular occupied bounds 24..44.
+- "Tight" bodies are a 16-voxel cube filling a 16 volume, which packs to a single uniform root.
+- All are turned off-axis in a 4x4 grid, 120 voxels ahead in the open corridor or 120 behind.
+
+**Checks.** For every row, the test asserts that each combination's image is identical to neither's. It also asserts the marched count is 0 exactly where the cull should remove bodies. Each 16-body row then measures every combination A/B/A directly against neither. Raw output, verbatim:
 
 ```
 scene: extent 1024, 1280x720, bench camera, flags DEFAULT without CULL_BODIES and BODY_RECT (31) plus each combination; loose = 16-voxel cube in a 64 volume, tight = 16-voxel cube filling a 16 volume
-            0 bodies neither: wall  17.88 ms vs 17.36/16.22 (drift 1.14) =  +1.09 ms | gpu  15.41 ms vs 15.53/15.42 (drift 0.11) =  -0.06 ms |      0 px changed, 0 marched
-            0 bodies    cull: wall  16.10 ms vs 16.25/15.95 (drift 0.30) =  -0.00 ms | gpu  15.45 ms vs 15.47/15.43 (drift 0.04) =  +0.01 ms |      0 px changed, 0 marched
-            0 bodies    rect: wall  17.32 ms vs 15.65/18.46 (drift 2.81) =  +0.26 ms | gpu  16.80 ms vs 19.35/15.88 (drift 3.47) =  -0.82 ms |      0 px changed, 0 marched
-            0 bodies    both: wall  15.87 ms vs 16.00/15.94 (drift 0.06) =  -0.10 ms | gpu  15.47 ms vs 15.44/15.44 (drift 0.01) =  +0.03 ms |      0 px changed, 0 marched
-              1 body neither: wall  21.03 ms vs 16.19/18.63 (drift 2.43) =  +3.62 ms | gpu  17.49 ms vs 16.16/15.73 (drift 0.43) =  +1.55 ms |  15633 px changed, 1 marched
-              1 body    cull: wall  17.88 ms vs 15.93/15.98 (drift 0.05) =  +1.93 ms | gpu  17.56 ms vs 15.69/15.67 (drift 0.02) =  +1.88 ms |  15633 px changed, 1 marched
-              1 body    rect: wall  17.36 ms vs 18.02/17.39 (drift 0.63) =  -0.34 ms | gpu  16.55 ms vs 15.66/15.72 (drift 0.07) =  +0.86 ms |  15633 px changed, 1 marched
-              1 body    both: wall  17.31 ms vs 15.75/16.21 (drift 0.47) =  +1.33 ms | gpu  19.05 ms vs 18.28/18.14 (drift 0.14) =  +0.84 ms |  15633 px changed, 1 marched
-            4 bodies neither: wall  24.26 ms vs 18.09/17.44 (drift 0.65) =  +6.50 ms | gpu  23.78 ms vs 17.15/16.87 (drift 0.28) =  +6.77 ms |  62133 px changed, 4 marched
-            4 bodies    cull: wall  24.55 ms vs 17.51/17.77 (drift 0.25) =  +6.91 ms | gpu  23.80 ms vs 16.71/16.97 (drift 0.26) =  +6.96 ms |  62133 px changed, 4 marched
-            4 bodies    rect: wall  20.51 ms vs 17.14/17.23 (drift 0.09) =  +3.32 ms | gpu  19.79 ms vs 16.99/17.05 (drift 0.06) =  +2.78 ms |  62133 px changed, 4 marched
-            4 bodies    both: wall  20.52 ms vs 17.14/17.19 (drift 0.05) =  +3.36 ms | gpu  21.30 ms vs 17.74/17.85 (drift 0.11) =  +3.50 ms |  62133 px changed, 4 marched
-           16 bodies neither: wall  33.37 ms vs 17.28/17.23 (drift 0.05) = +16.11 ms | gpu  33.31 ms vs 17.09/16.43 (drift 0.66) = +16.55 ms | 267934 px changed, 16 marched
-           16 bodies    cull: wall  33.48 ms vs 17.37/17.40 (drift 0.03) = +16.09 ms | gpu  32.76 ms vs 17.33/16.67 (drift 0.66) = +15.75 ms | 267934 px changed, 16 marched
-           16 bodies    rect: wall  25.94 ms vs 17.38/17.40 (drift 0.03) =  +8.56 ms | gpu  25.73 ms vs 17.15/16.91 (drift 0.24) =  +8.70 ms | 267934 px changed, 16 marched
-           16 bodies    both: wall  25.96 ms vs 17.46/17.39 (drift 0.08) =  +8.53 ms | gpu  25.91 ms vs 16.57/16.82 (drift 0.25) =  +9.21 ms | 267934 px changed, 16 marched
-           16 bodies    cull against neither: wall  33.37 ms vs 33.35/33.43 (drift 0.08) =  -0.02 ms | gpu  32.66 ms vs 32.75/32.71 (drift 0.04) =  -0.07 ms
-           16 bodies    rect against neither: wall  25.93 ms vs 33.37/33.33 (drift 0.04) =  -7.42 ms | gpu  25.63 ms vs 33.05/33.80 (drift 0.74) =  -7.79 ms
-           16 bodies    both against neither: wall  26.25 ms vs 33.59/34.83 (drift 1.23) =  -7.97 ms | gpu  23.73 ms vs 33.32/35.66 (drift 2.34) = -10.76 ms
-16 behind the camera neither: wall  22.32 ms vs 17.26/17.26 (drift 0.00) =  +5.06 ms | gpu  22.15 ms vs 17.78/16.86 (drift 0.92) =  +4.83 ms |      0 px changed, 16 marched
-16 behind the camera    cull: wall  17.85 ms vs 17.22/17.36 (drift 0.15) =  +0.56 ms | gpu  16.42 ms vs 16.89/16.61 (drift 0.28) =  -0.33 ms |      0 px changed, 0 marched
-16 behind the camera    rect: wall  22.50 ms vs 17.13/17.73 (drift 0.61) =  +5.07 ms | gpu  21.81 ms vs 17.09/17.18 (drift 0.09) =  +4.68 ms |      0 px changed, 16 marched
-16 behind the camera    both: wall  17.13 ms vs 17.13/17.19 (drift 0.06) =  -0.03 ms | gpu  17.09 ms vs 17.44/16.58 (drift 0.87) =  +0.08 ms |      0 px changed, 0 marched
-16 behind the camera    cull against neither: wall  17.14 ms vs 21.67/22.20 (drift 0.54) =  -4.80 ms | gpu  17.49 ms vs 19.98/22.08 (drift 2.10) =  -3.54 ms
-16 behind the camera    rect against neither: wall  22.52 ms vs 22.01/21.65 (drift 0.36) =  +0.70 ms | gpu  21.90 ms vs 21.95/21.48 (drift 0.47) =  +0.19 ms
-16 behind the camera    both against neither: wall  17.42 ms vs 21.71/21.38 (drift 0.34) =  -4.12 ms | gpu  17.06 ms vs 21.41/21.22 (drift 0.20) =  -4.26 ms
-            16 tight neither: wall  20.76 ms vs 16.97/16.67 (drift 0.30) =  +3.94 ms | gpu  21.47 ms vs 17.83/17.71 (drift 0.13) =  +3.70 ms | 267934 px changed, 16 marched
-            16 tight    cull: wall  20.52 ms vs 16.91/17.71 (drift 0.80) =  +3.21 ms | gpu  19.74 ms vs 16.65/15.94 (drift 0.71) =  +3.45 ms | 267934 px changed, 16 marched
-            16 tight    rect: wall  18.01 ms vs 17.39/17.13 (drift 0.26) =  +0.75 ms | gpu  18.04 ms vs 17.17/17.63 (drift 0.46) =  +0.63 ms | 267934 px changed, 16 marched
-            16 tight    both: wall  18.50 ms vs 17.14/17.36 (drift 0.22) =  +1.24 ms | gpu  18.14 ms vs 17.27/17.06 (drift 0.22) =  +0.97 ms | 267934 px changed, 16 marched
-            16 tight    cull against neither: wall  20.94 ms vs 20.43/20.94 (drift 0.51) =  +0.26 ms | gpu  20.30 ms vs 20.43/19.89 (drift 0.54) =  +0.14 ms
-            16 tight    rect against neither: wall  17.86 ms vs 20.89/20.70 (drift 0.19) =  -2.93 ms | gpu  17.54 ms vs 20.08/20.75 (drift 0.67) =  -2.88 ms
-            16 tight    both against neither: wall  18.10 ms vs 20.57/20.77 (drift 0.19) =  -2.57 ms | gpu  17.52 ms vs 20.09/20.29 (drift 0.20) =  -2.67 ms
-static world: wall 17.23 ms, gpu 16.89 ms
-neither: per visible body (slope over 0/1/4/16): wall 0.885 ms = 5.1% of the static march, gpu 1.003 ms = 5.9%; bodies that fit a 16.7 ms frame beside the static world: wall -0.6, gpu -0.2
-   cull: per visible body (slope over 0/1/4/16): wall 0.959 ms = 5.6% of the static march, gpu 0.938 ms = 5.6%; bodies that fit a 16.7 ms frame beside the static world: wall -0.6, gpu -0.2
-   rect: per visible body (slope over 0/1/4/16): wall 0.540 ms = 3.1% of the static march, gpu 0.557 ms = 3.3%; bodies that fit a 16.7 ms frame beside the static world: wall -1.0, gpu -0.3
-   both: per visible body (slope over 0/1/4/16): wall 0.506 ms = 2.9% of the static march, gpu 0.559 ms = 3.3%; bodies that fit a 16.7 ms frame beside the static world: wall -1.1, gpu -0.3
+            0 bodies neither: wall  12.37 ms vs 12.53/12.35 (drift 0.18) =  -0.07 ms | gpu  11.80 ms vs 11.80/11.81 (drift 0.01) =  -0.00 ms |      0 px changed, 0 marched
+            0 bodies    cull: wall  12.24 ms vs 12.05/11.96 (drift 0.09) =  +0.24 ms | gpu  11.82 ms vs 11.84/11.96 (drift 0.12) =  -0.08 ms |      0 px changed, 0 marched
+            0 bodies    rect: wall  12.42 ms vs 12.44/12.43 (drift 0.01) =  -0.02 ms | gpu  11.81 ms vs 11.83/11.84 (drift 0.02) =  -0.02 ms |      0 px changed, 0 marched
+            0 bodies    both: wall  12.44 ms vs 12.35/12.28 (drift 0.07) =  +0.12 ms | gpu  11.83 ms vs 11.81/11.88 (drift 0.06) =  -0.02 ms |      0 px changed, 0 marched
+              1 body neither: wall  15.54 ms vs 11.96/11.97 (drift 0.01) =  +3.57 ms | gpu  15.15 ms vs 11.85/11.82 (drift 0.03) =  +3.31 ms |  15633 px changed, 1 marched
+              1 body    cull: wall  15.79 ms vs 12.03/12.02 (drift 0.01) =  +3.77 ms | gpu  15.17 ms vs 11.91/11.82 (drift 0.09) =  +3.31 ms |  15633 px changed, 1 marched
+              1 body    rect: wall  13.17 ms vs 12.58/13.12 (drift 0.54) =  +0.32 ms | gpu  13.09 ms vs 12.96/13.11 (drift 0.15) =  +0.05 ms |  15633 px changed, 1 marched
+              1 body    both: wall  13.32 ms vs 12.87/12.76 (drift 0.11) =  +0.51 ms | gpu  13.24 ms vs 12.83/13.02 (drift 0.19) =  +0.32 ms |  15633 px changed, 1 marched
+            4 bodies neither: wall  24.56 ms vs 12.05/11.92 (drift 0.13) = +12.58 ms | gpu  24.47 ms vs 11.79/11.86 (drift 0.07) = +12.65 ms |  62133 px changed, 4 marched
+            4 bodies    cull: wall  24.58 ms vs 12.09/11.92 (drift 0.17) = +12.58 ms | gpu  24.46 ms vs 11.81/11.81 (drift 0.00) = +12.65 ms |  62133 px changed, 4 marched
+            4 bodies    rect: wall  12.76 ms vs 11.94/13.09 (drift 1.15) =  +0.25 ms | gpu  13.84 ms vs 12.80/12.80 (drift 0.00) =  +1.03 ms |  62133 px changed, 4 marched
+            4 bodies    both: wall  13.74 ms vs 12.66/12.52 (drift 0.14) =  +1.15 ms | gpu  12.60 ms vs 11.79/11.78 (drift 0.01) =  +0.81 ms |  62133 px changed, 4 marched
+           16 bodies neither: wall  65.85 ms vs 11.93/11.81 (drift 0.12) = +53.98 ms | gpu  64.34 ms vs 11.73/11.84 (drift 0.11) = +52.55 ms | 267934 px changed, 16 marched
+           16 bodies    cull: wall  66.51 ms vs 12.15/12.80 (drift 0.65) = +54.04 ms | gpu  68.34 ms vs 11.78/11.76 (drift 0.01) = +56.57 ms | 267934 px changed, 16 marched
+           16 bodies    rect: wall  16.34 ms vs 11.89/11.95 (drift 0.07) =  +4.42 ms | gpu  16.09 ms vs 13.80/11.85 (drift 1.95) =  +3.26 ms | 267934 px changed, 16 marched
+           16 bodies    both: wall  16.33 ms vs 11.88/11.97 (drift 0.09) =  +4.40 ms | gpu  16.12 ms vs 11.78/11.79 (drift 0.01) =  +4.34 ms | 267934 px changed, 16 marched
+           16 bodies    cull against neither: wall  65.45 ms vs 65.13/65.18 (drift 0.05) =  +0.29 ms | gpu  64.45 ms vs 64.53/64.47 (drift 0.06) =  -0.05 ms
+           16 bodies    rect against neither: wall  16.28 ms vs 64.67/64.86 (drift 0.19) = -48.49 ms | gpu  16.09 ms vs 64.48/64.40 (drift 0.09) = -48.35 ms
+           16 bodies    both against neither: wall  16.23 ms vs 64.66/64.86 (drift 0.19) = -48.53 ms | gpu  16.08 ms vs 64.41/64.42 (drift 0.01) = -48.34 ms
+16 behind the camera neither: wall  59.79 ms vs 11.94/12.06 (drift 0.12) = +47.80 ms | gpu  59.33 ms vs 11.83/11.82 (drift 0.01) = +47.51 ms |      0 px changed, 16 marched
+16 behind the camera    cull: wall  11.92 ms vs 12.01/12.15 (drift 0.14) =  -0.16 ms | gpu  11.82 ms vs 11.82/11.81 (drift 0.02) =  +0.00 ms |      0 px changed, 0 marched
+16 behind the camera    rect: wall  59.52 ms vs 11.93/11.91 (drift 0.02) = +47.59 ms | gpu  59.31 ms vs 11.78/11.83 (drift 0.05) = +47.51 ms |      0 px changed, 16 marched
+16 behind the camera    both: wall  11.92 ms vs 11.97/11.90 (drift 0.07) =  -0.02 ms | gpu  11.78 ms vs 11.79/11.78 (drift 0.01) =  -0.01 ms |      0 px changed, 0 marched
+16 behind the camera    cull against neither: wall  11.93 ms vs 60.05/59.89 (drift 0.15) = -48.04 ms | gpu  11.80 ms vs 59.41/61.00 (drift 1.60) = -48.40 ms
+16 behind the camera    rect against neither: wall  59.88 ms vs 59.64/59.82 (drift 0.17) =  +0.15 ms | gpu  60.59 ms vs 60.36/60.57 (drift 0.21) =  +0.12 ms
+16 behind the camera    both against neither: wall  12.24 ms vs 60.23/60.28 (drift 0.05) = -48.01 ms | gpu  11.80 ms vs 59.04/59.06 (drift 0.03) = -47.25 ms
+            16 tight neither: wall  59.94 ms vs 11.94/11.97 (drift 0.03) = +47.98 ms | gpu  59.73 ms vs 11.82/11.87 (drift 0.05) = +47.89 ms | 267934 px changed, 16 marched
+            16 tight    cull: wall  60.45 ms vs 11.98/12.03 (drift 0.06) = +48.44 ms | gpu  59.70 ms vs 11.83/11.82 (drift 0.00) = +47.87 ms | 267934 px changed, 16 marched
+            16 tight    rect: wall  13.95 ms vs 12.19/11.96 (drift 0.24) =  +1.88 ms | gpu  13.59 ms vs 11.83/11.83 (drift 0.01) =  +1.76 ms | 267934 px changed, 16 marched
+            16 tight    both: wall  13.82 ms vs 11.99/11.95 (drift 0.04) =  +1.85 ms | gpu  13.62 ms vs 11.85/11.84 (drift 0.01) =  +1.78 ms | 267934 px changed, 16 marched
+            16 tight    cull against neither: wall  60.35 ms vs 60.03/60.57 (drift 0.54) =  +0.05 ms | gpu  61.95 ms vs 61.18/61.80 (drift 0.62) =  +0.46 ms
+            16 tight    rect against neither: wall  14.49 ms vs 61.67/61.93 (drift 0.26) = -47.31 ms | gpu  14.03 ms vs 62.05/61.78 (drift 0.27) = -47.89 ms
+            16 tight    both against neither: wall  14.59 ms vs 61.91/60.37 (drift 1.54) = -46.55 ms | gpu  14.54 ms vs 62.02/61.94 (drift 0.08) = -47.44 ms
+static world: wall 12.02 ms, gpu 11.83 ms
+neither: per visible body (slope over 0/1/4/16): wall 3.378 ms = 28.1% of the static march, gpu 3.287 ms = 27.8%; bodies that fit a 16.7 ms frame beside the static world: wall 1.4, gpu 1.5
+   cull: per visible body (slope over 0/1/4/16): wall 3.367 ms = 28.0% of the static march, gpu 3.556 ms = 30.1%; bodies that fit a 16.7 ms frame beside the static world: wall 1.4, gpu 1.4
+   rect: per visible body (slope over 0/1/4/16): wall 0.282 ms = 2.3% of the static march, gpu 0.207 ms = 1.7%; bodies that fit a 16.7 ms frame beside the static world: wall 16.6, gpu 23.6
+   both: per visible body (slope over 0/1/4/16): wall 0.265 ms = 2.2% of the static march, gpu 0.273 ms = 2.3%; bodies that fit a 16.7 ms frame beside the static world: wall 17.7, gpu 17.9
 ```
 
-Per body, wall / GPU ms: the 16-body rows' added cost divided by 16, and the slope.
+Per body, wall / GPU ms: each 16-body row's added cost divided by 16, plus the slope.
 
 | | neither | cull | rect | both |
 |---|---|---|---|---|
-| 16 in view, loose | 1.007 / 1.034 | 1.006 / 0.984 | 0.535 / 0.544 | 0.533 / 0.576 |
-| 16 behind the camera | 0.316 / 0.302 | 0.035 / -0.021 | 0.317 / 0.293 | -0.002 / 0.005 |
-| 16 in view, tight | 0.246 / 0.231 | 0.201 / 0.216 | 0.047 / 0.039 | 0.078 / 0.061 |
-| slope over 0/1/4/16, loose | 0.885 / 1.003 | 0.959 / 0.938 | 0.540 / 0.557 | 0.506 / 0.559 |
+| 16 in view, loose | 3.374 / 3.284 | 3.378 / 3.536 | 0.276 / 0.204 | 0.275 / 0.271 |
+| 16 behind the camera | 2.988 / 2.969 | -0.010 / 0.000 | 2.974 / 2.969 | -0.001 / -0.001 |
+| 16 in view, tight | 2.999 / 2.993 | 3.028 / 2.992 | 0.118 / 0.110 | 0.116 / 0.111 |
+| slope over 0/1/4/16, loose | 3.378 / 3.287 | 3.367 / 3.556 | 0.282 / 0.207 | 0.265 / 0.273 |
 
-**The cull removes bodies behind the camera almost entirely.** With it, sixteen of them cost +0.56 ms wall (drift 0.15) and -0.33 ms GPU against no bodies, and none is marched. Directly against neither it saves 4.80 ms wall (drift 0.54) and 3.54 ms GPU (drift 2.10). Where it culls nothing, it is within drift or under 0.1 ms. So what such a body cost was in the per-body loop, as Task 2 assumed.
+**Without either rejection, a body costs what the previous milestone measured.** A visible body adds 3.38 ms wall, 28% of a 12.02 ms static world; the previous milestone measured 3.17 ms against 11.80. A body behind the camera costs 89% as much as a visible one (2.99 against 3.37), the same share that milestone found.
 
-**The rectangle halves a visible loose body's cost:** it saves 7.42 ms wall (drift 0.04) and 7.79 ms GPU (drift 0.74) on sixteen. Alone, it saves nothing behind the camera, where a body gets the whole screen: +0.70 ms wall (drift 0.36), +0.19 ms GPU (drift 0.47). Together with the cull, those bodies are gone (4.12 / 4.26 ms saved).
+**The cull removes bodies behind the camera entirely.** Directly against neither, it saves 48.04 ms wall (drift 0.15) and 48.40 ms GPU (drift 1.60) on sixteen bodies, and none is marched. Where it culls nothing, it is within drift.
 
-**Does the rectangle's gain depend on body size? Yes: on how much of the body's box is empty.** On the same on-screen cube it saves 7.42 ms for loose bodies and 2.93 ms (drift 0.19) for tight ones. A loose body's rectangle, from its occupied bounds, also rejects pixels whose rays would enter the 64-voxel box and walk its empty space. A tight body has no such pixels, so the rectangle saves only the read, the transforms and the slab test. Inside the rectangle, a loose body still costs about 11 times a tight one (0.535 against 0.047 ms wall per body): rays still enter the 64 box outside the cube. Part of that ratio is the tight cube being one uniform node, which is a confound for the ratio but not for the rectangle's gain. Starting a body's traversal at its occupied bounds rather than its volume's box is the obvious next rejection. It is not measured here.
+**The rectangle cuts a visible body's cost about twelvefold.** On sixteen loose bodies it saves 48.49 ms wall (drift 0.19) and 48.35 ms GPU (drift 0.09); on tight ones, 47.31 / 47.89. Alone it saves nothing behind the camera (+0.15 ms wall, drift 0.17), because a body there gets the whole screen. The cull removes those bodies instead.
 
-**Both joined `DEFAULT`**, each faster than drift where it can act and within drift where it cannot. Neither changes a pixel (the parity gates, and every row above), and neither runs for a body-free scene.
+**Body size.** The rectangle's gain now barely depends on it: 48.5 ms saved on loose bodies, 47.3 on tight ones. The cost left inside the rectangle does depend on it. A loose body costs about 2.4 times a tight one (0.275 against 0.116 ms wall), because its rays still enter the 64-voxel box outside the cube. Part of that gap comes from the tight cube being a single uniform node. The obvious next rejection is to start a body's traversal at its occupied bounds; it is not measured here.
 
-**`MAX_BODIES` stays 1.** The static world, the median of every baseline reading in the run, took 17.23 ms wall and 16.89 ms GPU: already past 16.7 ms before any body. With both rejections a visible body costs 0.506 ms wall and 0.559 ms GPU, so the room beside the static world is (16.7 - 17.23) / 0.506 = -1.0 bodies on the wall clock and (16.7 - 16.89) / 0.559 = -0.3 on the GPU. Pairing the per-body cost with the static world from the cross-commit run instead (15.69 wall, 15.44 GPU) gives 2.0 and 2.3. That still floors to 1 on the wall clock, and those two numbers come from different processes. **Bodies are no longer what holds the cap. The static world is.** A visible body is now about 3% of the static march. The cap should be re-derived once the static-world regression above is understood.
+**Both joined `DEFAULT`.** Each is faster than drift where it can act, and within drift where it cannot. Neither changes a pixel, and neither runs for a body-free scene.
 
-**What these numbers do not show.** They are dispatch timings at one camera, not frame rates: no present, no vsync, no CPU frame work. One scene, one resolution, one GPU. Most of the per-body cost is paid per pixel, so the cap arithmetic is tied to 1280x720. The bodies sit at one distance (about 15,600 pixels each), so a nearer body costs more under the rectangle. The static world's absolute time moved by about 1.5 ms between processes in this session (15.69 in one run, 17.23 in the next), more than most in-run drift. The cap arithmetic rests on that absolute, and comparisons do not. These per-body figures are not comparable with the previous milestone's 3.17 ms: different shader, different process, and no A/B/A across them was run. Primary rays only: shadow rays do not compose bodies. That `prepare_march_buffers` calls `frame_uniform` is still untested, which would need a render device.
+**`MAX_BODIES` is 16.** Sixteen visible bodies under both rejections marched in 16.33 ms wall and 16.12 ms GPU, under 16.7 ms. The slope (0.265 ms wall, 0.273 ms GPU per body) would fit 17.7 and 17.9 bodies beside the 12.02 / 11.83 ms static world. But sixteen is the largest count actually run, and the difference is under a tenth of a millisecond of headroom.
+
+**The cliff also distorted body costs, in the other direction.** Under e225213's shader, a body with neither rejection cost 1.0 ms, and sixteen such bodies took 33.4 ms. Now they cost 3.4 ms and 65.9 ms. The driver that made the static world slower made the body path cheaper. So the body path's codegen is not settled: the same work has run at a third of today's cost. That is an open question, not a result.
+
+**What these numbers do not show.**
+- They are dispatch timings at one camera, not frame rates. There is no present, no vsync and no CPU frame work, so the cap leaves no frame headroom.
+- They cover one scene, one resolution, one GPU and one driver.
+- Most of the per-body cost is paid per pixel, so the cap is tied to 1280x720 and to bodies about 15,600 pixels on screen. A nearer body costs more under the rectangle.
+- They cover primary rays only: shadow rays do not compose bodies.
+- That `prepare_march_buffers` calls `frame_uniform` is still untested; testing it would need a render device.
 
 ## Corrections made during execution
 
@@ -858,5 +837,6 @@ Per body, wall / GPU ms: the 16-body rows' added cost divided by 16, and the slo
   - beam and distance-field seeds moved the ray origin instead of starting the distance;
   - the mask filter asked from the cell ahead of an exact entry plane.
 - The inner-plane tie guard stops the tie loop from running on every frame entry, where the entering face always ties.
-- The 11.80 ms static world Task 4 was to use predated those traversal changes. It was re-measured (above), and has regressed.
+- The 11.80 ms static world Task 4 was to use predated those traversal changes. Re-measuring it found a 17-24% regression. The bisect put it in 6b47b61; the cause was a driver optimisation cliff from the tie loop, fixed with a branch-free mask (8b59104).
+- Task 4 first left `MAX_BODIES` at 1 because of that regression. Re-run after the fix, it is 16.
 - `the_uploaded_uniform_marches_no_more_than_the_cap` and the cap-after-cull test assumed a cap of 1 and a `DEFAULT` without the cull. Both now reach past the cap at any value under any `DEFAULT`. Both fail when `marched_body_count` stops clamping.

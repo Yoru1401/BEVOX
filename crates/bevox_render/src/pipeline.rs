@@ -46,26 +46,22 @@ pub const VOXEL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 /// but not marched: the count the shader loops over is clamped to it, after the
 /// cull, so it caps visible bodies.
 ///
-/// Still one, and now because of the static world rather than the bodies. Set
-/// from `bodies_are_measured_against_none` in `tests/gpu_bench.rs` on a GTX
-/// 1650, 2026-09-17, at 1280x720 from the bench camera. With `DEFAULT`'s cull
-/// and rectangles a visible body adds 0.506 ms wall / 0.559 ms GPU -- the
-/// least-squares slope over 0, 1, 4 and 16 bodies, about 3% of the static
-/// march; 0.885 / 1.003 ms with neither, in the same run. But the static world
-/// marched in 17.23 ms wall / 16.89 ms GPU in that run, already past a 16.7 ms
-/// frame, which leaves room for no body. It regressed on this branch: 15.69 ms
-/// at 5a43911 against 12.89 / 12.43 ms at 85370de, the commit before the
-/// exact-tie and camera-relative traversal changes, A/B/A across the two builds
-/// (GPU 15.44 against 13.35 / 12.91).
+/// Sixteen, measured rather than extrapolated. In
+/// `bodies_are_measured_against_none` in `tests/gpu_bench.rs` (GTX 1650,
+/// 2026-09-17, 1280x720, bench camera, at 8b59104) the static world marched in
+/// 12.02 ms wall / 11.83 ms GPU, and sixteen visible bodies under `DEFAULT`'s
+/// cull and rectangles in 16.33 / 16.12 ms, under a 16.7 ms frame. The slope
+/// over 0, 1, 4 and 16 bodies is 0.265 ms wall / 0.273 ms GPU per body, which
+/// would fit 17.7 / 17.9; sixteen is the largest count actually run.
 ///
-/// Raise this once the static world is back under the frame with room to
-/// spare, re-running the benchmark. Most of the per-body cost is paid per
-/// pixel, so the arithmetic is tied to 1280x720. The plan's Measurements
-/// section has the numbers.
+/// This is a dispatch budget, not a frame: no present, no CPU frame work, and no
+/// headroom for either. Most of the per-body cost is paid per pixel, so the
+/// arithmetic is tied to 1280x720 and to bodies about 15,600 pixels on screen.
+/// The plan's Measurements section has the numbers.
 ///
 /// The test harness writes its own uniform and is not capped, which is what
 /// lets the benchmark measure past this.
-pub const MAX_BODIES: usize = 1;
+pub const MAX_BODIES: usize = 16;
 
 /// How many of `bodies` the shader marches: all of them, up to `MAX_BODIES`.
 ///
