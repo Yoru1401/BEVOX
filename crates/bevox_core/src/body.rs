@@ -10,6 +10,7 @@ use crate::march::{Hit, MarchStats, march};
 use crate::material::MaterialTable;
 use crate::physics::classify::{Features, features};
 use crate::physics::contact::ContactKey;
+use crate::physics::solver::ContactImpulse;
 use crate::physics::mass::{MassProperties, mass_properties};
 use glam::{Affine3A, Quat, UVec3, Vec3};
 use std::collections::HashMap;
@@ -40,9 +41,9 @@ pub struct Body {
     /// Corner and edge voxels, the only ones tested for contact. Empty until
     /// `recompute`.
     pub features: Features,
-    /// Each contact's accumulated normal impulse from the last tick, for warm
+    /// Each contact's accumulated impulse from the last tick, for warm
     /// starting. Cleared by `recompute`, whose voxels may have moved.
-    pub warm: HashMap<ContactKey, f32>,
+    pub warm: HashMap<ContactKey, ContactImpulse>,
 }
 
 impl Body {

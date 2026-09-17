@@ -137,7 +137,15 @@ fn demo_body(centre: Vec3, orientation: Quat) -> Body {
 /// One physics tick for every body.
 fn physics_system(time: Res<Time>, mut scene: ResMut<VoxelScene>) {
     let scene = &mut *scene;
-    if step(&mut scene.bodies, &scene.tree, &scene.field, GRAVITY, time.delta_secs()) {
+    let changed = step(
+        &mut scene.bodies,
+        &scene.tree,
+        &scene.field,
+        &scene.materials,
+        GRAVITY,
+        time.delta_secs(),
+    );
+    if changed {
         // A body left the world. The body list is packed into the scene
         // buffers, so they must be rebuilt.
         scene.generation += 1;

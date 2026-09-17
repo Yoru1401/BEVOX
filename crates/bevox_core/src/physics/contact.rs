@@ -9,6 +9,7 @@ use super::classify::{Shape, classify, solid_at};
 use crate::body::{Body, occupied_bounds};
 use crate::contree::Contree;
 use crate::distance_field::{CELL_VOXELS, DistanceField};
+use crate::material::{MaterialTable, combine_friction, combine_restitution};
 use glam::{IVec3, UVec3, Vec3};
 use std::collections::HashMap;
 
@@ -33,6 +34,10 @@ pub struct Contact {
     pub anchor: Vec3,
     /// Where that point was in the world at detection.
     pub world_point: Vec3,
+    /// Coulomb friction between the two voxels that touch.
+    pub friction: f32,
+    /// How much of the approach speed a bounce keeps.
+    pub restitution: f32,
 }
 
 /// Owned ranges are half-open, so a point on the boundary between two voxels
@@ -174,6 +179,7 @@ fn box_voxels(min: Vec3, max: Vec3, extent: u32) -> impl Iterator<Item = IVec3> 
 
 /// Records a contact unless it is past the margin. When two loops find the same
 /// voxel pair, the first stands.
+#[allow(clippy::too_many_arguments)]
 fn keep(
     found: &mut HashMap<ContactKey, Contact>,
     body: &Body,
@@ -182,12 +188,38 @@ fn keep(
     normal: Vec3,
     separation: f32,
     world_point: Vec3,
+    coefficients: (f32, f32),
 ) {
     if separation > margin {
         return;
     }
     let anchor = body.local_from_world().transform_point3(world_point) - body.com;
-    found.entry(key).or_insert(Contact { key, normal, separation, anchor, world_point });
+    let (friction, restitution) = coefficients;
+    found.entry(key).or_insert(Contact {
+        key,
+        normal,
+        separation,
+        anchor,
+        world_point,
+        friction,
+        restitution,
+    });
+}
+
+/// The coefficients for a touch between a body voxel and a world voxel: each
+/// voxel's own material, combined. A body half on ice drags on one side only.
+///
+/// `k` is always inside the world here: every caller has tested it already.
+fn coefficients(
+    materials: &MaterialTable,
+    body: &Body,
+    u: UVec3,
+    tree: &Contree,
+    k: IVec3,
+) -> (f32, f32) {
+    let a = materials.get(body.volume.get(u));
+    let b = materials.get(tree.get(k.as_uvec3()));
+    (combine_friction(a.friction, b.friction), combine_restitution(a.restitution, b.restitution))
 }
 
 /// Every contact between `body` and the static world with a separation of at
@@ -196,7 +228,13 @@ fn keep(
 /// The reach grows with the margin. A contact at `margin` needs voxels up to
 /// `ceil(margin + 0.5)` away, and a floor exactly one voxel below a resting
 /// corner sits on a 2x2x2 lookup's tie boundary.
-pub fn detect(body: &Body, tree: &Contree, field: &DistanceField, margin: f32) -> Vec<Contact> {
+pub fn detect(
+    body: &Body,
+    tree: &Contree,
+    field: &DistanceField,
+    materials: &MaterialTable,
+    margin: f32,
+) -> Vec<Contact> {
     let Some((min, max)) = world_box(body, margin) else {
         return Vec::new();
     };
@@ -219,7 +257,9 @@ pub fn detect(body: &Body, tree: &Contree, field: &DistanceField, margin: f32) -
             }
             if let Some((sep, n)) = sphere_vs_voxel(q, k.as_vec3() + 0.5, classify(world_solid, k))
             {
-                keep(&mut found, body, margin, (u, k), n, sep, q - n * (RADIUS + sep * 0.5));
+                let point = q - n * (RADIUS + sep * 0.5);
+                let pair = coefficients(materials, body, u, tree, k);
+                keep(&mut found, body, margin, (u, k), n, sep, point, pair);
             }
         }
     }
@@ -242,6 +282,7 @@ pub fn detect(body: &Body, tree: &Contree, field: &DistanceField, margin: f32) -
                 // the body is pushed the other way.
                 let point = world_from_local
                     .transform_point3(q - n_local * (RADIUS + sep * 0.5));
+                let pair = coefficients(materials, body, u.as_uvec3(), tree, k);
                 keep(
                     &mut found,
                     body,
@@ -250,6 +291,7 @@ pub fn detect(body: &Body, tree: &Contree, field: &DistanceField, margin: f32) -
                     -(body.orientation * n_local),
                     sep,
                     point,
+                    pair,
                 );
             }
         }
@@ -267,7 +309,8 @@ pub fn detect(body: &Body, tree: &Contree, field: &DistanceField, margin: f32) -
             if let Some((sep, n, point)) =
                 edge_vs_edge(p, d, k.as_vec3() + 0.5, AXES[world_axis])
             {
-                keep(&mut found, body, margin, (u, k), n, sep, point);
+                let pair = coefficients(materials, body, u, tree, k);
+                keep(&mut found, body, margin, (u, k), n, sep, point, pair);
             }
         }
     }
@@ -281,7 +324,7 @@ pub fn detect(body: &Body, tree: &Contree, field: &DistanceField, margin: f32) -
 mod tests {
     use super::*;
     use crate::material::MaterialId;
-    use crate::physics::fixtures::{cube, placed, slab};
+    use crate::physics::fixtures::{cube, cube_of, materials, placed, slab};
     use glam::Quat;
 
     const TOLERANCE: f32 = 1e-4;
@@ -346,7 +389,7 @@ mod tests {
         let field = DistanceField::build(&world);
         for angle in [0.0f32, 0.5236] {
             let body = placed(cube(4, 4), Vec3::new(32.0, 10.0, 32.0), Quat::from_rotation_y(angle));
-            let contacts = detect(&body, &world, &field, 0.1);
+            let contacts = detect(&body, &world, &field, &materials(), 0.1);
             assert_eq!(contacts.len(), 4, "at {angle} rad: {contacts:#?}");
             for c in &contacts {
                 assert!(c.separation.abs() < TOLERANCE, "at {angle} rad, separation {}", c.separation);
@@ -369,7 +412,7 @@ mod tests {
         // A 4-cube centred over the pillar: the pillar's top meets the middle of
         // its bottom face.
         let body = placed(cube(4, 4), Vec3::new(32.5, 10.0, 32.5), Quat::IDENTITY);
-        let contacts = detect(&body, &world, &field, 0.1);
+        let contacts = detect(&body, &world, &field, &materials(), 0.1);
         assert!(!contacts.is_empty(), "the pillar was not found");
         for c in &contacts {
             assert_eq!(c.key.1, IVec3::new(32, 7, 32), "contact with {:?}", c.key.1);
@@ -389,7 +432,7 @@ mod tests {
         let field = DistanceField::build(&world);
         let bar: Vec<_> = (0..16).map(|x| (UVec3::new(x, 0, 0), MaterialId(1))).collect();
         let body = placed(Contree::from_voxels(16, &bar), Vec3::new(32.5, 9.5, 32.5), Quat::IDENTITY);
-        let contacts = detect(&body, &world, &field, 0.1);
+        let contacts = detect(&body, &world, &field, &materials(), 0.1);
         assert!(
             contacts.iter().any(|c| c.key == (UVec3::new(8, 0, 0), IVec3::new(32, 8, 32))
                 && c.separation.abs() < TOLERANCE),
@@ -411,11 +454,47 @@ mod tests {
         assert!(!field_clears(&field, Vec3::new(20.0, 4.0, 20.0), Vec3::new(28.0, 10.0, 28.0)));
     }
 
+    /// The coefficients come from the two voxels that touch, not from the
+    /// body: a cube resting half on ice and half on stone drags on one side.
+    #[test]
+    fn a_contact_takes_the_coefficients_of_both_voxels() {
+        let materials = materials();
+        // Floor of stone (1), with the far half ice (3).
+        let mut voxels = Vec::new();
+        for z in 0..64 {
+            for y in 0..8 {
+                for x in 0..64 {
+                    let m = if x >= 32 { MaterialId(3) } else { MaterialId(1) };
+                    voxels.push((UVec3::new(x, y, z), m));
+                }
+            }
+        }
+        let world = Contree::from_voxels(64, &voxels);
+        let field = DistanceField::build(&world);
+        // A bouncy cube (4) straddling the seam.
+        let body = placed(cube_of(4, 4, MaterialId(4)), Vec3::new(32.0, 10.0, 32.0), Quat::IDENTITY);
+        let contacts = detect(&body, &world, &field, &materials, 0.1);
+        assert_eq!(contacts.len(), 4);
+
+        let on_ice: Vec<_> = contacts.iter().filter(|c| c.key.1.x >= 32).collect();
+        let on_stone: Vec<_> = contacts.iter().filter(|c| c.key.1.x < 32).collect();
+        assert_eq!(on_ice.len(), 2, "the cube did not straddle the seam");
+        assert_eq!(on_stone.len(), 2);
+        for c in on_ice {
+            assert_eq!(c.friction, 0.0, "ice is frictionless");
+            assert!((c.restitution - 0.8).abs() < 1e-6, "the bouncy cube bounces on ice");
+        }
+        for c in on_stone {
+            assert!((c.friction - 0.6).abs() < 1e-6, "stone against a gripping cube");
+            assert!((c.restitution - 0.8).abs() < 1e-6);
+        }
+    }
+
     #[test]
     fn a_body_in_open_air_has_no_contacts() {
         let world = slab(64, 0..8);
         let field = DistanceField::build(&world);
         let body = placed(cube(4, 4), Vec3::new(32.0, 40.0, 32.0), Quat::IDENTITY);
-        assert!(detect(&body, &world, &field, 1.35).is_empty());
+        assert!(detect(&body, &world, &field, &materials(), 1.35).is_empty());
     }
 }
