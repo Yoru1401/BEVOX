@@ -55,7 +55,9 @@ pub struct VoxelScene {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct MarchUniform {
-    pub world_from_clip: [[f32; 4]; 4],
+    /// Clip space to the world-space offset from `camera_position`. See
+    /// `ExtractedMarchCamera::offset_from_clip`.
+    pub offset_from_clip: [[f32; 4]; 4],
     pub camera_position: [f32; 4],
     /// Normalised direction *toward* the sun.
     pub sun_direction: [f32; 4],
@@ -349,7 +351,18 @@ pub fn extract_gpu_scene(
 /// The active camera, as the render world needs it.
 #[derive(Resource, Clone, ExtractResource)]
 pub struct ExtractedMarchCamera {
-    pub world_from_clip: Mat4,
+    /// Clip space to the world-space offset from `position`: the camera's
+    /// rotation times the inverse projection, with no translation anywhere in
+    /// it.
+    ///
+    /// Not an absolute inverse view-projection. In f32 every entry of that
+    /// carries about `|position| * epsilon` of error, and a primary ray built by
+    /// unprojecting the near plane (0.1 away under reverse-Z) and subtracting
+    /// the eye amplifies it by `1 / near`: about 2 pixels at 2560x1440 a
+    /// thousand units from the origin, which moved body edges outside their
+    /// screen rectangles. Built from rotation and projection only, the error is
+    /// relative and does not grow with distance from the origin.
+    pub offset_from_clip: Mat4,
     pub position: Vec3,
 }
 
@@ -435,10 +448,11 @@ pub fn track_march_camera(
     let Ok((transform, projection)) = camera.single() else {
         return;
     };
-    let view = transform.to_matrix().inverse();
-    let clip_from_world = projection.get_clip_from_view() * view;
+    // Rotation and projection only: never derived from the absolute
+    // view-projection, whose f32 error cannot be subtracted back out.
     commands.insert_resource(ExtractedMarchCamera {
-        world_from_clip: clip_from_world.inverse(),
+        offset_from_clip: Mat4::from_quat(transform.rotation())
+            * projection.get_clip_from_view().inverse(),
         position: transform.translation(),
     });
 }
@@ -483,21 +497,21 @@ pub fn create_march_target(
 
 /// Builds the shader uniform from a camera and the volume being drawn.
 ///
-/// `world_from_clip` is the inverse view-projection: the shader multiplies a
-/// clip-space point by it to get a world-space ray target.
+/// `offset_from_clip` is camera-relative, as `ExtractedMarchCamera` describes:
+/// the shader multiplies a clip-space point by it to get a ray direction.
 ///
 /// Takes the field rather than recomputing its edge count from `tree.extent()`:
 /// that formula already lives in `DistanceField::build`, and repeating it here
 /// is a second spelling of the same number that could silently drift from it.
 pub fn march_uniform(
-    world_from_clip: Mat4,
+    offset_from_clip: Mat4,
     camera_position: Vec3,
     tree: &Contree,
     field: &DistanceField,
     flags: u32,
 ) -> MarchUniform {
     MarchUniform {
-        world_from_clip: world_from_clip.to_cols_array_2d(),
+        offset_from_clip: offset_from_clip.to_cols_array_2d(),
         camera_position: camera_position.extend(0.0).to_array(),
         sun_direction: SUN_DIRECTION.normalize().extend(0.0).to_array(),
         volume_params: [tree.depth(), tree.extent(), flags, 0],
@@ -794,9 +808,9 @@ mod tests {
         let field = DistanceField::build(&tree);
         let u = march_uniform(m, Vec3::ZERO, &tree, &field, march_flags::NONE);
         // glam is column-major, and to_cols_array_2d yields columns.
-        assert_eq!(u.world_from_clip[3][0], 5.0);
-        assert_eq!(u.world_from_clip[3][1], 6.0);
-        assert_eq!(u.world_from_clip[3][2], 7.0);
+        assert_eq!(u.offset_from_clip[3][0], 5.0);
+        assert_eq!(u.offset_from_clip[3][1], 6.0);
+        assert_eq!(u.offset_from_clip[3][2], 7.0);
     }
 
     use bevox_core::contree::Contree;

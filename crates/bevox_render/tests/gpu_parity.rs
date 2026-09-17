@@ -7,6 +7,7 @@ use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
 use bevox_core::gpu::GpuVolume;
 use bevox_core::march::{MarchStats, march};
+use bevox_render::cull::GpuBodyRect;
 use bevox_render::upload::{VoxelScene, march_flags};
 use bevox_core::material::MaterialId;
 use glam::{Affine3A, Mat4, Quat, UVec3, Vec3, Vec4};
@@ -41,13 +42,13 @@ fn parity_scene() -> Contree {
 
 
 /// Same ray construction the shader performs, operation for operation, so both
-/// sides march the same rays bit for bit: the pixel centre as an exact integer
-/// times an explicit reciprocal.
-fn ray_direction(world_from_clip: Mat4, eye: Vec3, x: u32, y: u32, w: u32, h: u32) -> Vec3 {
+/// sides march the same rays bit for bit: camera-relative, nothing subtracted,
+/// and the pixel centre as an exact integer times an explicit reciprocal.
+fn ray_direction(offset_from_clip: Mat4, x: u32, y: u32, w: u32, h: u32) -> Vec3 {
     let ndc_x = ((2 * x + 1) as f32 - w as f32) * (1.0 / w as f32);
     let ndc_y = (h as f32 - (2 * y + 1) as f32) * (1.0 / h as f32);
-    let far = world_from_clip * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
-    (far.truncate() / far.w - eye).normalize()
+    let p = offset_from_clip * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+    (p.truncate() / p.w).normalize()
 }
 
 /// Renders one frame with the given traversal flags and reads it back.
@@ -57,7 +58,7 @@ fn run_march_flagged(
     queue: &wgpu::Queue,
     source: &str,
     entry_point: &str,
-    world_from_clip: Mat4,
+    offset_from_clip: Mat4,
     eye: Vec3,
     tree: &Contree,
     width: u32,
@@ -65,7 +66,7 @@ fn run_march_flagged(
     flags: u32,
 ) -> Vec<u8> {
     Prepared::new(
-        device, source, entry_point, tree, world_from_clip, eye, width, height, flags,
+        device, source, entry_point, tree, offset_from_clip, eye, width, height, flags,
         &[],
     )
     .read_back(device, queue)
@@ -78,14 +79,14 @@ fn run_march(
     queue: &wgpu::Queue,
     source: &str,
     entry_point: &str,
-    world_from_clip: Mat4,
+    offset_from_clip: Mat4,
     eye: Vec3,
     tree: &Contree,
     width: u32,
     height: u32,
 ) -> Vec<u8> {
     Prepared::new(
-        device, source, entry_point, tree, world_from_clip, eye, width, height, 0, &[],
+        device, source, entry_point, tree, offset_from_clip, eye, width, height, 0, &[],
     )
     .read_back(device, queue)
 }
@@ -99,7 +100,7 @@ fn run_bodies(
     queue: &wgpu::Queue,
     source: &str,
     entry_point: &str,
-    world_from_clip: Mat4,
+    offset_from_clip: Mat4,
     eye: Vec3,
     world: &Contree,
     bodies: &[Body],
@@ -107,7 +108,7 @@ fn run_bodies(
     height: u32,
 ) -> Vec<u8> {
     Prepared::new(
-        device, source, entry_point, world, world_from_clip, eye, width, height,
+        device, source, entry_point, world, offset_from_clip, eye, width, height,
         march_flags::DEFAULT | march_flags::BODIES, bodies,
     )
     .read_back(device, queue)
@@ -158,9 +159,9 @@ fn the_display_entry_point_renders_a_scene() {
 
     let (width, height) = (64u32, 64u32);
     let eye = Vec3::new(-30.0, 40.0, -30.0);
-    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(32.0, 12.0, 32.0) - eye, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, width as f32 / height as f32, 0.1, 500.0);
-    let world_from_clip = (projection * view).inverse();
+    let offset_from_clip = (projection * view).inverse();
 
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader file missing");
     let pixels = run_march(
@@ -168,7 +169,7 @@ fn the_display_entry_point_renders_a_scene() {
         &queue,
         &shader,
         "march",
-        world_from_clip,
+        offset_from_clip,
         eye,
         &tree,
         width,
@@ -207,9 +208,9 @@ fn the_gpu_reports_the_same_hit_voxel_as_the_cpu() {
     let tree = parity_scene();
     let (width, height) = (64u32, 64u32);
     let eye = Vec3::new(-30.0, 40.0, -30.0);
-    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(32.0, 12.0, 32.0) - eye, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, width as f32 / height as f32, 0.1, 500.0);
-    let world_from_clip = (projection * view).inverse();
+    let offset_from_clip = (projection * view).inverse();
 
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader file missing");
     let pixels = run_march(
@@ -217,7 +218,7 @@ fn the_gpu_reports_the_same_hit_voxel_as_the_cpu() {
         &queue,
         &shader,
         "march_voxel_id",
-        world_from_clip,
+        offset_from_clip,
         eye,
         &tree,
         width,
@@ -230,7 +231,7 @@ fn the_gpu_reports_the_same_hit_voxel_as_the_cpu() {
 
     for y in 0..height {
         for x in 0..width {
-            let dir = ray_direction(world_from_clip, eye, x, y, width, height);
+            let dir = ray_direction(offset_from_clip, x, y, width, height);
             let cpu = march(&tree, Affine3A::IDENTITY, eye, dir, 1000.0, false, &mut stats);
             let i = ((y * width + x) * 4) as usize;
 
@@ -270,9 +271,9 @@ fn the_gpu_normals_match_the_cpu() {
     let tree = parity_scene();
     let (width, height) = (64u32, 64u32);
     let eye = Vec3::new(-30.0, 40.0, -30.0);
-    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(32.0, 12.0, 32.0) - eye, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, width as f32 / height as f32, 0.1, 500.0);
-    let world_from_clip = (projection * view).inverse();
+    let offset_from_clip = (projection * view).inverse();
 
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader file missing");
     let pixels = run_march(
@@ -280,7 +281,7 @@ fn the_gpu_normals_match_the_cpu() {
         &queue,
         &shader,
         "march_normal",
-        world_from_clip,
+        offset_from_clip,
         eye,
         &tree,
         width,
@@ -295,7 +296,7 @@ fn the_gpu_normals_match_the_cpu() {
 
     for y in 0..height {
         for x in 0..width {
-            let dir = ray_direction(world_from_clip, eye, x, y, width, height);
+            let dir = ray_direction(offset_from_clip, x, y, width, height);
             let Some(hit) = march(&tree, Affine3A::IDENTITY, eye, dir, 1000.0, false, &mut stats)
             else {
                 continue;
@@ -341,9 +342,9 @@ fn the_gpu_shadows_match_the_cpu() {
     let tree = parity_scene();
     let (width, height) = (64u32, 64u32);
     let eye = Vec3::new(-30.0, 40.0, -30.0);
-    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(32.0, 12.0, 32.0) - eye, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, width as f32 / height as f32, 0.1, 500.0);
-    let world_from_clip = (projection * view).inverse();
+    let offset_from_clip = (projection * view).inverse();
     let sun = bevox_render::upload::SUN_DIRECTION.normalize();
 
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader file missing");
@@ -352,7 +353,7 @@ fn the_gpu_shadows_match_the_cpu() {
         &queue,
         &shader,
         "march_shadow",
-        world_from_clip,
+        offset_from_clip,
         eye,
         &tree,
         width,
@@ -367,7 +368,7 @@ fn the_gpu_shadows_match_the_cpu() {
 
     for y in 0..height {
         for x in 0..width {
-            let dir = ray_direction(world_from_clip, eye, x, y, width, height);
+            let dir = ray_direction(offset_from_clip, x, y, width, height);
             let Some(hit) = march(&tree, Affine3A::IDENTITY, eye, dir, 1000.0, false, &mut stats)
             else {
                 continue;
@@ -439,9 +440,9 @@ fn a_distant_camera_on_a_large_volume_still_reaches_the_geometry() {
     let eye = centre_f + Vec3::new(-1.0, 1.2, -1.0).normalize() * extent as f32 * 1.1;
 
     let (width, height) = (256u32, 256u32);
-    let view = Mat4::look_at_rh(eye, centre_f, Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, centre_f - eye, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 20_000.0);
-    let world_from_clip = (projection * view).inverse();
+    let offset_from_clip = (projection * view).inverse();
 
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader file missing");
     let pixels = run_march(
@@ -449,7 +450,7 @@ fn a_distant_camera_on_a_large_volume_still_reaches_the_geometry() {
         &queue,
         &shader,
         "march_identity",
-        world_from_clip,
+        offset_from_clip,
         eye,
         &tree,
         width,
@@ -465,7 +466,7 @@ fn a_distant_camera_on_a_large_volume_still_reaches_the_geometry() {
     let mut cpu_hits = 0usize;
     for y in 0..height {
         for x in 0..width {
-            let dir = ray_direction(world_from_clip, eye, x, y, width, height);
+            let dir = ray_direction(offset_from_clip, x, y, width, height);
             if march(&tree, Affine3A::IDENTITY, eye, dir, 100_000.0, false, &mut stats).is_some() {
                 cpu_hits += 1;
             }
@@ -500,18 +501,18 @@ fn the_mask_filter_and_beam_together_leave_output_identical() {
     let tree = parity_scene();
     let (width, height) = (64u32, 64u32);
     let eye = Vec3::new(-30.0, 40.0, -30.0);
-    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(32.0, 12.0, 32.0) - eye, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
-    let world_from_clip = (projection * view).inverse();
+    let offset_from_clip = (projection * view).inverse();
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
     for entry in ["march_identity", "march_normal", "march_shadow", "march"] {
         let off = run_march_flagged(
-            &device, &queue, &shader, entry, world_from_clip, eye, &tree, width,
+            &device, &queue, &shader, entry, offset_from_clip, eye, &tree, width,
             height, 0,
         );
         let on = run_march_flagged(
-            &device, &queue, &shader, entry, world_from_clip, eye, &tree, width,
+            &device, &queue, &shader, entry, offset_from_clip, eye, &tree, width,
             height, 0b110,
         );
         assert_eq!(off, on, "{entry}: the mask filter and beam together changed output");
@@ -529,9 +530,9 @@ fn the_gpu_traversal_agrees_with_the_cpu_reference() {
 
     let (width, height) = (64u32, 64u32);
     let eye = Vec3::new(-30.0, 40.0, -30.0);
-    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(32.0, 12.0, 32.0) - eye, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, width as f32 / height as f32, 0.1, 500.0);
-    let world_from_clip = (projection * view).inverse();
+    let offset_from_clip = (projection * view).inverse();
 
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader file missing");
     let gpu_pixels = run_march(
@@ -539,7 +540,7 @@ fn the_gpu_traversal_agrees_with_the_cpu_reference() {
         &queue,
         &shader,
         "march_identity",
-        world_from_clip,
+        offset_from_clip,
         eye,
         &tree,
         width,
@@ -552,7 +553,7 @@ fn the_gpu_traversal_agrees_with_the_cpu_reference() {
 
     for y in 0..height {
         for x in 0..width {
-            let dir = ray_direction(world_from_clip, eye, x, y, width, height);
+            let dir = ray_direction(offset_from_clip, x, y, width, height);
             let cpu = march(&tree, Affine3A::IDENTITY, eye, dir, 1000.0, false, &mut stats);
 
             let i = ((y * width + x) * 4) as usize;
@@ -695,17 +696,17 @@ fn dda_leaves_output_bit_identical() {
     ];
 
     for (i, (eye, target)) in cameras.iter().enumerate() {
-        let view = Mat4::look_at_rh(*eye, *target, Vec3::Y);
+        let view = Mat4::look_at_rh(Vec3::ZERO, *target - *eye, Vec3::Y);
         let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
-        let world_from_clip = (projection * view).inverse();
+        let offset_from_clip = (projection * view).inverse();
 
         for entry in ["march_identity", "march_normal", "march_shadow", "march"] {
             let off = run_march_flagged(
-                &device, &queue, &shader, entry, world_from_clip, *eye, &tree, width,
+                &device, &queue, &shader, entry, offset_from_clip, *eye, &tree, width,
                 height, march_flags::NONE,
             );
             let on = run_march_flagged(
-                &device, &queue, &shader, entry, world_from_clip, *eye, &tree, width,
+                &device, &queue, &shader, entry, offset_from_clip, *eye, &tree, width,
                 height, march_flags::DDA,
             );
             let differing = off
@@ -747,13 +748,13 @@ fn the_mask_filter_leaves_output_bit_identical() {
     ];
 
     for (i, (eye, target)) in cameras.iter().enumerate() {
-        let view = Mat4::look_at_rh(*eye, *target, Vec3::Y);
+        let view = Mat4::look_at_rh(Vec3::ZERO, *target - *eye, Vec3::Y);
         let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
-        let world_from_clip = (projection * view).inverse();
+        let offset_from_clip = (projection * view).inverse();
 
         for entry in ["march_identity", "march_normal", "march_shadow", "march"] {
             let reference = run_march_flagged(
-                &device, &queue, &shader, entry, world_from_clip, *eye, &tree, width,
+                &device, &queue, &shader, entry, offset_from_clip, *eye, &tree, width,
                 height, march_flags::NONE,
             );
             for flags in [
@@ -761,7 +762,7 @@ fn the_mask_filter_leaves_output_bit_identical() {
                 march_flags::DDA | march_flags::MASK_FILTER,
             ] {
                 let got = run_march_flagged(
-                    &device, &queue, &shader, entry, world_from_clip, *eye, &tree,
+                    &device, &queue, &shader, entry, offset_from_clip, *eye, &tree,
                     width, height, flags,
                 );
                 let differing =
@@ -830,14 +831,14 @@ fn the_beam_prepass_never_skips_geometry() {
     for step in 0..8u32 {
         let angle = step as f32 * std::f32::consts::TAU / 8.0;
         let eye = centre + Vec3::new(angle.cos() * 90.0, 30.0, angle.sin() * 90.0);
-        let view = Mat4::look_at_rh(eye, centre, Vec3::Y);
+        let view = Mat4::look_at_rh(Vec3::ZERO, centre - eye, Vec3::Y);
         let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
-        let world_from_clip = (projection * view).inverse();
+        let offset_from_clip = (projection * view).inverse();
 
         for entry in ["march_identity", "march_voxel_id", "march_normal", "march_shadow", "march"]
         {
             let reference = run_march_flagged(
-                &device, &queue, &shader, entry, world_from_clip, eye, &tree, width,
+                &device, &queue, &shader, entry, offset_from_clip, eye, &tree, width,
                 height, march_flags::NONE,
             );
             for flags in [
@@ -845,7 +846,7 @@ fn the_beam_prepass_never_skips_geometry() {
                 march_flags::DDA | march_flags::MASK_FILTER | march_flags::BEAM,
             ] {
                 let seeded = run_march_flagged(
-                    &device, &queue, &shader, entry, world_from_clip, eye, &tree,
+                    &device, &queue, &shader, entry, offset_from_clip, eye, &tree,
                     width, height, flags,
                 );
                 let differing =
@@ -958,13 +959,13 @@ fn the_distance_field_leaves_output_bit_identical() {
              none of the jump arithmetic"
         );
 
-        let view = Mat4::look_at_rh(eye, centre, Vec3::Y);
+        let view = Mat4::look_at_rh(Vec3::ZERO, centre - eye, Vec3::Y);
         let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
-        let world_from_clip = (projection * view).inverse();
+        let offset_from_clip = (projection * view).inverse();
 
         for entry in ["march_identity", "march_voxel_id", "march_normal", "march"] {
             let reference = run_march_flagged(
-                &device, &queue, &shader, entry, world_from_clip, eye, &tree, width,
+                &device, &queue, &shader, entry, offset_from_clip, eye, &tree, width,
                 height, march_flags::NONE,
             );
             for flags in [
@@ -972,7 +973,7 @@ fn the_distance_field_leaves_output_bit_identical() {
                 march_flags::DEFAULT | march_flags::DISTANCE_FIELD,
             ] {
                 let got = run_march_flagged(
-                    &device, &queue, &shader, entry, world_from_clip, eye, &tree,
+                    &device, &queue, &shader, entry, offset_from_clip, eye, &tree,
                     width, height, flags,
                 );
                 let differing =
@@ -1024,16 +1025,16 @@ fn dda_matches_the_scan_from_inside_the_volume() {
         for step in 0..4u32 {
             let angle = step as f32 * std::f32::consts::TAU / 4.0;
             let target = *eye + Vec3::new(angle.cos(), 0.6, angle.sin()) * 20.0;
-            let view = Mat4::look_at_rh(*eye, target, Vec3::Y);
+            let view = Mat4::look_at_rh(Vec3::ZERO, target - *eye, Vec3::Y);
             let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
-            let world_from_clip = (projection * view).inverse();
+            let offset_from_clip = (projection * view).inverse();
             for entry in ["march_identity", "march_voxel_id"] {
                 let scan = run_march_flagged(
-                    &device, &queue, &shader, entry, world_from_clip, *eye, &tree,
+                    &device, &queue, &shader, entry, offset_from_clip, *eye, &tree,
                     width, height, march_flags::NONE,
                 );
                 let dda = run_march_flagged(
-                    &device, &queue, &shader, entry, world_from_clip, *eye, &tree,
+                    &device, &queue, &shader, entry, offset_from_clip, *eye, &tree,
                     width, height, march_flags::DDA,
                 );
                 let differing =
@@ -1065,9 +1066,9 @@ fn an_incrementally_uploaded_edit_renders_identically() {
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
     let (width, height) = (96u32, 96u32);
     let eye = Vec3::new(-30.0, 40.0, -30.0);
-    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(32.0, 12.0, 32.0) - eye, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
-    let world_from_clip = (projection * view).inverse();
+    let offset_from_clip = (projection * view).inverse();
 
     let edits = [
         (Vec3::new(32.0, 20.0, 32.0), 7.0, MaterialId(2)),
@@ -1111,7 +1112,7 @@ fn an_incrementally_uploaded_edit_renders_identically() {
 
     let volume = GpuVolume::from_contree(&incremental.tree);
     let prepared = Prepared::new(
-        &device, &shader, "march_identity", &incremental.tree, world_from_clip, eye,
+        &device, &shader, "march_identity", &incremental.tree, offset_from_clip, eye,
         width, height, march_flags::DEFAULT, &[],
     );
 
@@ -1130,7 +1131,7 @@ fn an_incrementally_uploaded_edit_renders_identically() {
         let got = prepared.read_back(&device, &queue);
 
         let reference = run_march_flagged(
-            &device, &queue, &shader, "march_identity", world_from_clip, eye, &whole.tree,
+            &device, &queue, &shader, "march_identity", offset_from_clip, eye, &whole.tree,
             width, height, march_flags::DEFAULT,
         );
 
@@ -1163,22 +1164,22 @@ fn a_scene_with_no_bodies_is_bit_identical_with_bodies_enabled() {
     let tree = parity_scene();
     let (width, height) = (96u32, 96u32);
     let eye = Vec3::new(-30.0, 40.0, -30.0);
-    let view = Mat4::look_at_rh(eye, Vec3::new(32.0, 12.0, 32.0), Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(32.0, 12.0, 32.0) - eye, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
-    let world_from_clip = (projection * view).inverse();
+    let offset_from_clip = (projection * view).inverse();
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
     for entry in ["march_identity", "march_voxel_id", "march_normal", "march_shadow", "march"] {
         // Masked out explicitly: `DEFAULT` carries `BODIES`, so comparing it
         // against `DEFAULT | BODIES` would compare a build with itself.
         let without = run_march_flagged(
-            &device, &queue, &shader, entry, world_from_clip, eye, &tree, width,
+            &device, &queue, &shader, entry, offset_from_clip, eye, &tree, width,
             height, march_flags::DEFAULT & !march_flags::BODIES,
         );
         // With the rectangles on too: the loop runs zero times, and the
         // rectangle buffer is one zeroed entry nothing reads.
         let with = run_march_flagged(
-            &device, &queue, &shader, entry, world_from_clip, eye, &tree, width,
+            &device, &queue, &shader, entry, offset_from_clip, eye, &tree, width,
             height, march_flags::DEFAULT | march_flags::BODIES | march_flags::BODY_RECT,
         );
         let differing = without.chunks(4).zip(with.chunks(4)).filter(|(a, b)| a != b).count();
@@ -1203,9 +1204,9 @@ fn a_placed_body_appears_where_its_transform_puts_it() {
     };
     let (width, height) = (96u32, 96u32);
     let eye = Vec3::new(32.0, 32.0, -60.0);
-    let view = Mat4::look_at_rh(eye, Vec3::splat(32.0), Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::splat(32.0) - eye, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
-    let world_from_clip = (projection * view).inverse();
+    let offset_from_clip = (projection * view).inverse();
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
     // Every ray that reaches the cube (y 25..41, seen from y 32) stays far above
@@ -1218,7 +1219,7 @@ fn a_placed_body_appears_where_its_transform_puts_it() {
     // material in red and the hit flag in green; the floor is another material.
     let halves = |bodies: &[Body]| {
         let pixels = run_bodies(
-            &device, &queue, &shader, "march_identity", world_from_clip, eye, &world, bodies,
+            &device, &queue, &shader, "march_identity", offset_from_clip, eye, &world, bodies,
             width, height,
         );
         let mut sides = [0usize; 2];
@@ -1288,9 +1289,9 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
     // own cell still reads as open space.
     let eye = Vec3::new(100.0, 60.0, 88.0);
     let centre = Vec3::new(100.0, 60.0, 140.0);
-    let view = Mat4::look_at_rh(eye, centre, Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, centre - eye, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
-    let world_from_clip = (projection * view).inverse();
+    let offset_from_clip = (projection * view).inverse();
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
     let mut decoy = Vec::new();
@@ -1327,7 +1328,7 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
 
     let render = |entry: &str| {
         run_bodies(
-            &device, &queue, &shader, entry, world_from_clip, eye, &world,
+            &device, &queue, &shader, entry, offset_from_clip, eye, &world,
             std::slice::from_ref(&body), width, height,
         )
     };
@@ -1349,7 +1350,7 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
     let mut first = String::new();
     for y in 0..height {
         for x in 0..width {
-            let dir = ray_direction(world_from_clip, eye, x, y, width, height);
+            let dir = ray_direction(offset_from_clip, x, y, width, height);
             let i = ((y * width + x) * 4) as usize;
             let gpu_hit = pixels[i + 3] > 0;
             let got = Vec3::new(
@@ -1485,12 +1486,12 @@ fn a_body_reaching_its_volume_edge_matches_the_cpu_from_past_that_edge() {
     let mut failures = Vec::new();
     for local_eye in [Vec3::new(110.0, 44.0, 44.0), Vec3::new(100.0, 110.0, 120.0)] {
         let eye = body.position + local_eye;
-        let view = Mat4::look_at_rh(eye, body.position + Vec3::splat(44.0), Vec3::Y);
+        let view = Mat4::look_at_rh(Vec3::ZERO, (body.position + Vec3::splat(44.0)) - eye, Vec3::Y);
         let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
-        let world_from_clip = (projection * view).inverse();
+        let offset_from_clip = (projection * view).inverse();
 
         let pixels = run_bodies(
-            &device, &queue, &shader, "march_voxel_id", world_from_clip, eye, &world,
+            &device, &queue, &shader, "march_voxel_id", offset_from_clip, eye, &world,
             std::slice::from_ref(&body), width, height,
         );
 
@@ -1501,7 +1502,7 @@ fn a_body_reaching_its_volume_edge_matches_the_cpu_from_past_that_edge() {
         let mut first = String::new();
         for y in 0..height {
             for x in 0..width {
-                let dir = ray_direction(world_from_clip, eye, x, y, width, height);
+                let dir = ray_direction(offset_from_clip, x, y, width, height);
                 let i = ((y * width + x) * 4) as usize;
                 let gpu_hit = pixels[i + 3] > 0;
                 let gpu_voxel =
@@ -1570,9 +1571,9 @@ fn culling_bodies_outside_the_view_leaves_output_bit_identical() {
     };
     let (width, height) = (96u32, 96u32);
     let eye = Vec3::new(128.0, 60.0, 40.0);
-    let view = Mat4::look_at_rh(eye, eye + Vec3::Z, Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::Z, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
-    let world_from_clip = (projection * view).inverse();
+    let offset_from_clip = (projection * view).inverse();
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
     let world = body_world(&[]);
 
@@ -1597,7 +1598,7 @@ fn culling_bodies_outside_the_view_leaves_output_bit_identical() {
     let no_cull = march_flags::DEFAULT & !march_flags::CULL_BODIES;
 
     let packed = bevox_render::upload::pack_bodies(&world, &bodies);
-    let camera = bevox_render::upload::ExtractedMarchCamera { world_from_clip, position: eye };
+    let camera = bevox_render::upload::ExtractedMarchCamera { offset_from_clip, position: eye };
     let kept: Vec<u32> = bevox_render::cull::bodies_to_march(
         &packed.bodies, &packed.body_local_bounds, &camera, cull, glam::UVec2::new(width, height),
     )
@@ -1610,7 +1611,8 @@ fn culling_bodies_outside_the_view_leaves_output_bit_identical() {
 
     // Each straddler is genuine: its centre outside the frustum, its voxels
     // still hit by some pixel's ray.
-    let frustum = bevox_render::cull::Frustum::from_camera(world_from_clip, eye);
+    let frustum =
+        bevox_render::cull::Frustum::from_camera(offset_from_clip, offset_from_clip.inverse(), eye);
     let mut stats = MarchStats::default();
     for i in 1..5 {
         let local = packed.body_local_bounds[i].expect("the cube has voxels");
@@ -1620,7 +1622,7 @@ fn culling_bodies_outside_the_view_leaves_output_bit_identical() {
             "body {i}'s centre is inside the frustum, so it does not straddle a side plane"
         );
         let hit = (0..width * height).any(|p| {
-            let dir = ray_direction(world_from_clip, eye, p % width, p / width, width, height);
+            let dir = ray_direction(offset_from_clip, p % width, p / width, width, height);
             bodies[i].march_world(eye, dir, 1000.0, &mut stats).is_some()
         });
         assert!(hit, "body {i} is meant to straddle a side plane, but no pixel sees it");
@@ -1629,7 +1631,7 @@ fn culling_bodies_outside_the_view_leaves_output_bit_identical() {
     for entry in ["march_identity", "march_normal", "march"] {
         let prepare = |flags| {
             Prepared::new(
-                &device, &shader, entry, &world, world_from_clip, eye, width, height, flags,
+                &device, &shader, entry, &world, offset_from_clip, eye, width, height, flags,
                 &bodies,
             )
         };
@@ -1671,9 +1673,9 @@ fn skipping_bodies_outside_their_screen_rectangles_leaves_output_bit_identical()
     // Not square, so a transposed axis in the rectangle cannot hide.
     let (width, height) = (128u32, 80u32);
     let eye = Vec3::new(128.0, 60.0, 40.0);
-    let view = Mat4::look_at_rh(eye, eye + Vec3::Z, Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::Z, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, 1.6, 0.1, 500.0);
-    let world_from_clip = (projection * view).inverse();
+    let offset_from_clip = (projection * view).inverse();
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
     let world = body_world(&[]);
 
@@ -1683,23 +1685,7 @@ fn skipping_bodies_outside_their_screen_rectangles_leaves_output_bit_identical()
     let d = 60.0;
     let half_h = d * 0.45f32.tan();
     let half_w = half_h * 1.6;
-    // On the brick grid, so its occupied bounds are its voxels exactly and a
-    // rectangle a pixel short of them drops body pixels. `body_cube` is off the
-    // grid and bounded up to three voxels loose, which hides a short rectangle.
-    let mut dense = DenseVolume::new(64).unwrap();
-    for z in 24..40 {
-        for y in 24..40 {
-            for x in 24..40 {
-                dense.set(UVec3::new(x, y, z), MaterialId(1));
-            }
-        }
-    }
-    let cube = dense.into_contree();
-    assert_eq!(
-        bevox_core::body::occupied_bounds(&cube),
-        Some((UVec3::splat(24), UVec3::splat(40))),
-        "the cube's bounds are loose, so a rectangle short of the body could pass"
-    );
+    let cube = tight_cube();
     let turned = Quat::from_euler(glam::EulerRot::XYZ, 0.4, 0.8, -0.3);
     let place =
         |offset: Vec3| Body::new(cube.clone(), eye + offset - turned * Vec3::splat(32.0), turned);
@@ -1715,7 +1701,7 @@ fn skipping_bodies_outside_their_screen_rectangles_leaves_output_bit_identical()
     let mut stats = MarchStats::default();
     for (i, body) in bodies.iter().enumerate().skip(1) {
         let seen = (0..width * height).any(|p| {
-            let dir = ray_direction(world_from_clip, eye, p % width, p / width, width, height);
+            let dir = ray_direction(offset_from_clip, p % width, p / width, width, height);
             body.march_world(eye, dir, 1000.0, &mut stats).is_some()
         });
         assert!(seen, "body {i} is meant to be on screen, but no pixel sees it");
@@ -1726,7 +1712,7 @@ fn skipping_bodies_outside_their_screen_rectangles_leaves_output_bit_identical()
     let rect_and_cull = rect | march_flags::CULL_BODIES;
     let prepare = |entry: &str, flags| {
         Prepared::new(
-            &device, &shader, entry, &world, world_from_clip, eye, width, height, flags, &bodies,
+            &device, &shader, entry, &world, offset_from_clip, eye, width, height, flags, &bodies,
         )
     };
 
@@ -1736,6 +1722,11 @@ fn skipping_bodies_outside_their_screen_rectangles_leaves_output_bit_identical()
         (r[2].min[0], r[3].min[1], r[4].max[1], r[5].max[0]),
         (0, 0, height - 1, width - 1),
         "the edge bodies do not reach the left, top, bottom and right edges: {r:?}"
+    );
+    assert_eq!(
+        r[0],
+        GpuBodyRect::whole(glam::UVec2::new(width, height)),
+        "the body behind the camera did not get the whole screen"
     );
 
     for entry in ["march_identity", "march_normal", "march"] {
@@ -1774,7 +1765,7 @@ fn skipping_bodies_outside_their_screen_rectangles_leaves_output_bit_identical()
             );
 
             if entry == "march_identity" {
-                let one_pixel = vec![bevox_render::cull::GpuBodyRect::default(); rects.len()];
+                let one_pixel = vec![GpuBodyRect::default(); rects.len()];
                 prepared.overwrite_body_rects(&queue, &one_pixel);
                 let shrunk = prepared.read_back(&device, &queue);
                 let changed = without.chunks(4).zip(shrunk.chunks(4)).filter(|(a, b)| a != b).count();
@@ -1786,4 +1777,264 @@ fn skipping_bodies_outside_their_screen_rectangles_leaves_output_bit_identical()
             }
         }
     }
+}
+
+/// A 16-voxel cube on the brick grid (24..40), so its occupied bounds are its
+/// voxels exactly and a rectangle a pixel short of them drops body pixels.
+/// `body_cube` is off the grid and bounded up to three voxels loose, which hides
+/// a short rectangle.
+fn tight_cube() -> Contree {
+    let mut dense = DenseVolume::new(64).unwrap();
+    for z in 24..40 {
+        for y in 24..40 {
+            for x in 24..40 {
+                dense.set(UVec3::new(x, y, z), MaterialId(1));
+            }
+        }
+    }
+    let cube = dense.into_contree();
+    assert_eq!(
+        bevox_core::body::occupied_bounds(&cube),
+        Some((UVec3::splat(24), UVec3::splat(40))),
+        "the cube's bounds are loose, so a rectangle short of the body could pass"
+    );
+    cube
+}
+
+/// Rectangles and the cull must change no pixel where precision runs out: the
+/// app's projection (Bevy's default: reverse-Z, infinite, FOV pi/4, near 0.1) at
+/// 2560x1440, the physical size of a 1280x720 window on a 2x display, about 2000
+/// from the origin.
+///
+/// Rays unprojected through an absolute f32 view-projection drift a few pixels
+/// here, past the rectangles' one-pixel pad; at the other gates, near the origin
+/// at small sizes, they do not. At 1280x720 on the test GPU the drift at these
+/// silhouettes stayed inside the pad, so that size could not tell the absolute
+/// rays from the relative ones. The camera is yawed and pitched, as a player's
+/// is: looking straight down an axis keeps the matrices sparse, and the drift
+/// with them. Cubes turned to face it square-on lay whole silhouette edges along
+/// their rectangles' edges, so a drift shows along a side rather than only at a
+/// corner. One cube is turned further.
+#[test]
+fn body_rectangles_and_culling_hold_far_from_the_origin_with_the_app_camera() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (width, height) = (2560u32, 1440u32);
+    // The static world sits at the origin, well outside the view: only bodies
+    // draw.
+    let eye = Vec3::new(1300.0, 700.0, -1350.0);
+    assert!((eye.length() - 2000.0).abs() < 5.0);
+    let projection =
+        Mat4::perspective_infinite_reverse_rh(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(0.45, -0.25, 0.85), Vec3::Y);
+    let offset_from_clip = (projection * view).inverse();
+    let facing = Quat::from_mat4(&view.inverse()).normalize();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let world = body_world(&[]);
+
+    let cube = tight_cube();
+    let turned = Quat::from_euler(glam::EulerRot::XYZ, 0.4, 0.8, -0.3);
+    // At `right`, `up` and `depth` in the camera's frame.
+    let place = |right: f32, up: f32, depth: f32, orientation: Quat| {
+        let centre = eye + facing * Vec3::new(right, up, -depth);
+        Body::new(cube.clone(), centre - orientation * Vec3::splat(32.0), orientation)
+    };
+    // A grid across the view, so silhouette edges fall in many columns and rows,
+    // and one cube turned further.
+    let mut bodies: Vec<Body> = (0..4)
+        .flat_map(|i| (0..3).map(move |j| (i, j)))
+        .map(|(i, j)| place(i as f32 * 26.0 - 39.0, j as f32 * 24.0 - 24.0, 90.0, facing))
+        .collect();
+    bodies.push(place(0.0, 0.0, 50.0, facing * turned));
+
+    let off = march_flags::DEFAULT & !march_flags::CULL_BODIES & !march_flags::BODY_RECT;
+    let on = off | march_flags::BODY_RECT | march_flags::CULL_BODIES;
+    let prepare = |entry: &str, flags| {
+        Prepared::new(
+            &device, &shader, entry, &world, offset_from_clip, eye, width, height, flags, &bodies,
+        )
+    };
+
+    for entry in ["march_identity", "march_normal", "march"] {
+        let without = prepare(entry, off).read_back(&device, &queue);
+        let prepared = prepare(entry, on);
+        assert_eq!(prepared.body_count as usize, bodies.len(), "{entry}: the cull dropped a body in plain view");
+        if entry == "march_identity" {
+            // Each body is drawn inside its rectangle (material 1, hit flag),
+            // and each rectangle leaves pixels out.
+            for (i, r) in prepared.body_rects.iter().enumerate() {
+                let drawn = (r.min[1]..=r.max[1])
+                    .flat_map(|y| (r.min[0]..=r.max[0]).map(move |x| (y * width + x) as usize * 4))
+                    .filter(|&p| without[p + 1] > 0 && without[p] == 1)
+                    .count();
+                let area = (r.max[0] + 1 - r.min[0]) * (r.max[1] + 1 - r.min[1]);
+                assert!(drawn > 1000, "body {i} drew only {drawn} pixels in {r:?}; the gate is vacuous");
+                assert!(area < width * height, "body {i}'s rectangle {r:?} excludes no pixel");
+            }
+        }
+        let with = prepared.read_back(&device, &queue);
+        let differing = without.chunks(4).zip(with.chunks(4)).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            differing, 0,
+            "{entry}: rectangles and culling changed {differing} pixels about 2000 from the origin"
+        );
+    }
+}
+
+/// Entry points that write one component of `primary_ray` as its raw bits, a
+/// byte per channel, so a test can read the GPU's own ray exactly.
+const RAY_BITS: &str = r#"
+fn store_bits(id: vec3<u32>, v: u32) {
+    let b = vec4<f32>(vec4<u32>(v & 255u, (v >> 8u) & 255u, (v >> 16u) & 255u, v >> 24u));
+    textureStore(output, vec2<i32>(id.xy), b / 255.0);
+}
+@compute @workgroup_size(8, 8, 1)
+fn ray_bits_x(@builtin(global_invocation_id) id: vec3<u32>) {
+    let s = textureDimensions(output);
+    if id.x < s.x && id.y < s.y { store_bits(id, bitcast<u32>(primary_ray(id, s).x)); }
+}
+@compute @workgroup_size(8, 8, 1)
+fn ray_bits_y(@builtin(global_invocation_id) id: vec3<u32>) {
+    let s = textureDimensions(output);
+    if id.x < s.x && id.y < s.y { store_bits(id, bitcast<u32>(primary_ray(id, s).y)); }
+}
+@compute @workgroup_size(8, 8, 1)
+fn ray_bits_z(@builtin(global_invocation_id) id: vec3<u32>) {
+    let s = textureDimensions(output);
+    if id.x < s.x && id.y < s.y { store_bits(id, bitcast<u32>(primary_ray(id, s).z)); }
+}
+"#;
+
+/// At a voxel edge the ray crosses exactly, DDA must visit every cell it
+/// touches there, in the order the scan path and the CPU reference do: nearest
+/// first, lowest child index at equal distance. Stepping diagonally past a
+/// grazed cell, or starting a frame past the cell grazed on entry, picks another
+/// voxel or misses, and every seeded or accelerated walk must agree too.
+///
+/// The ties are placed, not hoped for. Looking straight down +Z at a square
+/// target, a pixel on either diagonal has |dir.x| == |dir.y| exactly, so from an
+/// eye the same distance from an edge on both axes its ray crosses that edge
+/// exactly. Whether it does is read from the GPU's own ray, bit for bit, and the
+/// CPU reference marches that same ray. Three placements:
+///
+/// - a floor edge on a brick boundary, seen from above: the grazed voxel is in
+///   the brick the ray is leaving, which the diagonal step leaves first;
+/// - a floor edge inside a brick: the grazed voxel has the lower index;
+/// - a block's top edge seen from below, on a brick boundary: the ray enters the
+///   next brick exactly on an inner plane, grazing the voxel below it, and
+///   without it misses the block entirely.
+///
+/// Each placement must produce grazed hits, or the gate cannot tell a DDA that
+/// visits them from one that does not.
+#[test]
+fn a_ray_crossing_a_voxel_edge_exactly_hits_what_the_scan_hits() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (width, height) = (96u32, 96u32);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+    let offset_from_clip = (projection * Mat4::look_at_rh(Vec3::ZERO, Vec3::Z, Vec3::Y)).inverse();
+    let source = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let shader = format!("{source}\n{RAY_BITS}");
+
+    let solid = |hi_x: u32, lo_x: u32, hi_y: u32| {
+        let mut dense = DenseVolume::new(64).unwrap();
+        for z in 0..64 {
+            for y in 0..hi_y {
+                for x in lo_x..hi_x {
+                    dense.set(UVec3::new(x, y, z), MaterialId(1));
+                }
+            }
+        }
+        dense.into_contree()
+    };
+    let floor = solid(64, 0, 6);
+    let block = solid(64, 20, 10);
+    // (label, world, eye, the edge's y, the grazed voxel's (x, y) for a ray
+    // crossing the edge at x going the given way along x)
+    type Grazed = fn(f32, bool) -> (u32, u32);
+    let placements: [(&str, &Contree, Vec3, f32, Grazed); 3] = [
+        ("floor edge on a brick boundary", &floor, Vec3::new(32.0, 18.0, -40.0), 6.0, |x, pos| {
+            (if pos { x as u32 - 1 } else { x as u32 }, 5)
+        }),
+        ("floor edge inside a brick", &floor, Vec3::new(30.0, 18.0, -40.0), 6.0, |x, pos| {
+            (if pos { x as u32 - 1 } else { x as u32 }, 5)
+        }),
+        ("block edge entered from below", &block, Vec3::new(14.0, 4.0, -40.0), 10.0, |x, _| {
+            (x as u32, 9)
+        }),
+    ];
+
+    let flag_sets = [
+        march_flags::DDA,
+        march_flags::MASK_FILTER,
+        march_flags::DDA | march_flags::MASK_FILTER,
+        march_flags::BEAM,
+        march_flags::DISTANCE_FIELD,
+        march_flags::DEFAULT,
+    ];
+    let mut failures = Vec::new();
+    for (label, world, eye, edge_y, grazed) in placements {
+        let axis = |entry: &str| -> Vec<f32> {
+            let px = Prepared::new(
+                &device, &shader, entry, world, offset_from_clip, eye, width, height, 0, &[],
+            )
+            .read_back(&device, &queue);
+            px.chunks(4).map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect()
+        };
+        let (xs, ys, zs) = (axis("ray_bits_x"), axis("ray_bits_y"), axis("ray_bits_z"));
+        let render = |flags| {
+            Prepared::new(
+                &device, &shader, "march_voxel_id", world, offset_from_clip, eye, width, height,
+                flags, &[],
+            )
+            .read_back(&device, &queue)
+        };
+        let scan = render(march_flags::NONE);
+
+        let mut stats = MarchStats::default();
+        let (mut ties, mut grazed_hits, mut wrong) = (0, 0, 0);
+        let d = edge_y - eye.y;
+        for p in 0..(width * height) as usize {
+            let dir = Vec3::new(xs[p], ys[p], zs[p]);
+            // The same distances the shader computes: plane minus origin, times
+            // the reciprocal. The edge is `d` from the eye along x, on the side
+            // the ray is heading.
+            let edge_x = eye.x + d.abs() * dir.x.signum();
+            let inv = Vec3::ONE / dir;
+            if (edge_x - eye.x) * inv.x != (edge_y - eye.y) * inv.y {
+                continue;
+            }
+            let Some(hit) = march(world, Affine3A::IDENTITY, eye, dir, 1000.0, false, &mut stats)
+            else {
+                continue;
+            };
+            ties += 1;
+            let at_edge = hit.t == (edge_y - eye.y) * inv.y;
+            grazed_hits +=
+                usize::from(at_edge && (hit.voxel.x, hit.voxel.y) == grazed(edge_x, dir.x > 0.0));
+            let got = &scan[p * 4..p * 4 + 4];
+            if got[3] == 0 || UVec3::new(got[0] as u32, got[1] as u32, got[2] as u32) != hit.voxel {
+                wrong += 1;
+            }
+        }
+        eprintln!("{label}: {ties} tied rays that hit, {grazed_hits} on the grazed voxel, {wrong} scan mismatches");
+        if grazed_hits < 3 {
+            failures.push(format!("{label}: only {grazed_hits} rays hit the grazed voxel; the tie is not placed"));
+        }
+        if wrong > 0 {
+            failures.push(format!("{label}: the scan path disagrees with the CPU on {wrong} tied rays"));
+        }
+        for flags in flag_sets {
+            let got = render(flags);
+            let differing = scan.chunks(4).zip(got.chunks(4)).filter(|(a, b)| a != b).count();
+            if differing > 0 {
+                failures.push(format!("{label}: flags {flags:#b} changed {differing} pixels"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

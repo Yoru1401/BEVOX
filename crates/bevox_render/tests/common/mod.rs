@@ -20,7 +20,9 @@ use wgpu::util::DeviceExt;
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TestUniform {
-    pub world_from_clip: [[f32; 4]; 4],
+    /// Clip space to the offset from the eye, as `ExtractedMarchCamera` carries
+    /// it: build it from a view with no translation, never from an absolute one.
+    pub offset_from_clip: [[f32; 4]; 4],
     pub camera_position: [f32; 4],
     pub sun_direction: [f32; 4],
     /// `[depth, extent, flags, 0]`.
@@ -253,7 +255,7 @@ impl Prepared {
         source: &str,
         entry_point: &str,
         tree: &Contree,
-        world_from_clip: Mat4,
+        offset_from_clip: Mat4,
         eye: Vec3,
         width: u32,
         height: u32,
@@ -275,12 +277,12 @@ impl Prepared {
         let (table, body_rects) = bevox_render::cull::bodies_to_march(
             &packed.bodies,
             &packed.body_local_bounds,
-            &bevox_render::upload::ExtractedMarchCamera { world_from_clip, position: eye },
+            &bevox_render::upload::ExtractedMarchCamera { offset_from_clip, position: eye },
             flags,
             glam::UVec2::new(texture.width(), texture.height()),
         );
         let uniform = TestUniform {
-            world_from_clip: world_from_clip.to_cols_array_2d(),
+            offset_from_clip: offset_from_clip.to_cols_array_2d(),
             camera_position: eye.extend(0.0).to_array(),
             sun_direction: bevox_render::upload::SUN_DIRECTION
                 .normalize()

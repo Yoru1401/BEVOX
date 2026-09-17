@@ -119,7 +119,7 @@ fn median(v: &mut [f32]) -> f32 {
 pub fn bench_camera(extent: u32) -> (Vec3, Mat4) {
     let half = extent as f32 * 0.5;
     let eye = Vec3::new(half, 40.0, half - 120.0);
-    let view = Mat4::look_at_rh(eye, Vec3::new(half, 40.0, half), Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(half, 40.0, half) - eye, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, 1280.0 / 720.0, 0.1, 20_000.0);
     (eye, (projection * view).inverse())
 }
@@ -140,7 +140,7 @@ fn record_the_baseline() {
         built.elapsed().as_secs_f32()
     );
 
-    let (eye, world_from_clip) = bench_camera(extent);
+    let (eye, offset_from_clip) = bench_camera(extent);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
     let prepared = Prepared::new(
@@ -148,7 +148,7 @@ fn record_the_baseline() {
         &shader,
         "march",
         &tree,
-        world_from_clip,
+        offset_from_clip,
         eye,
         1280,
         720,
@@ -178,12 +178,12 @@ fn optimisations_are_measured_against_the_baseline() {
     };
 
     let (tree, extent) = bench_scene();
-    let (eye, world_from_clip) = bench_camera(extent);
+    let (eye, offset_from_clip) = bench_camera(extent);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
     let make = |flags: u32| {
         Prepared::new(
-            &device, &shader, "march", &tree, world_from_clip, eye, 1280, 720, flags,
+            &device, &shader, "march", &tree, offset_from_clip, eye, 1280, 720, flags,
             &[],
         )
     };
@@ -255,15 +255,15 @@ fn the_real_scenes_are_measured_with_the_defaults() {
         };
         let extent = tree.extent();
 
-        for (label, (eye, world_from_clip)) in
+        for (label, (eye, offset_from_clip)) in
             [("framed", framed_camera(extent)), ("close", close_camera(&tree, extent))]
         {
             let baseline = Prepared::new(
-                &device, &shader, "march", &tree, world_from_clip, eye, 1280, 720,
+                &device, &shader, "march", &tree, offset_from_clip, eye, 1280, 720,
                 march_flags::NONE, &[],
             );
             let variant = Prepared::new(
-                &device, &shader, "march", &tree, world_from_clip, eye, 1280, 720,
+                &device, &shader, "march", &tree, offset_from_clip, eye, 1280, 720,
                 march_flags::DEFAULT, &[],
             );
             let (a1, b, a2) = compare_aba(&device, &queue, &baseline, &variant);
@@ -283,7 +283,7 @@ fn framed_camera(extent: u32) -> (Vec3, Mat4) {
     let e = extent as f32;
     let centre = Vec3::splat(e * 0.5);
     let eye = centre + Vec3::new(0.6, 0.5, 1.0).normalize() * e * 1.1;
-    let view = Mat4::look_at_rh(eye, centre, Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, centre - eye, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, 1280.0 / 720.0, 0.1, e * 8.0);
     (eye, (projection * view).inverse())
 }
@@ -313,7 +313,7 @@ fn close_camera(tree: &bevox_core::contree::Contree, extent: u32) -> (Vec3, Mat4
         None => centre,
     };
     let close = surface - dir * 30.0;
-    let view = Mat4::look_at_rh(close, surface + dir * e * 0.25, Vec3::Y);
+    let view = Mat4::look_at_rh(Vec3::ZERO, (surface + dir * e * 0.25) - close, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, 1280.0 / 720.0, 0.1, e * 8.0);
     (close, (projection * view).inverse())
 }
@@ -577,7 +577,7 @@ fn the_dispatches_are_timed_by_the_gpu() {
     }
 
     let (tree, extent) = bench_scene();
-    let (eye, world_from_clip) = bench_camera(extent);
+    let (eye, offset_from_clip) = bench_camera(extent);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
     println!("scene: extent {extent}, 1280x720, close to geometry");
@@ -591,7 +591,7 @@ fn the_dispatches_are_timed_by_the_gpu() {
         ("default", march_flags::DEFAULT),
     ] {
         let prepared = Prepared::new(
-            &device, &shader, "march", &tree, world_from_clip, eye, 1280, 720, flags,
+            &device, &shader, "march", &tree, offset_from_clip, eye, 1280, 720, flags,
             &[],
         );
         // Discard the first dispatch: it pays for pipeline compilation.
@@ -714,12 +714,12 @@ fn bodies_are_measured_against_none() {
     }
 
     let (tree, extent) = bench_scene();
-    let (eye, world_from_clip) = bench_camera(extent);
+    let (eye, offset_from_clip) = bench_camera(extent);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
     let (ahead, behind) = (bench_bodies(eye, 120.0), bench_bodies(eye, -120.0));
     let make = |bodies: &[bevox_core::body::Body]| {
         Prepared::new(
-            &device, &shader, "march", &tree, world_from_clip, eye, 1280, 720,
+            &device, &shader, "march", &tree, offset_from_clip, eye, 1280, 720,
             march_flags::DEFAULT, bodies,
         )
     };

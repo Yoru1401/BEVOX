@@ -39,27 +39,32 @@ pub fn world_bound(local: (UVec3, UVec3), body: &GpuBody) -> BodyBound {
 /// far plane at infinity, the test harness's is standard-Z, and those planes
 /// mean opposite things in the two. The side planes use only x, y and w, so
 /// they are the same in both.
+///
+/// Camera-relative, like the rays: planes and bounds are compared as offsets
+/// from the eye, so a camera far from the origin culls as precisely as one at
+/// it.
 pub struct Frustum {
-    /// Inward-facing, as (normal, distance); a point p is inside when
-    /// dot(normal, p) + distance >= 0.
+    /// Inward-facing, as (normal, distance), in camera-relative space; an offset
+    /// p from the eye is inside when dot(normal, p) + distance >= 0.
     sides: [Vec4; 4],
     position: Vec3,
     forward: Vec3,
 }
 
 impl Frustum {
-    pub fn from_camera(world_from_clip: Mat4, position: Vec3) -> Self {
-        let clip_from_world = world_from_clip.inverse();
-        let r0 = clip_from_world.row(0);
-        let r1 = clip_from_world.row(1);
-        let r3 = clip_from_world.row(3);
+    /// `offset_from_clip` is `ExtractedMarchCamera`'s, and `clip_from_offset` its
+    /// inverse, passed in so a frame inverts it once.
+    pub fn from_camera(offset_from_clip: Mat4, clip_from_offset: Mat4, position: Vec3) -> Self {
+        let r0 = clip_from_offset.row(0);
+        let r1 = clip_from_offset.row(1);
+        let r3 = clip_from_offset.row(3);
         let normalise = |p: Vec4| p / p.xyz().length();
 
         // z = 1 is in front of the camera in both conventions: the far plane
         // under standard-Z, the near plane under reverse-Z. z = 0 is not -- under
         // reverse-Z it is the plane at infinity.
-        let ahead = world_from_clip * Vec4::new(0.0, 0.0, 1.0, 1.0);
-        let forward = (ahead.xyz() / ahead.w - position).normalize();
+        let ahead = offset_from_clip * Vec4::new(0.0, 0.0, 1.0, 1.0);
+        let forward = (ahead.xyz() / ahead.w).normalize();
 
         Self {
             sides: [
@@ -75,12 +80,11 @@ impl Frustum {
 
     /// Whether any part of the sphere could be on screen. Errs towards yes.
     pub fn sees(&self, bound: BodyBound) -> bool {
-        if (bound.centre - self.position).dot(self.forward) < -bound.radius {
+        let centre = bound.centre - self.position;
+        if centre.dot(self.forward) < -bound.radius {
             return false;
         }
-        self.sides
-            .iter()
-            .all(|p| p.xyz().dot(bound.centre) + p.w >= -bound.radius)
+        self.sides.iter().all(|p| p.xyz().dot(centre) + p.w >= -bound.radius)
     }
 }
 
@@ -92,18 +96,32 @@ pub struct GpuBodyRect {
     pub max: [u32; 2],
 }
 
-/// The pixels a body can cover: its eight world-space corners projected and
-/// rounded outward, padded by one.
+impl GpuBodyRect {
+    /// Every pixel of a `size` target.
+    pub fn whole(size: UVec2) -> Self {
+        Self { min: [0, 0], max: [size.x - 1, size.y - 1] }
+    }
+}
+
+/// The pixels a body can cover: its eight corners, as offsets from the eye,
+/// projected and rounded outward, padded by one.
 ///
-/// Inverts `primary_ray`'s mapping exactly. A corner at or behind the camera
-/// has no meaningful projection, so the body gets the whole screen -- only
-/// conservative answers are allowed.
+/// Inverts `primary_ray`'s mapping exactly. The pad absorbs only float error,
+/// which camera-relative projection keeps relative rather than growing with the
+/// distance from the origin. A corner at or behind the camera has no meaningful
+/// projection, so the body gets the whole screen -- only conservative answers
+/// are allowed.
 ///
-/// `size` must be the dimensions of the texture the shader writes, which is
-/// what `primary_ray` maps pixels with.
-pub fn screen_rect(local: (UVec3, UVec3), body: &GpuBody, world_from_clip: Mat4, size: UVec2) -> GpuBodyRect {
-    let whole = GpuBodyRect { min: [0, 0], max: [size.x - 1, size.y - 1] };
-    let clip_from_world = world_from_clip.inverse();
+/// `clip_from_offset` is the inverse of `ExtractedMarchCamera::offset_from_clip`
+/// and `eye` its position. `size` must be the dimensions of the texture the
+/// shader writes, which is what `primary_ray` maps pixels with.
+pub fn screen_rect(
+    local: (UVec3, UVec3),
+    body: &GpuBody,
+    clip_from_offset: Mat4,
+    eye: Vec3,
+    size: UVec2,
+) -> GpuBodyRect {
     let world_from_local = Mat4::from_cols_array_2d(&body.local_from_world).inverse();
     let (lo, hi) = (local.0.as_vec3(), local.1.as_vec3());
 
@@ -115,9 +133,16 @@ pub fn screen_rect(local: (UVec3, UVec3), body: &GpuBody, world_from_clip: Mat4,
             if i & 2 == 0 { lo.y } else { hi.y },
             if i & 4 == 0 { lo.z } else { hi.z },
         );
-        let clip = clip_from_world * world_from_local.transform_point3(corner).extend(1.0);
+        let offset = world_from_local.transform_point3(corner) - eye;
+        let clip = clip_from_offset * offset.extend(1.0);
+        // `w` is the corner's depth along the view, accurate to about
+        // |offset| * epsilon now that nothing absolute enters it. A corner that
+        // truly sits just behind the camera but reads as just in front
+        // projects to the same side at infinity as the in-front part of its
+        // edges, which the clamp turns into the screen edge: still
+        // conservative, so no wider margin is needed.
         if clip.w <= 1e-6 {
-            return whole;
+            return GpuBodyRect::whole(size);
         }
         let ndc = clip.xy() / clip.w;
         let px = Vec2::new(
@@ -165,15 +190,17 @@ pub fn bodies_to_march(
 ) -> (Vec<GpuBody>, Vec<GpuBodyRect>) {
     debug_assert!(placed.len() <= local_bounds.len());
     let cull = flags & march_flags::CULL_BODIES != 0;
-    let frustum = Frustum::from_camera(camera.world_from_clip, camera.position);
+    // Inverted once a frame, for the frustum and every rectangle.
+    let clip_from_offset = camera.offset_from_clip.inverse();
+    let frustum = Frustum::from_camera(camera.offset_from_clip, clip_from_offset, camera.position);
     placed
         .iter()
         .zip(local_bounds)
         .filter_map(|(g, local)| match local {
             Some(l) if cull && !frustum.sees(world_bound(*l, g)) => None,
-            Some(l) => Some((*g, screen_rect(*l, g, camera.world_from_clip, size))),
+            Some(l) => Some((*g, screen_rect(*l, g, clip_from_offset, camera.position, size))),
             None if cull => None,
-            None => Some((*g, GpuBodyRect { min: [0, 0], max: [size.x - 1, size.y - 1] })),
+            None => Some((*g, GpuBodyRect::whole(size))),
         })
         .unzip()
 }
@@ -184,8 +211,10 @@ mod tests {
     use bevox_core::body::Body;
     use glam::Quat;
 
+    /// Camera-relative, as `ExtractedMarchCamera::offset_from_clip` is: the view
+    /// looks from the origin along `target - eye`, with no translation.
     fn standard(eye: Vec3, target: Vec3) -> Mat4 {
-        let view = Mat4::look_at_rh(eye, target, Vec3::Y);
+        let view = Mat4::look_at_rh(Vec3::ZERO, target - eye, Vec3::Y);
         let projection = Mat4::perspective_rh(0.9, 16.0 / 9.0, 0.1, 500.0);
         (projection * view).inverse()
     }
@@ -193,16 +222,31 @@ mod tests {
     /// Bevy's default projection: reverse-Z, far plane at infinity. The app
     /// uses this; the GPU harness does not.
     fn reverse_z(eye: Vec3, target: Vec3) -> Mat4 {
-        let view = Mat4::look_at_rh(eye, target, Vec3::Y);
+        let view = Mat4::look_at_rh(Vec3::ZERO, target - eye, Vec3::Y);
         let projection = Mat4::perspective_infinite_reverse_rh(0.9, 16.0 / 9.0, 0.1);
         (projection * view).inverse()
+    }
+
+    fn frustum(offset_from_clip: Mat4, eye: Vec3) -> Frustum {
+        Frustum::from_camera(offset_from_clip, offset_from_clip.inverse(), eye)
+    }
+
+    /// What `primary_ray` computes for pixel (x, y), as a CPU mirror, operation
+    /// for operation.
+    fn primary_ray(offset_from_clip: Mat4, x: u32, y: u32, size: UVec2) -> Vec3 {
+        let ndc = Vec2::new(
+            (2 * x + 1) as f32 - size.x as f32,
+            size.y as f32 - (2 * y + 1) as f32,
+        ) * (Vec2::ONE / size.as_vec2());
+        let p = offset_from_clip * Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
+        (p.xyz() / p.w).normalize()
     }
 
     #[test]
     fn a_body_straight_ahead_is_seen() {
         let eye = Vec3::ZERO;
-        for world_from_clip in [standard(eye, -Vec3::Z), reverse_z(eye, -Vec3::Z)] {
-            let f = Frustum::from_camera(world_from_clip, eye);
+        for offset_from_clip in [standard(eye, -Vec3::Z), reverse_z(eye, -Vec3::Z)] {
+            let f = frustum(offset_from_clip, eye);
             assert!(f.sees(BodyBound { centre: Vec3::new(0.0, 0.0, -50.0), radius: 5.0 }));
         }
     }
@@ -210,8 +254,8 @@ mod tests {
     #[test]
     fn a_body_behind_the_camera_is_culled() {
         let eye = Vec3::ZERO;
-        for world_from_clip in [standard(eye, -Vec3::Z), reverse_z(eye, -Vec3::Z)] {
-            let f = Frustum::from_camera(world_from_clip, eye);
+        for offset_from_clip in [standard(eye, -Vec3::Z), reverse_z(eye, -Vec3::Z)] {
+            let f = frustum(offset_from_clip, eye);
             assert!(!f.sees(BodyBound { centre: Vec3::new(0.0, 0.0, 50.0), radius: 5.0 }));
         }
     }
@@ -219,8 +263,8 @@ mod tests {
     #[test]
     fn a_body_far_to_the_side_is_culled() {
         let eye = Vec3::ZERO;
-        for world_from_clip in [standard(eye, -Vec3::Z), reverse_z(eye, -Vec3::Z)] {
-            let f = Frustum::from_camera(world_from_clip, eye);
+        for offset_from_clip in [standard(eye, -Vec3::Z), reverse_z(eye, -Vec3::Z)] {
+            let f = frustum(offset_from_clip, eye);
             assert!(!f.sees(BodyBound { centre: Vec3::new(500.0, 0.0, -50.0), radius: 5.0 }));
         }
     }
@@ -230,8 +274,8 @@ mod tests {
     #[test]
     fn a_body_straddling_a_side_plane_is_seen() {
         let eye = Vec3::ZERO;
-        for world_from_clip in [standard(eye, -Vec3::Z), reverse_z(eye, -Vec3::Z)] {
-            let f = Frustum::from_camera(world_from_clip, eye);
+        for offset_from_clip in [standard(eye, -Vec3::Z), reverse_z(eye, -Vec3::Z)] {
+            let f = frustum(offset_from_clip, eye);
             // At z = -50 the horizontal half-width is 50 * tan(0.45) * 16/9 ~ 43.
             assert!(f.sees(BodyBound { centre: Vec3::new(45.0, 0.0, -50.0), radius: 5.0 }));
         }
@@ -242,8 +286,8 @@ mod tests {
     #[test]
     fn a_body_enclosing_the_camera_is_seen() {
         let eye = Vec3::ZERO;
-        for world_from_clip in [standard(eye, -Vec3::Z), reverse_z(eye, -Vec3::Z)] {
-            let f = Frustum::from_camera(world_from_clip, eye);
+        for offset_from_clip in [standard(eye, -Vec3::Z), reverse_z(eye, -Vec3::Z)] {
+            let f = frustum(offset_from_clip, eye);
             assert!(f.sees(BodyBound { centre: Vec3::new(0.0, 0.0, 3.0), radius: 5.0 }));
         }
     }
@@ -269,8 +313,8 @@ mod tests {
         let mut rng = bevox_core::testing::XorShift64::new(17);
         let eye = Vec3::new(3.0, 7.0, -2.0);
         let target = Vec3::new(40.0, -10.0, -90.0);
-        let a = Frustum::from_camera(standard(eye, target), eye);
-        let b = Frustum::from_camera(reverse_z(eye, target), eye);
+        let a = frustum(standard(eye, target), eye);
+        let b = frustum(reverse_z(eye, target), eye);
         let mut seen = 0;
         for _ in 0..4000 {
             let c = Vec3::new(
@@ -292,8 +336,8 @@ mod tests {
     #[test]
     fn nothing_is_culled_for_being_far() {
         let eye = Vec3::ZERO;
-        for world_from_clip in [standard(eye, -Vec3::Z), reverse_z(eye, -Vec3::Z)] {
-            let f = Frustum::from_camera(world_from_clip, eye);
+        for offset_from_clip in [standard(eye, -Vec3::Z), reverse_z(eye, -Vec3::Z)] {
+            let f = frustum(offset_from_clip, eye);
             assert!(f.sees(BodyBound { centre: Vec3::new(0.0, 0.0, -5000.0), radius: 5.0 }));
         }
     }
@@ -325,13 +369,41 @@ mod tests {
         (GpuBody::default().placed(&body), (UVec3::splat(24), UVec3::splat(40)))
     }
 
-    /// The rectangle must cover every pixel whose ray hits the body's box. It is
-    /// checked against the same pixel-to-ray mapping `primary_ray` uses, so a
+    /// Asserts every pixel whose ray hits the body's box lies inside its
+    /// rectangle, and returns how many pixels hit it.
+    ///
+    /// Rays are built exactly as the shader builds them, and brought into the
+    /// body's frame as `compose_bodies` does, so the oracle carries the same
+    /// float error the GPU does. The box, not the bounding sphere: the rectangle
+    /// is built from the box's corners, and the sphere's footprint is wider.
+    fn covered(offset_from_clip: Mat4, eye: Vec3, body: &GpuBody, local: (UVec3, UVec3), size: UVec2) -> u32 {
+        let rect = screen_rect(local, body, offset_from_clip.inverse(), eye, size);
+        let local_from_world = Mat4::from_cols_array_2d(&body.local_from_world);
+        let (lo, hi) = (local.0.as_vec3(), local.1.as_vec3());
+        let origin = local_from_world.transform_point3(eye);
+
+        let mut inside = 0;
+        for y in 0..size.y {
+            for x in 0..size.x {
+                let dir = primary_ray(offset_from_clip, x, y, size);
+                let inv = local_from_world.transform_vector3(dir).recip();
+                let (t0, t1) = ((lo - origin) * inv, (hi - origin) * inv);
+                let (enter, exit) = (t0.min(t1).max_element(), t0.max(t1).min_element());
+                if enter <= exit && exit >= 0.0 {
+                    inside += 1;
+                    assert!(
+                        x >= rect.min[0] && x <= rect.max[0] && y >= rect.min[1] && y <= rect.max[1],
+                        "pixel ({x}, {y}) can see the body but lies outside the rectangle {rect:?}"
+                    );
+                }
+            }
+        }
+        inside
+    }
+
+    /// The rectangle must cover every pixel whose ray hits the body's box, so a
     /// rectangle a pixel short is caught here rather than as a missing column on
     /// screen.
-    ///
-    /// The oracle is the box, not the bounding sphere: the rectangle is built
-    /// from the box's corners, and the sphere's footprint is wider.
     #[test]
     fn the_rectangle_covers_every_pixel_that_sees_the_body() {
         let size = UVec2::new(160, 90);
@@ -342,38 +414,40 @@ mod tests {
             cube_body(Vec3::ZERO, Quat::IDENTITY),
             cube_body(Vec3::splat(32.0) - turned * Vec3::splat(32.0), turned),
         ];
-        for world_from_clip in [standard(eye, Vec3::splat(32.0)), reverse_z(eye, Vec3::splat(32.0))] {
+        for offset_from_clip in [standard(eye, Vec3::splat(32.0)), reverse_z(eye, Vec3::splat(32.0))] {
             for (body, local) in &bodies {
-                let rect = screen_rect(*local, body, world_from_clip, size);
-                let local_from_world = Mat4::from_cols_array_2d(&body.local_from_world);
-                let (lo, hi) = (local.0.as_vec3(), local.1.as_vec3());
-
-                let mut inside = 0;
-                for y in 0..size.y {
-                    for x in 0..size.x {
-                        // As `primary_ray` builds it, operation for operation.
-                        let ndc = Vec2::new(
-                            (2 * x + 1) as f32 - size.x as f32,
-                            size.y as f32 - (2 * y + 1) as f32,
-                        ) * (Vec2::ONE / size.as_vec2());
-                        let far = world_from_clip * Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
-                        let dir = (far.xyz() / far.w - eye).normalize();
-                        // Slab test in the body's frame.
-                        let origin = local_from_world.transform_point3(eye);
-                        let inv = local_from_world.transform_vector3(dir).recip();
-                        let (t0, t1) = ((lo - origin) * inv, (hi - origin) * inv);
-                        let (enter, exit) = (t0.min(t1).max_element(), t0.max(t1).min_element());
-                        if enter <= exit && exit >= 0.0 {
-                            inside += 1;
-                            assert!(
-                                x >= rect.min[0] && x <= rect.max[0] && y >= rect.min[1] && y <= rect.max[1],
-                                "pixel ({x}, {y}) can see the body but lies outside the rectangle {rect:?}"
-                            );
-                        }
-                    }
-                }
+                let inside = covered(offset_from_clip, eye, body, *local, size);
                 assert!(inside > 50, "only {inside} pixels see the body; the test is not exercising the rectangle");
             }
+        }
+    }
+
+    /// The app's camera where precision runs out: Bevy's default projection
+    /// (reverse-Z, infinite, FOV pi/4, near 0.1) at 2560x1440, the physical size
+    /// of a 1280x720 window on a 2x display, about 1450 from the origin.
+    ///
+    /// Rays unprojected through an absolute matrix drift about two pixels here
+    /// (295 pixels of one body outside its rectangle, measured in review). A
+    /// check near the origin at a small size cannot see that.
+    #[test]
+    fn the_rectangle_covers_every_pixel_far_from_the_origin_at_app_resolution() {
+        let size = UVec2::new(2560, 1440);
+        let projection =
+            Mat4::perspective_infinite_reverse_rh(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1);
+        let eye = Vec3::new(1025.0, 60.0, 1025.0);
+        assert!((eye.length() - 1450.0).abs() < 5.0);
+        let offset_from_clip =
+            (projection * Mat4::look_at_rh(Vec3::ZERO, Vec3::new(0.1, -0.05, 1.0), Vec3::Y)).inverse();
+
+        let turned = Quat::from_euler(glam::EulerRot::XYZ, 0.4, 0.8, -0.3);
+        let place = |offset: Vec3, orientation: Quat| {
+            cube_body(eye + offset - orientation * Vec3::splat(32.0), orientation)
+        };
+        for (body, local) in
+            [place(Vec3::new(-14.0, 6.0, 70.0), turned), place(Vec3::new(20.0, -12.0, 90.0), Quat::IDENTITY)]
+        {
+            let inside = covered(offset_from_clip, eye, &body, local, size);
+            assert!(inside > 10_000, "only {inside} pixels see the body; the test is not exercising the rectangle");
         }
     }
 
@@ -383,10 +457,12 @@ mod tests {
     fn a_body_around_the_camera_gets_the_whole_screen() {
         let size = UVec2::new(160, 90);
         let eye = Vec3::new(32.0, 32.0, 32.0);
+        let target = Vec3::new(32.0, 32.0, 100.0);
         let (body, local) = cube_body(Vec3::ZERO, Quat::IDENTITY);
-        let rect = screen_rect(local, &body, standard(eye, Vec3::new(32.0, 32.0, 100.0)), size);
-        assert_eq!(rect.min, [0, 0]);
-        assert_eq!(rect.max, [size.x - 1, size.y - 1]);
+        for offset_from_clip in [standard(eye, target), reverse_z(eye, target)] {
+            let rect = screen_rect(local, &body, offset_from_clip.inverse(), eye, size);
+            assert_eq!(rect, GpuBodyRect::whole(size));
+        }
     }
 
     /// Off, every entry is marched as packed. On, an empty body and one out of
@@ -396,7 +472,7 @@ mod tests {
     fn bodies_to_march_drops_only_what_the_flag_and_the_view_allow() {
         let eye = Vec3::ZERO;
         let camera =
-            ExtractedMarchCamera { world_from_clip: reverse_z(eye, -Vec3::Z), position: eye };
+            ExtractedMarchCamera { offset_from_clip: reverse_z(eye, -Vec3::Z), position: eye };
         let at = |z: f32, id: u32| {
             let volume = bevox_core::contree::Contree::empty(2);
             let body = Body::new(volume, Vec3::new(-4.0, -4.0, z), Quat::IDENTITY);
@@ -412,8 +488,10 @@ mod tests {
             let own: Vec<GpuBodyRect> = kept
                 .iter()
                 .map(|g| match bounds[g.node_base as usize] {
-                    Some(local) => screen_rect(local, g, camera.world_from_clip, size),
-                    None => GpuBodyRect { min: [0, 0], max: [size.x - 1, size.y - 1] },
+                    Some(local) => {
+                        screen_rect(local, g, camera.offset_from_clip.inverse(), eye, size)
+                    }
+                    None => GpuBodyRect::whole(size),
                 })
                 .collect();
             assert_eq!(rects, own, "a rectangle is not its own body's");
@@ -423,3 +501,4 @@ mod tests {
         assert_eq!(ids(march_flags::DEFAULT | march_flags::CULL_BODIES), [0, 3]);
     }
 }
+

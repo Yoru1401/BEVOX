@@ -103,7 +103,8 @@ pub fn within_budget(
     budget_bytes(node_capacity, voxel_word_capacity, field_words, body_count) <= VOXEL_BUDGET_BYTES
 }
 
-/// Bytes the four storage buffers would occupy at these capacities.
+/// Bytes the scene's storage buffers would occupy at these capacities. A body
+/// is its table entry and its screen rectangle.
 pub fn budget_bytes(
     node_capacity: u32,
     voxel_word_capacity: u32,
@@ -113,8 +114,11 @@ pub fn budget_bytes(
     u64::from(node_capacity) * size_of::<GpuNode>() as u64
         + u64::from(voxel_word_capacity) * 4
         + u64::from(field_words) * 4
-        + u64::from(body_count) * size_of::<GpuBody>() as u64
+        + u64::from(body_count) * BODY_BYTES
 }
+
+/// GPU bytes per body: its table entry and its screen rectangle.
+const BODY_BYTES: u64 = (size_of::<GpuBody>() + size_of::<GpuBodyRect>()) as u64;
 
 #[derive(Resource)]
 pub struct MarchPipeline {
@@ -196,7 +200,7 @@ pub fn frame_uniform(
     let (table, rects) =
         crate::cull::bodies_to_march(placed, &scene.body_local_bounds, camera, flags, size);
     let uniform = MarchUniform {
-        world_from_clip: camera.world_from_clip.to_cols_array_2d(),
+        offset_from_clip: camera.offset_from_clip.to_cols_array_2d(),
         camera_position: camera.position.extend(0.0).to_array(),
         sun_direction: crate::upload::SUN_DIRECTION.normalize().extend(0.0).to_array(),
         volume_params: [scene.depth, scene.extent, flags, marched_body_count(table.len())],
@@ -362,7 +366,7 @@ pub fn prepare_march_buffers(
             u64::from(node_capacity) * size_of::<GpuNode>() as u64 / (1024 * 1024),
             u64::from(voxel_word_capacity) * 4 / (1024 * 1024),
             u64::from(field_words) * 4 / (1024 * 1024),
-            u64::from(body_capacity) * size_of::<GpuBody>() as u64 / (1024 * 1024),
+            u64::from(body_capacity) * BODY_BYTES / (1024 * 1024),
             VOXEL_BUDGET_BYTES / (1024 * 1024)
         );
         return;
@@ -604,6 +608,9 @@ mod tests {
         // Body geometry counts against the budget the same as the static world.
         let over_on_bodies = (VOXEL_BUDGET_BYTES / size_of::<GpuBody>() as u64) as u32 + 1;
         assert!(!within_budget(1, 1, 0, over_on_bodies));
+        // And the rectangles beside them: this many table entries alone fit.
+        let tables_fit = (VOXEL_BUDGET_BYTES / size_of::<GpuBody>() as u64) as u32;
+        assert!(!within_budget(0, 0, 0, tables_fit), "the rectangle buffer is not budgeted");
     }
 
     #[test]
@@ -670,7 +677,7 @@ mod tests {
     /// uniform the app uploads goes through it.
     #[test]
     fn the_uploaded_uniform_marches_no_more_than_the_cap() {
-        let camera = ExtractedMarchCamera { world_from_clip: Mat4::IDENTITY, position: Vec3::ZERO };
+        let camera = ExtractedMarchCamera { offset_from_clip: Mat4::IDENTITY, position: Vec3::ZERO };
         let bodies = vec![GpuBody::default(); MAX_BODIES + 1];
         let scene = GpuSceneData { body_local_bounds: vec![None; bodies.len()], ..default() };
         let (uniform, ..) =
@@ -687,7 +694,7 @@ mod tests {
         let view = Mat4::look_at_rh(eye, -Vec3::Z, Vec3::Y);
         let projection = Mat4::perspective_infinite_reverse_rh(0.9, 16.0 / 9.0, 0.1);
         let camera =
-            ExtractedMarchCamera { world_from_clip: (projection * view).inverse(), position: eye };
+            ExtractedMarchCamera { offset_from_clip: (projection * view).inverse(), position: eye };
         let at = |z: f32| {
             let body = bevox_core::body::Body::new(
                 bevox_core::contree::Contree::empty(2),
@@ -712,7 +719,14 @@ mod tests {
         assert!(MAX_BODIES < 2, "this case no longer reaches past the cap");
         let (uniform, table, rects) = frame_uniform(&scene, &camera, &[behind, ahead], cull, size);
         assert_eq!(bytemuck::cast_slice::<GpuBody, u8>(&table), bytemuck::bytes_of(&ahead));
-        assert_eq!(rects, [crate::cull::screen_rect(cube.unwrap(), &ahead, camera.world_from_clip, size)]);
+        let own = crate::cull::screen_rect(
+            cube.unwrap(),
+            &ahead,
+            camera.offset_from_clip.inverse(),
+            eye,
+            size,
+        );
+        assert_eq!(rects, [own]);
         assert_eq!(uniform.volume_params[3], 1);
     }
 

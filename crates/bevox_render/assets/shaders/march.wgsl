@@ -6,7 +6,8 @@
 // *correct*, and its correctness is pinned by a parity test against the CPU.
 
 struct MarchUniform {
-    world_from_clip: mat4x4<f32>,
+    // Clip space to the world-space offset from camera_position: no translation.
+    offset_from_clip: mat4x4<f32>,
     camera_position: vec4<f32>,
     sun_direction: vec4<f32>,
     volume_params: vec4<u32>,  // [depth, extent, flags, 0]
@@ -724,6 +725,11 @@ fn max_ray_distance() -> f32 {
 }
 
 /// Ray direction for a pixel. Shared so both entry points march identical rays.
+///
+/// Camera-relative: the unprojected point is already an offset from the eye, so
+/// nothing is subtracted. Unprojecting through an absolute matrix and
+/// subtracting the eye loses about |eye| * epsilon / near of direction, which a
+/// thousand units out is pixels.
 fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
     // (2 * id + 1 - size) / size: the pixel centre in [-1, 1]. An exact integer
     // difference times an explicit reciprocal, so no compiler can reorder it.
@@ -734,8 +740,8 @@ fn primary_ray(id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
         f32(2u * id.x + 1u) - f32(size.x),
         f32(size.y) - f32(2u * id.y + 1u),
     ) * (vec2<f32>(1.0) / vec2<f32>(size));
-    let far = view.world_from_clip * vec4<f32>(ndc, 1.0, 1.0);
-    return normalize(far.xyz / far.w - view.camera_position.xyz);
+    let p = view.offset_from_clip * vec4<f32>(ndc, 1.0, 1.0);
+    return normalize(p.xyz / p.w);
 }
 
 /// Voxels per field cell, per axis, as built by `DistanceField::build`.
