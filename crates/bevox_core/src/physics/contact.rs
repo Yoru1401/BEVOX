@@ -6,7 +6,7 @@
 //! the ownership rules are this design's own; see the spec's Provenance section.
 
 use super::classify::{Shape, classify, solid_at};
-use crate::body::{Body, occupied_bounds};
+use crate::body::{Body, BodyId, occupied_bounds};
 use crate::contree::Contree;
 use crate::distance_field::{CELL_VOXELS, DistanceField};
 use crate::material::{MaterialTable, combine_friction, combine_restitution};
@@ -18,9 +18,23 @@ pub const RADIUS: f32 = 0.5;
 
 const AXES: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
 
-/// Which body voxel touched which world voxel. Stable from tick to tick while
-/// the touch persists, which is what warm starting keys on.
-pub type ContactKey = (UVec3, IVec3);
+/// Which voxel of which body touched which voxel of what.
+///
+/// Stable from tick to tick while the touch persists, which is what warm
+/// starting keys on. `other` names the world or the body on the far side, so an
+/// impulse cannot be carried over to a different neighbour.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ContactKey {
+    /// The world, or the other body.
+    pub other: BodyId,
+    /// The voxel of the body this contact belongs to. Plain coordinates
+    /// rather than a `UVec3`, which is not ordered, and the solver sorts its
+    /// contacts so that a tick is reproducible.
+    pub mine: [u32; 3],
+    /// The voxel of `other`. Against the world, its world-space coordinate,
+    /// which is never negative where a contact can be.
+    pub theirs: [u32; 3],
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Contact {
@@ -259,7 +273,16 @@ pub fn detect(
             {
                 let point = q - n * (RADIUS + sep * 0.5);
                 let pair = coefficients(materials, body, u, tree, k);
-                keep(&mut found, body, margin, (u, k), n, sep, point, pair);
+                keep(
+                    &mut found,
+                    body,
+                    margin,
+                    ContactKey { other: BodyId::WORLD, mine: u.to_array(), theirs: k.as_uvec3().to_array() },
+                    n,
+                    sep,
+                    point,
+                    pair,
+                );
             }
         }
     }
@@ -287,7 +310,7 @@ pub fn detect(
                     &mut found,
                     body,
                     margin,
-                    (u.as_uvec3(), k),
+                    ContactKey { other: BodyId::WORLD, mine: u.as_uvec3().to_array(), theirs: k.as_uvec3().to_array() },
                     -(body.orientation * n_local),
                     sep,
                     point,
@@ -310,13 +333,22 @@ pub fn detect(
                 edge_vs_edge(p, d, k.as_vec3() + 0.5, AXES[world_axis])
             {
                 let pair = coefficients(materials, body, u, tree, k);
-                keep(&mut found, body, margin, (u, k), n, sep, point, pair);
+                keep(
+                    &mut found,
+                    body,
+                    margin,
+                    ContactKey { other: BodyId::WORLD, mine: u.to_array(), theirs: k.as_uvec3().to_array() },
+                    n,
+                    sep,
+                    point,
+                    pair,
+                );
             }
         }
     }
 
     let mut contacts: Vec<Contact> = found.into_values().collect();
-    contacts.sort_by_key(|c| (c.key.0.to_array(), c.key.1.to_array()));
+    contacts.sort_unstable_by_key(|c| c.key);
     contacts
 }
 
@@ -394,7 +426,7 @@ mod tests {
             for c in &contacts {
                 assert!(c.separation.abs() < TOLERANCE, "at {angle} rad, separation {}", c.separation);
                 assert!((c.normal - Vec3::Y).length() < TOLERANCE, "at {angle} rad, normal {:?}", c.normal);
-                assert!(c.key.0.y == 0, "a contact came from voxel {:?}, not the bottom", c.key.0);
+                assert!(c.key.mine[1] == 0, "a contact came from voxel {:?}, not the bottom", c.key.mine);
             }
         }
     }
@@ -415,7 +447,7 @@ mod tests {
         let contacts = detect(&body, &world, &field, &materials(), 0.1);
         assert!(!contacts.is_empty(), "the pillar was not found");
         for c in &contacts {
-            assert_eq!(c.key.1, IVec3::new(32, 7, 32), "contact with {:?}", c.key.1);
+            assert_eq!(c.key.theirs, [32, 7, 32], "contact with {:?}", c.key.theirs);
             assert!((c.normal - Vec3::Y).length() < TOLERANCE, "normal {:?}", c.normal);
             assert!(c.separation.abs() < TOLERANCE, "separation {}", c.separation);
         }
@@ -434,7 +466,7 @@ mod tests {
         let body = placed(Contree::from_voxels(16, &bar), Vec3::new(32.5, 9.5, 32.5), Quat::IDENTITY);
         let contacts = detect(&body, &world, &field, &materials(), 0.1);
         assert!(
-            contacts.iter().any(|c| c.key == (UVec3::new(8, 0, 0), IVec3::new(32, 8, 32))
+            contacts.iter().any(|c| (c.key.mine, c.key.theirs) == ([8, 0, 0], [32, 8, 32])
                 && c.separation.abs() < TOLERANCE),
             "no edge contact at the crossing: {contacts:#?}"
         );
@@ -476,8 +508,8 @@ mod tests {
         let contacts = detect(&body, &world, &field, &materials, 0.1);
         assert_eq!(contacts.len(), 4);
 
-        let on_ice: Vec<_> = contacts.iter().filter(|c| c.key.1.x >= 32).collect();
-        let on_stone: Vec<_> = contacts.iter().filter(|c| c.key.1.x < 32).collect();
+        let on_ice: Vec<_> = contacts.iter().filter(|c| c.key.theirs[0] >= 32).collect();
+        let on_stone: Vec<_> = contacts.iter().filter(|c| c.key.theirs[0] < 32).collect();
         assert_eq!(on_ice.len(), 2, "the cube did not straddle the seam");
         assert_eq!(on_stone.len(), 2);
         for c in on_ice {

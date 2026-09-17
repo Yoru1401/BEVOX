@@ -616,7 +616,7 @@ mod tests {
         let mut bodies = vec![placed(cube(4, 4), Vec3::new(32.0, 10.5, 32.0), Quat::IDENTITY)];
         run(&mut bodies, &world, &field, &materials(), GRAVITY, 300);
         let keys = |b: &Body| {
-            let mut k: Vec<_> = b.warm.keys().map(|(u, w)| (u.to_array(), w.to_array())).collect();
+            let mut k: Vec<_> = b.warm.keys().copied().collect();
             k.sort_unstable();
             k
         };

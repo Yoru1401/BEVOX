@@ -15,10 +15,32 @@ use crate::physics::mass::{MassProperties, mass_properties};
 use glam::{Affine3A, Quat, UVec3, Vec3};
 use std::collections::HashMap;
 
+/// Which body a contact is against. The static world is `WORLD`.
+///
+/// An identity rather than an index: bodies are removed from the middle of the
+/// scene's list, and a warm-start impulse must not follow whichever body takes
+/// the vacated slot.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct BodyId(pub u64);
+
+impl BodyId {
+    /// The static world, which every body can touch and which never moves.
+    pub const WORLD: BodyId = BodyId(0);
+}
+
+fn next_id() -> BodyId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    BodyId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 /// A voxel volume placed in the world by a rigid transform, and the state that
 /// moves it.
 #[derive(Clone, Debug)]
 pub struct Body {
+    /// Names this body in a contact. A clone keeps it: a clone is the same body,
+    /// which is what the render tests and the GPU packing rely on.
+    pub id: BodyId,
     pub volume: Contree,
     /// Where `com` is in the world: the point the body turns about.
     pub position: Vec3,
@@ -55,6 +77,7 @@ impl Body {
              nearest-hit composition would pick the wrong surface"
         );
         Self {
+            id: next_id(),
             volume,
             position,
             orientation,
@@ -242,6 +265,17 @@ mod tests {
         assert!(body.recompute(&crate::physics::fixtures::materials()));
         assert_eq!(body.features.corners.len(), 8);
         assert_eq!(body.features.edges.len(), 24);
+    }
+
+    /// Two bodies are never the same body, and a clone is the same body: the
+    /// warm-start cache keys on this.
+    #[test]
+    fn every_body_gets_its_own_id() {
+        let a = Body::new(cube(), Vec3::ZERO, Quat::IDENTITY);
+        let b = Body::new(cube(), Vec3::ZERO, Quat::IDENTITY);
+        assert_ne!(a.id, b.id);
+        assert_eq!(a.id, a.clone().id);
+        assert_ne!(a.id, BodyId::WORLD, "the world's id is reserved");
     }
 
     #[test]
