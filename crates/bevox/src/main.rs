@@ -7,7 +7,7 @@ use bevox_core::material::{Material, MaterialId, MaterialTable};
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system, start_camera};
 use bevox_render::pick::pick_voxel;
-use bevox_render::upload::{VoxelScene, apply_brush, stage_scene_update_system};
+use bevox_render::upload::{VoxelScene, apply_brush, build_gpu_scene};
 
 fn main() {
     App::new()
@@ -42,9 +42,10 @@ fn main() {
         .init_resource::<BrushSettings>()
         .add_systems(Startup, setup)
         .add_systems(Update, brush_input.after(fly_camera_system))
-        // Before staging, so the table uploaded this frame carries this frame's
-        // turn rather than the last one.
-        .add_systems(Update, spin_bodies.before(stage_scene_update_system))
+        // Before the rebuild, and so before the staging that follows it: a
+        // rebuild frame packs this frame's turn into the new buffers, and every
+        // other frame's table carries it too, rather than the last one.
+        .add_systems(Update, spin_bodies.before(build_gpu_scene))
         .run();
 }
 
