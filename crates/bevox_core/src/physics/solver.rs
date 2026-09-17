@@ -1,13 +1,17 @@
-//! Temporal Gauss-Seidel. Contacts are detected once per tick; then each
-//! substep applies gravity, warm starts, solves the velocity constraints,
-//! integrates and relaxes.
+//! Temporal Gauss-Seidel over the whole scene. Contacts are detected once per
+//! tick, body against world and body against body; then each substep applies
+//! gravity, warm starts, solves the velocity constraints, integrates and
+//! relaxes.
+//!
+//! The world is the case where a contact has no second body: every term of its
+//! is zero, so there is one code path rather than two.
 //!
 //! The detect-once-then-substep shape and warm starting by voxel pair are from
 //! Dwyer's devlog #26. The unbiased relax solve after integrating is from Erin
 //! Catto's soft-step solver (Box2D v3): it removes the velocity the push-out
 //! bias added, so pushing a body out of the floor does not make it bounce.
 
-use super::contact::{Contact, RADIUS, detect, world_box};
+use super::contact::{Contact, RADIUS, detect, detect_pair, world_box};
 use super::{BASE_MARGIN, BIAS, MAX_PUSH, MAX_TRAVEL, RESTITUTION_SWEEPS, SLOP, SUBSTEPS};
 use crate::body::{Body, occupied_bounds};
 use crate::contree::Contree;
@@ -15,7 +19,24 @@ use crate::distance_field::DistanceField;
 use crate::material::MaterialTable;
 use glam::{Mat3, Quat, Vec2, Vec3};
 
-/// Advances every body by one tick of `dt` seconds against the static world.
+/// What a contact carried last tick, for warm starting.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ContactImpulse {
+    pub normal: f32,
+    /// Along the contact's two tangents, in their order.
+    pub tangent: Vec2,
+}
+
+/// A contact and the bodies it joins: the one it belongs to, and the one it is
+/// against, unless that is the world.
+struct Joined {
+    contact: Contact,
+    body: usize,
+    other: Option<usize>,
+}
+
+/// Advances every body by one tick of `dt` seconds, against the static world and
+/// against each other.
 ///
 /// Bodies entirely below the world are removed first. Returns whether any were:
 /// the body list changed, so the caller must rebuild what is packed from it. A
@@ -30,98 +51,129 @@ pub fn step(
 ) -> bool {
     let before = bodies.len();
     bodies.retain(|b| world_box(b, 0.0).is_none_or(|(_, max)| max.y >= 0.0));
-    for body in bodies.iter_mut().filter(|b| b.mass.mass > 0.0) {
-        step_body(body, tree, field, materials, gravity, dt);
-    }
-    bodies.len() != before
-}
-
-/// What a contact carried last tick, for warm starting.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ContactImpulse {
-    pub normal: f32,
-    /// Along the contact's two tangents, in their order.
-    pub tangent: Vec2,
-}
-
-/// The contact's two tangent directions.
-///
-/// Derived from the normal only: a basis that depended on velocity would turn
-/// between ticks, and last tick's stored tangent impulse would mean nothing.
-fn tangents(normal: Vec3) -> (Vec3, Vec3) {
-    normal.any_orthonormal_pair()
-}
-
-fn step_body(
-    body: &mut Body,
-    tree: &Contree,
-    field: &DistanceField,
-    materials: &MaterialTable,
-    gravity: Vec3,
-    dt: f32,
-) {
     let h = dt / SUBSTEPS as f32;
     let inv_h = 1.0 / h;
-    let inv_mass = body.mass.inverse_mass();
-    let radius = radius(body);
 
-    let travel = cap_speed(body, world_inverse_inertia(body), radius, dt);
-    let contacts = detect(body, tree, field, materials, travel + BASE_MARGIN);
-    let mut impulses: Vec<ContactImpulse> =
-        contacts.iter().map(|c| body.warm.get(&c.key).copied().unwrap_or_default()).collect();
-    // The speed the body arrives with, which the substeps are about to destroy.
-    // A bounce is written in terms of it, so it is recorded here.
-    let arrival = world_inverse_inertia(body) * body.angular_momentum;
-    let approach: Vec<f32> = contacts
+    // Speeds are capped before anything is detected: a pair's margin depends on
+    // how far both of its bodies can travel.
+    let radii: Vec<f32> = bodies.iter().map(radius).collect();
+    let travel: Vec<f32> = bodies
+        .iter_mut()
+        .zip(&radii)
+        .map(|(b, &r)| {
+            if b.mass.mass > 0.0 { cap_speed(b, world_inverse_inertia(b), r, dt) } else { 0.0 }
+        })
+        .collect();
+
+    let joined = collect_contacts(bodies, tree, field, materials, &travel);
+    let mut impulses: Vec<ContactImpulse> = joined
         .iter()
-        .map(|c| {
-            let r = lever(body, c);
-            (body.velocity + arrival.cross(r)).dot(c.normal)
+        .map(|j| bodies[j.body].warm.get(&j.contact.key).copied().unwrap_or_default())
+        .collect();
+    // The speed the bodies arrive with, which the substeps are about to destroy.
+    // A bounce is written in terms of it, so it is recorded here.
+    let approach: Vec<f32> = joined
+        .iter()
+        .map(|j| {
+            let other = j.other.map(|o| &bodies[o]);
+            normal_velocity(&bodies[j.body], other, &j.contact)
         })
         .collect();
 
     for _ in 0..SUBSTEPS {
-        body.velocity += gravity * h;
-        let inv_inertia = world_inverse_inertia(body);
-        cap_speed(body, inv_inertia, radius, dt);
-
-        for (c, &impulse) in contacts.iter().zip(&impulses) {
-            warm_start(body, inv_mass, c, impulse);
-        }
-        for (c, impulse) in contacts.iter().zip(impulses.iter_mut()) {
-            solve(body, inv_mass, inv_inertia, c, impulse, inv_h, true);
-            solve_friction(body, inv_mass, inv_inertia, c, impulse);
+        for (b, &r) in bodies.iter_mut().zip(&radii).filter(|(b, _)| b.mass.mass > 0.0) {
+            b.velocity += gravity * h;
+            cap_speed(b, world_inverse_inertia(b), r, dt);
         }
 
-        integrate(body, inv_inertia, h);
+        for (j, &impulse) in joined.iter().zip(&impulses) {
+            let (a, b) = pair_mut(bodies, j.body, j.other);
+            warm_start(a, b, &j.contact, impulse);
+        }
+        for (j, impulse) in joined.iter().zip(impulses.iter_mut()) {
+            let (a, mut b) = pair_mut(bodies, j.body, j.other);
+            solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, true);
+            solve_friction(a, b, &j.contact, impulse);
+        }
 
-        let inv_inertia = world_inverse_inertia(body);
-        for (c, impulse) in contacts.iter().zip(impulses.iter_mut()) {
-            solve(body, inv_mass, inv_inertia, c, impulse, inv_h, false);
-            solve_friction(body, inv_mass, inv_inertia, c, impulse);
+        for b in bodies.iter_mut().filter(|b| b.mass.mass > 0.0) {
+            integrate(b, h);
+        }
+
+        for (j, impulse) in joined.iter().zip(impulses.iter_mut()) {
+            let (a, mut b) = pair_mut(bodies, j.body, j.other);
+            solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, false);
+            solve_friction(a, b, &j.contact, impulse);
         }
     }
 
-    // What the contacts carried while holding the body up, which is what warm
+    // What the contacts carried while holding the bodies up, which is what warm
     // starting wants next tick. The bounce below is a one-off: feeding it back
     // would have the next tick's warm start kick the body again, and a body
     // would keep almost all its speed instead of `restitution` of it.
-    body.warm = contacts.iter().zip(&impulses).map(|(c, &i)| (c.key, i)).collect();
+    for b in bodies.iter_mut() {
+        b.warm.clear();
+    }
+    for (j, &impulse) in joined.iter().zip(&impulses) {
+        bodies[j.body].warm.insert(j.contact.key, impulse);
+    }
 
-    // Restitution last, after the substeps have removed the approach speed.
-    // Solving it inside them would fight the push-out bias.
-    //
-    // Swept several times rather than once, and each contact may give impulse
-    // back down to what it carried before. A single sweep has every contact of
-    // a flat landing push the whole body to the target on its own, four corners
-    // stacking to more than the body arrived with; sweeping lets the later ones
-    // take that back out.
+    apply_restitution(bodies, &joined, &mut impulses, &approach);
+    bodies.len() != before
+}
+
+/// Every contact in the scene: each body against the world, then each pair of
+/// bodies once, with the lower index first.
+fn collect_contacts(
+    bodies: &[Body],
+    tree: &Contree,
+    field: &DistanceField,
+    materials: &MaterialTable,
+    travel: &[f32],
+) -> Vec<Joined> {
+    let mut joined = Vec::new();
+    for (i, body) in bodies.iter().enumerate() {
+        if body.mass.mass <= 0.0 {
+            continue;
+        }
+        for contact in detect(body, tree, field, materials, travel[i] + BASE_MARGIN) {
+            joined.push(Joined { contact, body: i, other: None });
+        }
+    }
+    for i in 0..bodies.len() {
+        for j in (i + 1)..bodies.len() {
+            if bodies[i].mass.mass <= 0.0 || bodies[j].mass.mass <= 0.0 {
+                continue;
+            }
+            let margin = travel[i].max(travel[j]) + BASE_MARGIN;
+            for contact in detect_pair(&bodies[i], &bodies[j], materials, margin) {
+                joined.push(Joined { contact, body: i, other: Some(j) });
+            }
+        }
+    }
+    joined
+}
+
+/// Restitution, after the substeps have removed the approach speed. Solving it
+/// inside them would fight the push-out bias.
+///
+/// Swept several times rather than once, and each contact may give impulse back
+/// down to what it carried before. A single sweep has every contact of a flat
+/// landing push the whole body to the target on its own, four corners stacking
+/// to more than the body arrived with; sweeping lets the later ones take that
+/// back out.
+fn apply_restitution(
+    bodies: &mut [Body],
+    joined: &[Joined],
+    impulses: &mut [ContactImpulse],
+    approach: &[f32],
+) {
     let base: Vec<f32> = impulses.iter().map(|i| i.normal).collect();
-    let inv_inertia = world_inverse_inertia(body);
     for _ in 0..RESTITUTION_SWEEPS {
-        for ((c, impulse), (&approach, &base)) in
-            contacts.iter().zip(impulses.iter_mut()).zip(approach.iter().zip(&base))
+        for ((j, impulse), (&approach, &base)) in
+            joined.iter().zip(impulses.iter_mut()).zip(approach.iter().zip(&base))
         {
+            let c = &j.contact;
             // A contact that never carried load is one the body never reached.
             //
             // No speed threshold here. One was tried, on the usual reasoning
@@ -133,15 +185,26 @@ fn step_body(
             if c.restitution <= 0.0 || base == 0.0 {
                 continue;
             }
-            let r = lever(body, c);
-            let omega = inv_inertia * body.angular_momentum;
-            let vn = (body.velocity + omega.cross(r)).dot(c.normal);
+            let (a, mut b) = pair_mut(bodies, j.body, j.other);
+            let vn = normal_velocity(a, b.as_deref(), c);
             let target = -c.restitution * approach;
-            let k = inv_mass + (inv_inertia * r.cross(c.normal)).cross(r).dot(c.normal);
+            let k = effective_mass(a, b.as_deref(), c);
             let total = (impulse.normal + (target - vn) / k).max(base);
             let delta = total - impulse.normal;
             impulse.normal = total;
-            push(body, inv_mass, c, c.normal * delta);
+            push(a, b.as_deref_mut(), c, c.normal * delta);
+        }
+    }
+}
+
+/// The two bodies a contact joins, borrowed at once.
+fn pair_mut(bodies: &mut [Body], i: usize, j: Option<usize>) -> (&mut Body, Option<&mut Body>) {
+    match j {
+        None => (&mut bodies[i], None),
+        Some(j) => {
+            debug_assert_ne!(i, j, "a contact cannot join a body to itself");
+            let (lo, hi) = bodies.split_at_mut(i.max(j));
+            if i < j { (&mut lo[i], Some(&mut hi[0])) } else { (&mut hi[0], Some(&mut lo[j])) }
         }
     }
 }
@@ -175,83 +238,93 @@ fn cap_speed(body: &mut Body, inv_inertia: Mat3, radius: f32, dt: f32) -> f32 {
     travel
 }
 
-/// The contact point's offset from the centre of mass, in world axes.
-fn lever(body: &Body, c: &Contact) -> Vec3 {
-    body.orientation * c.anchor
+/// How fast a point fixed to the body, `r` from its centre of mass, is moving.
+fn point_velocity(body: &Body, r: Vec3) -> Vec3 {
+    body.velocity + (world_inverse_inertia(body) * body.angular_momentum).cross(r)
 }
 
-/// Applies an impulse at the contact point.
-fn push(body: &mut Body, inv_mass: f32, c: &Contact, impulse: Vec3) {
-    body.velocity += impulse * inv_mass;
-    body.angular_momentum += lever(body, c).cross(impulse);
+/// How fast the two surfaces are moving apart, as a vector. The world
+/// contributes nothing, because it does not move.
+fn relative_velocity(a: &Body, b: Option<&Body>, c: &Contact) -> Vec3 {
+    let va = point_velocity(a, a.orientation * c.anchor);
+    let vb = b.map_or(Vec3::ZERO, |b| point_velocity(b, b.orientation * c.other_anchor));
+    va - vb
+}
+
+/// The closing speed along the contact normal. Negative is approaching.
+fn normal_velocity(a: &Body, b: Option<&Body>, c: &Contact) -> f32 {
+    relative_velocity(a, b, c).dot(c.normal)
+}
+
+/// How much impulse one unit of velocity change costs at this contact, along
+/// `dir`. Both bodies resist; the world's terms are zero.
+fn effective_mass_along(a: &Body, b: Option<&Body>, c: &Contact, dir: Vec3) -> f32 {
+    let term = |body: &Body, anchor: Vec3| {
+        let r = body.orientation * anchor;
+        let inv = world_inverse_inertia(body);
+        body.mass.inverse_mass() + (inv * r.cross(dir)).cross(r).dot(dir)
+    };
+    term(a, c.anchor) + b.map_or(0.0, |b| term(b, c.other_anchor))
+}
+
+fn effective_mass(a: &Body, b: Option<&Body>, c: &Contact) -> f32 {
+    effective_mass_along(a, b, c, c.normal)
+}
+
+/// The gap now: the gap at detection, plus how far the two anchors have moved
+/// apart along the normal since.
+fn separation(a: &Body, b: Option<&Body>, c: &Contact) -> f32 {
+    let moved_a = a.position + a.orientation * c.anchor - c.world_point;
+    let moved_b =
+        b.map_or(Vec3::ZERO, |b| b.position + b.orientation * c.other_anchor - c.other_point);
+    c.separation + (moved_a - moved_b).dot(c.normal)
+}
+
+/// The contact's two tangent directions.
+///
+/// Derived from the normal only: a basis that depended on velocity would turn
+/// between ticks, and last tick's stored tangent impulse would mean nothing.
+fn tangents(normal: Vec3) -> (Vec3, Vec3) {
+    normal.any_orthonormal_pair()
+}
+
+/// Applies an impulse at the contact point: the body is pushed along it, and
+/// whatever it is touching is pushed the other way.
+fn push(a: &mut Body, b: Option<&mut Body>, c: &Contact, impulse: Vec3) {
+    let ra = a.orientation * c.anchor;
+    a.velocity += impulse * a.mass.inverse_mass();
+    a.angular_momentum += ra.cross(impulse);
+    if let Some(b) = b {
+        let rb = b.orientation * c.other_anchor;
+        b.velocity -= impulse * b.mass.inverse_mass();
+        b.angular_momentum -= rb.cross(impulse);
+    }
 }
 
 /// Re-applies what the contact carried before, normal and friction together.
-fn warm_start(body: &mut Body, inv_mass: f32, c: &Contact, impulse: ContactImpulse) {
+fn warm_start(a: &mut Body, b: Option<&mut Body>, c: &Contact, impulse: ContactImpulse) {
     let (t1, t2) = tangents(c.normal);
     let p = c.normal * impulse.normal + t1 * impulse.tangent.x + t2 * impulse.tangent.y;
-    push(body, inv_mass, c, p);
-}
-
-/// Coulomb friction along the contact's two tangents.
-///
-/// The accumulated tangent impulse is clamped as a vector rather than per axis:
-/// clamping each axis alone would let the total reach sqrt(2) times the limit,
-/// and a body pushed diagonally would slide further than one pushed along an
-/// axis.
-fn solve_friction(
-    body: &mut Body,
-    inv_mass: f32,
-    inv_inertia: Mat3,
-    c: &Contact,
-    impulse: &mut ContactImpulse,
-) {
-    if c.friction <= 0.0 {
-        impulse.tangent = Vec2::ZERO;
-        return;
-    }
-    let (t1, t2) = tangents(c.normal);
-    let r = lever(body, c);
-    let omega = inv_inertia * body.angular_momentum;
-    let v = body.velocity + omega.cross(r);
-    let mut delta = Vec2::ZERO;
-    for (i, t) in [t1, t2].iter().enumerate() {
-        let k = inv_mass + (inv_inertia * r.cross(*t)).cross(r).dot(*t);
-        delta[i] = -v.dot(*t) / k;
-    }
-    let limit = c.friction * impulse.normal;
-    let mut total = impulse.tangent + delta;
-    if total.length() > limit {
-        total = total.normalize_or_zero() * limit;
-    }
-    let applied = total - impulse.tangent;
-    impulse.tangent = total;
-    push(body, inv_mass, c, t1 * applied.x + t2 * applied.y);
+    push(a, b, c, p);
 }
 
 /// One sequential-impulse iteration on one contact.
 ///
 /// The accumulated impulse never goes negative: contacts push, never pull. A
-/// contact that is still apart lets the body approach by exactly the gap. A
-/// penetrating one, with `use_bias`, pushes the body out by a fraction of the
+/// contact that is still apart lets the bodies approach by exactly the gap. A
+/// penetrating one, with `use_bias`, pushes them apart by a fraction of the
 /// depth beyond the slop.
 fn solve(
-    body: &mut Body,
-    inv_mass: f32,
-    inv_inertia: Mat3,
+    a: &mut Body,
+    b: Option<&mut Body>,
     c: &Contact,
     impulse: &mut ContactImpulse,
     inv_h: f32,
     use_bias: bool,
 ) {
-    let r = lever(body, c);
-    let omega = inv_inertia * body.angular_momentum;
-    let vn = (body.velocity + omega.cross(r)).dot(c.normal);
-    let k = inv_mass + (inv_inertia * r.cross(c.normal)).cross(r).dot(c.normal);
-
-    // The gap at detection, moved by how far the contact point has travelled
-    // along the normal since. The world does not move.
-    let separation = c.separation + (body.position + r - c.world_point).dot(c.normal);
+    let vn = normal_velocity(a, b.as_deref(), c);
+    let k = effective_mass(a, b.as_deref(), c);
+    let separation = separation(a, b.as_deref(), c);
     let bias = if separation > 0.0 {
         separation * inv_h
     } else if use_bias {
@@ -263,16 +336,48 @@ fn solve(
     let total = (impulse.normal - (vn + bias) / k).max(0.0);
     let delta = total - impulse.normal;
     impulse.normal = total;
-    push(body, inv_mass, c, c.normal * delta);
+    push(a, b, c, c.normal * delta);
+}
+
+/// Coulomb friction along the contact's two tangents.
+///
+/// The accumulated tangent impulse is clamped as a vector rather than per axis:
+/// clamping each axis alone would let the total reach sqrt(2) times the limit,
+/// and a body pushed diagonally would slide further than one pushed along an
+/// axis.
+fn solve_friction(
+    a: &mut Body,
+    b: Option<&mut Body>,
+    c: &Contact,
+    impulse: &mut ContactImpulse,
+) {
+    if c.friction <= 0.0 {
+        impulse.tangent = Vec2::ZERO;
+        return;
+    }
+    let (t1, t2) = tangents(c.normal);
+    let v = relative_velocity(a, b.as_deref(), c);
+    let mut delta = Vec2::ZERO;
+    for (i, t) in [t1, t2].iter().enumerate() {
+        delta[i] = -v.dot(*t) / effective_mass_along(a, b.as_deref(), c, *t);
+    }
+    let limit = c.friction * impulse.normal;
+    let mut total = impulse.tangent + delta;
+    if total.length() > limit {
+        total = total.normalize_or_zero() * limit;
+    }
+    let applied = total - impulse.tangent;
+    impulse.tangent = total;
+    push(a, b, c, t1 * applied.x + t2 * applied.y);
 }
 
 /// Moves and turns the body by one substep.
 ///
 /// `omega` is in world axes, so the spin quaternion multiplies on the left.
 /// Dwyer lost three weeks to the other order.
-fn integrate(body: &mut Body, inv_inertia: Mat3, h: f32) {
+fn integrate(body: &mut Body, h: f32) {
     body.position += body.velocity * h;
-    let omega = inv_inertia * body.angular_momentum;
+    let omega = world_inverse_inertia(body) * body.angular_momentum;
     let spin = Quat::from_xyzw(omega.x, omega.y, omega.z, 0.0) * body.orientation;
     body.orientation = (body.orientation + spin * (0.5 * h)).normalize();
 }
@@ -356,6 +461,103 @@ mod tests {
         let (axis, angle) = (bodies[0].orientation * start.inverse()).to_axis_angle();
         assert!(axis.y.abs() > 0.999, "turned about {axis:?}");
         assert!((angle - rate * DT).abs() < 0.01 * rate * DT, "turned {angle}, want {}", rate * DT);
+    }
+
+    /// A moving cube hitting a still one of equal mass gives its motion away:
+    /// momentum is conserved, and neither passes through the other.
+    #[test]
+    fn a_cube_knocks_another_along() {
+        let materials = materials();
+        let world = Contree::empty(3);
+        let field = DistanceField::build(&world);
+        let mut hitter = placed(cube(4, 4), Vec3::new(20.0, 32.0, 32.0), Quat::IDENTITY);
+        hitter.velocity = Vec3::new(20.0, 0.0, 0.0);
+        let sitter = placed(cube(4, 4), Vec3::new(30.0, 32.0, 32.0), Quat::IDENTITY);
+        let before = hitter.velocity * hitter.mass.mass;
+        let mut bodies = vec![hitter, sitter];
+        run(&mut bodies, &world, &field, &materials, Vec3::ZERO, 120);
+
+        let after: Vec3 = bodies.iter().map(|b| b.velocity * b.mass.mass).sum();
+        assert!(
+            (after - before).length() < 0.05 * before.length(),
+            "momentum {after:?}, was {before:?}"
+        );
+        assert!(
+            bodies[1].velocity.x > 1.0,
+            "the still cube was not knocked along: {:?}",
+            bodies[1].velocity
+        );
+        // Neither material bounces, so equal masses should end up travelling
+        // together. They do not quite: the push-out bias adds a little
+        // separation, measured at 4.55 voxels/s against a 20 voxels/s impact.
+        // The bound sits above that and below what a wrong effective mass or a
+        // separation that ignores the other body gives (6.14 and 6.60), which
+        // is what makes those breaks visible here.
+        let parting = bodies[1].velocity.x - bodies[0].velocity.x;
+        assert!(
+            parting < 5.5,
+            "the cubes parted at {parting} voxels/s; with no bounce they should travel together"
+        );
+        assert!(
+            bodies[0].position.x + 3.5 < bodies[1].position.x,
+            "the cubes ended overlapping: {} and {}",
+            bodies[0].position.x,
+            bodies[1].position.x
+        );
+    }
+
+    /// Three cubes stacked stay stacked, at the height they settled at. A stack
+    /// is how an impulse solver fails: the bottom sinks, or the whole thing
+    /// shivers. A single body cannot show either.
+    #[test]
+    fn a_stack_of_three_stands_still() {
+        let materials = materials();
+        let world = slab(64, 0..8);
+        let field = DistanceField::build(&world);
+        let mut bodies: Vec<Body> = (0..3)
+            .map(|i| placed(cube(4, 4), Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0), Quat::IDENTITY))
+            .collect();
+        run(&mut bodies, &world, &field, &materials, GRAVITY, 2000);
+        let settled: Vec<f32> = bodies.iter().map(|b| b.position.y).collect();
+        for (i, y) in settled.iter().enumerate() {
+            let want = 10.0 + i as f32 * 4.0;
+            assert!((y - want).abs() < 0.2, "body {i} settled at {y}, want about {want}");
+        }
+
+        run(&mut bodies, &world, &field, &materials, GRAVITY, 8000);
+        for (i, (b, was)) in bodies.iter().zip(&settled).enumerate() {
+            assert!(
+                (b.position.y - was).abs() < 5e-3,
+                "body {i} drifted from {was} to {}",
+                b.position.y
+            );
+            assert!(b.velocity.length() < 2e-2, "body {i} still moving at {:?}", b.velocity);
+        }
+    }
+
+    /// A body resting on another is held up by it, not by the floor: take the
+    /// lower one away and the upper one falls.
+    #[test]
+    fn taking_the_lower_body_away_drops_the_upper() {
+        let materials = materials();
+        let world = slab(64, 0..8);
+        let field = DistanceField::build(&world);
+        let mut bodies = vec![
+            placed(cube(4, 4), Vec3::new(32.0, 10.2, 32.0), Quat::IDENTITY),
+            placed(cube(4, 4), Vec3::new(32.0, 14.2, 32.0), Quat::IDENTITY),
+        ];
+        run(&mut bodies, &world, &field, &materials, GRAVITY, 1000);
+        assert!(bodies[1].velocity.y.abs() < 0.05, "the upper body never settled");
+        let held_at = bodies[1].position.y;
+        assert!(held_at > 13.0, "the upper body sank into the lower one: {held_at}");
+
+        bodies.remove(0);
+        run(&mut bodies, &world, &field, &materials, GRAVITY, 10);
+        assert!(
+            bodies[0].velocity.y < -1.0,
+            "the upper body hung in the air: {:?}",
+            bodies[0].velocity
+        );
     }
 
     /// Dropped flat from half a voxel up, a cube lands and stays put. Jitter is
