@@ -135,12 +135,13 @@ pub fn screen_rect(
         );
         let offset = world_from_local.transform_point3(corner) - eye;
         let clip = clip_from_offset * offset.extend(1.0);
-        // `w` is the corner's depth along the view, accurate to about
-        // |offset| * epsilon now that nothing absolute enters it. A corner that
-        // truly sits just behind the camera but reads as just in front
-        // projects to the same side at infinity as the in-front part of its
-        // edges, which the clamp turns into the screen edge: still
-        // conservative, so no wider margin is needed.
+        // `w` is the corner's depth along the view. `transform_point3` still
+        // passes through an absolute world-space point before `eye` is
+        // subtracted, so `w` itself carries about |eye| * epsilon of error --
+        // this is not immune to that. It is still safe: a corner misclassified
+        // by that error keeps the sign of its true side in `xy / w`, and the
+        // clamp turns it into the screen edge either way, so the rectangle
+        // stays conservative.
         if clip.w <= 1e-6 {
             return GpuBodyRect::whole(size);
         }

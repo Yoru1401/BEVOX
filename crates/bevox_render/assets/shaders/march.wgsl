@@ -470,8 +470,16 @@ fn traverse_at(
                     vec3<i32>(3),
                 );
                 // Entering exactly on an inner plane grazes the cell behind it.
-                let near = node_lo + vec3<f32>(cell + max(-stepv, vec3<i32>(0))) * cell_size;
-                ties = axis_bits((near - origin) * inv_dir == vec3<f32>(t_cur)) | TIE_ENTRY;
+                // The entering axis itself always lands on the node's own outer
+                // face (index 0 or 4), never an inner one, and recomputing its
+                // distance here reproduces `t_cur` bit for bit -- not a real tie,
+                // just the same float formula read twice. Restricting to inner
+                // planes (1..3) keeps the real ties and drops that false one,
+                // which otherwise ran the subset loop below on every entry.
+                let k = cell + max(-stepv, vec3<i32>(0));
+                let inner = k > vec3<i32>(0) & k < vec3<i32>(4);
+                let near = node_lo + vec3<f32>(k) * cell_size;
+                ties = axis_bits(inner & ((near - origin) * inv_dir == vec3<f32>(t_cur))) | TIE_ENTRY;
                 after = 0u;
             } else {
                 // Resuming at the distance last descended at, past that child.
@@ -602,9 +610,10 @@ fn traverse_at(
     return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0), false);
 }
 
-/// The static world, at its fixed place in the shared buffers. Every existing
-/// call site and every parity test is pinned to this function, so it must stay
-/// exactly what it was before bodies existed.
+/// The static world, at its fixed place in the shared buffers. Its signature
+/// has already grown once, to take the seed distance and the ray's distance
+/// budget -- but every existing call site and every parity test is pinned to
+/// what it does: walk only the static tree, rooted at node_base 0.
 fn traverse(origin: vec3<f32>, dir: vec3<f32>, t_start: f32, max_dist: f32) -> Hit {
     return traverse_at(origin, dir, t_start, max_dist, 0u, 0u, view.volume_params.x, view.volume_params.y);
 }
@@ -887,7 +896,7 @@ fn primary_hit(id: vec3<u32>, size: vec2<u32>) -> Hit {
     }
     var hit = traverse(view.camera_position.xyz, dir, t_seed, max_ray_distance());
     if flag_enabled(FLAG_BODIES) {
-        // From the camera over the whole ray, not from the seeded origin. The
+        // From the camera over the whole ray, not from the seed distance. The
         // beam seed and the distance-field skip are static-world accelerators:
         // the prepass marched only the static tree and the field was built only
         // from it, so neither carries any information about bodies. Starting a

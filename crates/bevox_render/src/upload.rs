@@ -440,6 +440,14 @@ pub fn pack_field(field: &bevox_core::distance_field::DistanceField) -> Vec<u32>
     bevox_core::gpu::pack_voxels(field.cells())
 }
 
+/// Clip space to the world-space offset from the eye: the camera's rotation
+/// times the inverse projection, with no translation anywhere in it. See
+/// `ExtractedMarchCamera::offset_from_clip` for why never the absolute
+/// view-projection.
+pub fn offset_from_clip(rotation: Quat, clip_from_view: Mat4) -> Mat4 {
+    Mat4::from_quat(rotation) * clip_from_view.inverse()
+}
+
 /// Reads the active 3D camera in the main world so it can be extracted.
 pub fn track_march_camera(
     mut commands: Commands,
@@ -448,11 +456,8 @@ pub fn track_march_camera(
     let Ok((transform, projection)) = camera.single() else {
         return;
     };
-    // Rotation and projection only: never derived from the absolute
-    // view-projection, whose f32 error cannot be subtracted back out.
     commands.insert_resource(ExtractedMarchCamera {
-        offset_from_clip: Mat4::from_quat(transform.rotation())
-            * projection.get_clip_from_view().inverse(),
+        offset_from_clip: offset_from_clip(transform.rotation(), projection.get_clip_from_view()),
         position: transform.translation(),
     });
 }
@@ -813,9 +818,37 @@ mod tests {
         assert_eq!(u.offset_from_clip[3][2], 7.0);
     }
 
+    #[test]
+    fn offset_from_clip_matches_the_inverse_view_projection_at_the_eye() {
+        // Yaw and pitch together, so no axis is left at its identity value.
+        let rotation = Quat::from_euler(EulerRot::YXZ, 0.6, 0.3, 0.0);
+        let projections = [
+            Mat4::perspective_rh(0.9, 16.0 / 9.0, 0.1, 500.0),
+            Mat4::perspective_infinite_reverse_rh(0.9, 16.0 / 9.0, 0.1),
+        ];
+        for clip_from_view in projections {
+            let got = offset_from_clip(rotation, clip_from_view);
+            // The textbook route: build the view matrix for a camera at the
+            // origin facing `rotation`, compose with the projection, and
+            // invert the whole thing back to a clip-to-world-offset matrix.
+            let forward = rotation * -Vec3::Z;
+            let up = rotation * Vec3::Y;
+            let want = (clip_from_view * Mat4::look_to_rh(Vec3::ZERO, forward, up)).inverse();
+            let (got, want) = (got.to_cols_array(), want.to_cols_array());
+            for i in 0..16 {
+                assert!(
+                    (got[i] - want[i]).abs() < 1e-5,
+                    "entry {i}: got {}, want {}",
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
     use bevox_core::contree::Contree;
     use bevox_core::material::MaterialId;
-    use glam::{Mat4, Quat, UVec3, Vec3};
+    use glam::{EulerRot, Mat4, Quat, UVec3, Vec3};
 
     /// A scene with something in it, so an edit has existing nodes to rewrite
     /// rather than only allocating fresh ones.

@@ -1956,7 +1956,7 @@ fn a_ray_crossing_a_voxel_edge_exactly_hits_what_the_scan_hits() {
     // (label, world, eye, the edge's y, the grazed voxel's (x, y) for a ray
     // crossing the edge at x going the given way along x)
     type Grazed = fn(f32, bool) -> (u32, u32);
-    let placements: [(&str, &Contree, Vec3, f32, Grazed); 3] = [
+    let placements: [(&str, &Contree, Vec3, f32, Grazed); 4] = [
         ("floor edge on a brick boundary", &floor, Vec3::new(32.0, 18.0, -40.0), 6.0, |x, pos| {
             (if pos { x as u32 - 1 } else { x as u32 }, 5)
         }),
@@ -1965,6 +1965,16 @@ fn a_ray_crossing_a_voxel_edge_exactly_hits_what_the_scan_hits() {
         }),
         ("block edge entered from below", &block, Vec3::new(14.0, 4.0, -40.0), 10.0, |x, _| {
             (x as u32, 9)
+        }),
+        // Eye inside the volume, in open space above the floor: unlike the
+        // other placements it sits in a distance-field cell the floor never
+        // touches (field cells are 16 voxels, and y=20 is outside the y<16
+        // cell the floor marks zero), so the DISTANCE_FIELD-only flag set
+        // below actually exercises skip_empty_space's advance instead of
+        // returning immediately, as it does when the eye starts outside the
+        // volume entirely.
+        ("floor edge with the eye inside the volume", &floor, Vec3::new(30.0, 20.0, 32.0), 6.0, |x, pos| {
+            (if pos { x as u32 - 1 } else { x as u32 }, 5)
         }),
     ];
 
@@ -2022,6 +2032,9 @@ fn a_ray_crossing_a_voxel_edge_exactly_hits_what_the_scan_hits() {
             }
         }
         eprintln!("{label}: {ties} tied rays that hit, {grazed_hits} on the grazed voxel, {wrong} scan mismatches");
+        if ties == 0 {
+            failures.push(format!("{label}: no tied ray reached a hit; the placement is vacuous"));
+        }
         if grazed_hits < 3 {
             failures.push(format!("{label}: only {grazed_hits} rays hit the grazed voxel; the tie is not placed"));
         }
