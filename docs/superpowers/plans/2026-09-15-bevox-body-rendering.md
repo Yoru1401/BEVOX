@@ -625,7 +625,7 @@ Guard the whole loop with `flag_enabled(FLAG_BODIES)` so a body-free scene with 
 Run: `cargo test --workspace`
 Expected: PASS.
 
-> **If `a_scene_with_no_bodies_is_bit_identical` fails**, the wrapper is not exactly equivalent to the old `traverse` — check the depth and extent it passes. **If `a_placed_body_appears` fails with all three images equal**, the loop is not running: check the count in `volume_params.w`. **If left and right are equal but differ from empty**, the transform is not being applied — check that the inverse, not the forward, placement was packed.
+> **If `a_scene_with_no_bodies_is_bit_identical` fails**, the composition loop changes a body-free image — check that it runs zero times at a count of zero and hands back the world hit untouched. It compares the flag on against off within one shader, so it cannot tell whether the `traverse_at` wrapper is exactly equivalent to the old `traverse`: both sides run the wrapper. That takes a render against the pre-branch shader. **If `a_placed_body_appears` fails with all three images equal**, the loop is not running: check the count in `volume_params.w`. **If left and right are equal but differ from empty**, the transform is not being applied — check that the inverse, not the forward, placement was packed.
 
 - [ ] **Step 5: Commit**
 
@@ -698,7 +698,7 @@ Run: `cargo test --release -p bevox_render --test gpu_bench bodies -- --nocaptur
 
 Add a Measurements section to this plan with the numbers, and set a body-count cap from them rather than from taste. State the per-body cost in milliseconds and what count fits a 16.7 ms frame alongside the static world.
 
-> If a single body costs more than about 10% of the static world's march, say so plainly — it would mean the composition is too expensive for the milestones that follow and the design needs a bounding-volume test before the per-body march, not more bodies.
+> If a single body costs more than about 10% of the static world's march, say so plainly — it would mean the composition is too expensive for the milestones that follow and the design needs a way to reject a body before it is read and transformed, not more bodies. A bounding-volume test placed in front of the per-body march is not that: `traverse_at`'s root slab test already is one, and the read and both transforms run before it. The Measurements section has the reasoning.
 
 - [ ] **Step 3: Run the whole suite**
 
@@ -724,7 +724,9 @@ No physics. The body spins from a hardcoded rotation; gravity, mass properties a
 
 No implicit normals for bodies. A body shades from its face normal, which is flat where the static world is smooth. Milestone 3, alongside contacts.
 
-No bounding-volume rejection before the per-body march. Task 5 measures whether it is needed rather than assuming it; adding it first would be optimising something unmeasured.
+No rejection of a body before it is read and transformed. Task 5 measures whether it is needed rather than assuming it; adding it first would be optimising something unmeasured. It found that it is, and that the rejection has to come before the body's read and transforms: `traverse_at`'s root slab test is already a bounding-volume test, so another placed just in front of the march would not help. See Measurements.
+
+No shadows from bodies. A body receives the static world's shadow, but shadow rays march the static world only, so a body casts none, on the world or on another body.
 
 No body-vs-body anything. Nothing here needs two bodies to interact.
 
@@ -756,7 +758,7 @@ An earlier run in the same session, before the behind-the-camera row existed, ga
 
 **Per body: 3.17 ms.** Linear in the count: 3.25, 3.15 and 3.17 ms per body at 1, 4 and 16. Wall clock and GPU time agree to within 0.1 ms, so this is shader time, not submission overhead.
 
-**Cap: one body.** 11.80 ms of static world plus 3.17 ms a body leaves room for 1.5 bodies in 16.7 ms. `MAX_BODIES = 1` in `crates/bevox_render/src/pipeline.rs`; `prepare_march_buffers` clamps the uniform's body count to it through `marched_body_count`, with `error_once!` when a scene has more. Bodies past the cap are still packed and uploaded, and simply not marched. The test harness writes its own uniform and is not capped, which is how this benchmark measures past it.
+**Cap: one body.** 11.80 ms of static world plus 3.17 ms a body leaves room for 1.5 bodies in 16.7 ms. `MAX_BODIES = 1` in `crates/bevox_render/src/pipeline.rs`; `prepare_march_buffers` clamps the uniform's body count to it through `frame_uniform` and `marched_body_count`, with `error_once!` when a scene has more. Bodies past the cap are still packed and uploaded, and simply not marched. The test harness writes its own uniform and is not capped, which is how this benchmark measures past it.
 
 **One body costs 27% of the static world's march, well over the 10% line.** Composition as built is too expensive for the milestones that follow: at this camera on this card, the linear fit predicts two bodies at about 18.1 ms, past 16.7 ms. Two bodies were not measured. The cap should not go up.
 
@@ -776,4 +778,4 @@ The benchmark cannot separate these. The root slab test in step 3 already is a b
 
 Neither where the time goes among steps 1 to 3, nor how much any candidate recovers, is measured here. Both belong to the task that adds one, re-measured with this benchmark.
 
-What these numbers do not show. They are dispatch timings at one camera, not frame rates: no present, no vsync, no CPU frame work. One scene, one resolution, one GPU. Because most of the per-body cost is paid per pixel, it likely scales with resolution, so a cap chosen at 1280x720 depends on that resolution. One body shape, and a loose one: a 16-voxel cube inside a 64-voxel volume, so rays that enter the volume and miss the cube are in the count; a tighter volume would change the in-view cost, though by the behind-the-camera row not most of it. Primary rays only: shadow rays do not compose bodies yet, so bodies casting shadows would add to this rather than share it. The cap test proves `marched_body_count` clamps; it does not prove `prepare_march_buffers` calls it, which needs a render device no unit test has.
+What these numbers do not show. They are dispatch timings at one camera, not frame rates: no present, no vsync, no CPU frame work. One scene, one resolution, one GPU. Because most of the per-body cost is paid per pixel, it likely scales with resolution, so a cap chosen at 1280x720 depends on that resolution. One body shape, and a loose one: a 16-voxel cube inside a 64-voxel volume, so rays that enter the volume and miss the cube are in the count; a tighter volume would change the in-view cost, though by the behind-the-camera row not most of it. Primary rays only: shadow rays do not compose bodies yet, so bodies casting shadows would add to this rather than share it. The cap tests prove `marched_body_count` clamps and that `frame_uniform`, the uniform `prepare_march_buffers` uploads, goes through it; that `prepare_march_buffers` calls `frame_uniform` is not tested, which would need a render device no unit test has.

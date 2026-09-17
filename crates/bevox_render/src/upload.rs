@@ -40,6 +40,14 @@ pub struct VoxelScene {
     /// or a body added or removed, needs `generation` bumped, because that
     /// moves bytes in the large node and voxel buffers. Do not bump the
     /// generation to move a body: that rebuilds the whole scene every frame.
+    ///
+    /// Ordering, for any system that writes this -- physics included. One that
+    /// changes a body's geometry, or adds, removes or reorders bodies, must
+    /// bump `generation` and run before `build_gpu_scene`. One that only
+    /// changes a transform must run before `stage_scene_update_system`. The
+    /// staged table pairs `GpuSceneData::bodies` with these by index, so
+    /// breaking either rule draws a transform on the wrong body's geometry for
+    /// a frame.
     pub bodies: Vec<Body>,
 }
 
@@ -125,6 +133,14 @@ impl GpuBody {
     /// The one spelling of a body's transform, shared by the full pack and the
     /// per-frame table refresh so the two cannot disagree.
     pub fn placed(self, body: &Body) -> Self {
+        // Here as well as in `Body::new`: the fields are public, and this is
+        // where every orientation passes on its way to the shader.
+        debug_assert!(
+            body.orientation.is_normalized(),
+            "body orientation {:?} is not a unit quaternion; it would scale `t` in the body's \
+             frame and break the nearest-hit composition",
+            body.orientation
+        );
         Self {
             local_from_world: Mat4::from(body.local_from_world()).to_cols_array_2d(),
             rotation: Mat4::from_quat(body.orientation).to_cols_array_2d(),
@@ -1199,8 +1215,9 @@ mod tests {
     /// or voxels, and must not rebuild. The frame that no longer fits must
     /// rebuild -- judged by `GpuSceneData`'s change tick, which is what
     /// `build_gpu_scene`'s trigger drives -- with the bodies moved past a region
-    /// the grown world fits. The render world's reuse check calls the same
-    /// `fits`, so it rebuilds on that frame rather than writing.
+    /// the grown world fits. The render world's half, `can_reuse_buffers`,
+    /// checks the same `fits` against its buffers' region; its own tests in
+    /// `pipeline.rs` pin that, since no render device is available here.
     fn paint_until_the_world_outgrows_its_region(
         mut scene: VoxelScene,
         strokes: impl IntoIterator<Item = (Vec3, f32, MaterialId)>,

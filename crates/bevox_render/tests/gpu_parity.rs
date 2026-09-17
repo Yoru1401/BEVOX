@@ -1142,10 +1142,16 @@ fn an_incrementally_uploaded_edit_renders_identically() {
     }
 }
 
-/// A scene with no bodies must be untouched by the composition loop.
+/// A scene with no bodies must render the same with body composition on as off.
 ///
-/// This is the one that protects everything built before this milestone: the
-/// loop runs, finds nothing, and must leave every pixel exactly as it was.
+/// Both sides run the same shader, so this proves one narrow thing: the
+/// composition loop, at a body count of zero, changes no pixel of any entry
+/// point. It cannot see a change both sides share -- the `traverse` wrapper
+/// over `traverse_at`, or `shadow_origin` factored out of the shading entry
+/// points -- because the flag-off side runs that code too. That a body-free
+/// scene still matches the shader from before bodies existed was checked once,
+/// in the final branch review, by rendering against that shader; nothing in
+/// the suite re-checks it.
 #[test]
 fn a_scene_with_no_bodies_is_bit_identical_with_bodies_enabled() {
     let Some((device, queue)) = gpu_device() else {
@@ -1160,7 +1166,7 @@ fn a_scene_with_no_bodies_is_bit_identical_with_bodies_enabled() {
     let world_from_clip = (projection * view).inverse();
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
-    for entry in ["march_identity", "march_voxel_id", "march_normal", "march"] {
+    for entry in ["march_identity", "march_voxel_id", "march_normal", "march_shadow", "march"] {
         // Masked out explicitly: `DEFAULT` carries `BODIES`, so comparing it
         // against `DEFAULT | BODIES` would compare a build with itself.
         let without = run_march_flagged(
@@ -1261,6 +1267,12 @@ fn a_placed_body_appears_where_its_transform_puts_it() {
 /// and gets a +-X normal; a shadow ray started from its local voxel starts
 /// among them and is shadowed. Without the decoy both probes read empty space
 /// and fall back to the right answer, which is how that bug hid before.
+///
+/// And a static wall stands between the camera and the body's world +X side,
+/// the image's left. Composition keeps the nearest `t`, so there the wall must
+/// show, though the body lies behind it. A body march not bounded by the world
+/// hit draws the body through the wall, and no other test would notice: every
+/// other body test has nothing between the camera and the body.
 #[test]
 fn a_rotated_body_is_shaded_with_its_rotated_normal() {
     let Some((device, queue)) = gpu_device() else {
@@ -1268,7 +1280,9 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
         return;
     };
     let (width, height) = (96u32, 96u32);
-    let eye = Vec3::new(100.0, 60.0, 100.0);
+    // Field cell 5 on z, two cells short of the wall's cell 7, so the camera's
+    // own cell still reads as open space.
+    let eye = Vec3::new(100.0, 60.0, 88.0);
     let centre = Vec3::new(100.0, 60.0, 140.0);
     let view = Mat4::look_at_rh(eye, centre, Vec3::Y);
     let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
@@ -1283,7 +1297,17 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
             }
         }
     }
-    let world = body_world(&decoy);
+    // In front of the body, whose nearest corner is at z ~127, over world
+    // x >= 100 only: half the body is hidden and half is not.
+    let mut wall = Vec::new();
+    for z in 116..119 {
+        for y in 40..80 {
+            for x in 100..130 {
+                wall.push((UVec3::new(x, y, z), FLOOR));
+            }
+        }
+    }
+    let world = body_world(&[decoy, wall].concat());
     let field = bevox_core::distance_field::DistanceField::build(&world);
     let at_eye = field.get((eye / bevox_core::distance_field::CELL_VOXELS as f32).as_uvec3());
     assert!(
@@ -1312,6 +1336,10 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
     // not a body's. Checking only body pixels would let extra GPU hits through.
     let mut stats = MarchStats::default();
     let mut body_pixels = 0usize;
+    // Pixels where the body is on the ray but the static world is nearer, and
+    // how many of those the GPU got wrong.
+    let mut occluded = 0usize;
+    let mut occluded_bad = 0usize;
     let mut mismatches = 0usize;
     let mut worst = 0.0f32;
     let mut first = String::new();
@@ -1326,10 +1354,12 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
                 pixels[i + 2] as f32 / 255.0 * 2.0 - 1.0,
             );
 
+            let mut behind = false;
             let (expected, cpu_shadowed, gpu_shadowed) =
                 match cpu_composed(&world, &body, eye, dir, &mut stats) {
                     None => (None, false, false),
                     Some((hit, false)) => {
+                        behind = body.march_world(eye, dir, 1000.0, &mut stats).is_some();
                         let n =
                             bevox_core::normal::implicit_normal(&world, hit.voxel, hit.face_normal);
                         (Some(n), false, false)
@@ -1369,14 +1399,27 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
                 }
                 mismatches += 1;
             }
+            if behind {
+                occluded += 1;
+                occluded_bad += usize::from(bad);
+            }
         }
     }
 
+    eprintln!(
+        "{body_pixels} body pixels, {occluded} with the wall in front of the body \
+         ({occluded_bad} wrong), {mismatches} mismatches in all"
+    );
     assert!(body_pixels > 200, "only {body_pixels} pixels hit the body; the test is vacuous");
+    assert!(
+        occluded > 200,
+        "only {occluded} pixels have the static world in front of the body, so nothing tests \
+         that the nearer hit wins"
+    );
     assert_eq!(
         mismatches, 0,
-        "{mismatches} of {} pixels disagreed ({body_pixels} on the body, worst channel {worst}); \
-         first {first}",
+        "{mismatches} of {} pixels disagreed ({body_pixels} on the body; {occluded_bad} of \
+         {occluded} where the wall is in front of the body; worst channel {worst}); first {first}",
         width * height
     );
 }

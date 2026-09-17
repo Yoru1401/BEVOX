@@ -41,7 +41,12 @@ fn main() {
         .add_plugins(BevoxRenderPlugin)
         .init_resource::<BrushSettings>()
         .add_systems(Startup, setup)
-        .add_systems(Update, brush_input.after(fly_camera_system))
+        // Before the rebuild too, not merely before staging. On a frame that
+        // rebuilds because the last stroke outgrew the world region, a stroke
+        // landing between the rebuild and the staging is drained into an update
+        // the render world discards in favour of the snapshot -- which was
+        // taken before that stroke. It is then lost until the next rebuild.
+        .add_systems(Update, brush_input.after(fly_camera_system).before(build_gpu_scene))
         // Before the rebuild, and so before the staging that follows it: a
         // rebuild frame packs this frame's turn into the new buffers, and every
         // other frame's table carries it too, rather than the last one.
@@ -85,10 +90,14 @@ fn setup(mut commands: Commands) {
         FlyCamera::looking_at(eye, look_at),
     ));
 
-    // On the line of sight, ten voxels short of the surface the camera faces:
-    // on screen at start whatever scene was loaded, and clear of that surface
-    // at any orientation, since the cube's half-diagonal is about five.
-    let body = demo_body(eye + (look_at - eye).normalize() * 14.0);
+    // Fourteen voxels ahead, ten short of the surface the camera faces, so on
+    // screen at start whatever scene was loaded. Six to the right of the line
+    // of sight, more than the cube's half-diagonal of about five, so it never
+    // sits under the middle of the screen: picking does not see bodies yet,
+    // and a click on the body would paint or erase the world behind it.
+    let forward = (look_at - eye).normalize();
+    let right = forward.cross(Vec3::Y).normalize_or_zero();
+    let body = demo_body(eye + forward * 14.0 + right * 6.0);
 
     let field = DistanceField::build(&tree);
     commands.insert_resource(VoxelScene {

@@ -19,6 +19,12 @@ pub struct Body {
 
 impl Body {
     pub fn new(volume: Contree, position: Vec3, orientation: Quat) -> Self {
+        debug_assert!(
+            orientation.is_normalized(),
+            "body orientation {orientation:?} is not a unit quaternion; it would scale the ray, \
+             so `t` would stop meaning the same distance in the body's frame and the renderer's \
+             nearest-hit composition would pick the wrong surface"
+        );
         Self { volume, position, orientation }
     }
 

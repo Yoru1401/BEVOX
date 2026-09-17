@@ -135,11 +135,61 @@ pub struct MarchBuffers {
     pub beam: Buffer,
     pub field: Buffer,
     pub bodies: Buffer,
+    pub built_from: BuiltFrom,
+}
+
+/// The layout a set of buffers was built with.
+///
+/// One value, not two fields, so the reuse check takes the buffers' region
+/// whole and its call site has no region to name -- and so none to confuse
+/// with the scene's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltFrom {
     pub generation: u32,
     /// The world's share of `nodes` and `voxels`, as the scene these buffers
     /// were built from laid it out. An incremental world write is allowed only
     /// inside it; past it are the bodies.
     pub world_region: WorldRegion,
+}
+
+/// Whether this frame's changes can be written into buffers built as
+/// `built_from`, rather than rebuilding them from `scene`.
+///
+/// No if the scene was replaced outright or an edit grew the world past the
+/// *buffers'* region. Not the scene's: on the frame an edit outgrows the region,
+/// `build_gpu_scene` has already re-packed the bodies past a larger one, so the
+/// fresh `scene` says the edit fits while the buffers still hold a body right
+/// where it lands. This is the render world's half of what keeps a paint out
+/// of the bodies; `build_gpu_scene` is the other.
+pub fn can_reuse_buffers(
+    built_from: BuiltFrom,
+    scene: &GpuSceneData,
+    update: Option<&SceneUpdate>,
+) -> bool {
+    built_from.generation == scene.generation
+        && update.is_none_or(|u| {
+            built_from.world_region.fits(u.node_high_water, u.voxel_word_high_water)
+        })
+}
+
+/// This frame's uniform: `camera` looking at `scene`, marching at most
+/// `MAX_BODIES` of its bodies.
+pub fn frame_uniform(scene: &GpuSceneData, camera: &ExtractedMarchCamera) -> MarchUniform {
+    MarchUniform {
+        world_from_clip: camera.world_from_clip.to_cols_array_2d(),
+        camera_position: camera.position.extend(0.0).to_array(),
+        sun_direction: crate::upload::SUN_DIRECTION.normalize().extend(0.0).to_array(),
+        volume_params: [
+            scene.depth,
+            scene.extent,
+            crate::upload::march_flags::DEFAULT,
+            marched_body_count(scene.bodies.len()),
+        ],
+        // The cell size travels with the edge count rather than a matching
+        // shader-side constant, so `march.wgsl` cannot silently disagree with
+        // `bevox_core::distance_field::CELL_VOXELS` about how big a cell is.
+        field_params: [scene.field_edge, bevox_core::distance_field::CELL_VOXELS, 0, 0],
+    }
 }
 
 pub fn init_march_pipeline(
@@ -216,31 +266,12 @@ pub fn prepare_march_buffers(
         return;
     };
 
-    let uniform_value = MarchUniform {
-        world_from_clip: camera.world_from_clip.to_cols_array_2d(),
-        camera_position: camera.position.extend(0.0).to_array(),
-        sun_direction: crate::upload::SUN_DIRECTION.normalize().extend(0.0).to_array(),
-        volume_params: [
-            scene.depth,
-            scene.extent,
-            crate::upload::march_flags::DEFAULT,
-            marched_body_count(scene.bodies.len()),
-        ],
-        // The cell size travels with the edge count rather than a matching
-        // shader-side constant, so `march.wgsl` cannot silently disagree with
-        // `bevox_core::distance_field::CELL_VOXELS` about how big a cell is.
-        field_params: [scene.field_edge, bevox_core::distance_field::CELL_VOXELS, 0, 0],
-    };
+    let uniform_value = frame_uniform(&scene, &camera);
 
-    // Reuse the buffers unless the scene was replaced outright or an edit grew
-    // the world past its region. Both fall through to the rebuild below, which
-    // re-packs the bodies past a larger region. The region, not the whole
-    // buffer: past it lie the bodies, and a write there would overwrite one.
+    // Anything `can_reuse_buffers` refuses falls through to the rebuild below,
+    // which re-packs the bodies past a larger region.
     if let Some(buffers) = existing
-        && buffers.generation == scene.generation
-        && update
-            .as_ref()
-            .is_none_or(|u| buffers.world_region.fits(u.node_high_water, u.voxel_word_high_water))
+        && can_reuse_buffers(buffers.built_from, &scene, update.as_deref())
     {
         queue.write_buffer(&buffers.uniform, 0, bytemuck::bytes_of(&uniform_value));
 
@@ -354,8 +385,7 @@ pub fn prepare_march_buffers(
             contents: &body_bytes,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         }),
-        generation: scene.generation,
-        world_region: scene.world_region,
+        built_from: BuiltFrom { generation: scene.generation, world_region: scene.world_region },
     });
 }
 
@@ -535,6 +565,64 @@ mod tests {
             MAX_BODIES as u32,
             "one body past the cap was marched"
         );
+    }
+
+    const BUILT: BuiltFrom =
+        BuiltFrom { generation: 3, world_region: WorldRegion { nodes: 100, voxel_words: 50 } };
+
+    fn scene_at(generation: u32, world_region: WorldRegion) -> GpuSceneData {
+        GpuSceneData { generation, world_region, ..default() }
+    }
+
+    fn update_at(node_high_water: u32, voxel_word_high_water: u32) -> SceneUpdate {
+        SceneUpdate { node_high_water, voxel_word_high_water, ..default() }
+    }
+
+    #[test]
+    fn buffers_are_reused_while_the_update_fits_their_region() {
+        let scene = scene_at(BUILT.generation, BUILT.world_region);
+        assert!(can_reuse_buffers(BUILT, &scene, None), "a frame with no update rebuilt");
+        assert!(
+            can_reuse_buffers(BUILT, &scene, Some(&update_at(99, 50))),
+            "an update at the region's last legal marks rebuilt"
+        );
+    }
+
+    /// The overflow frame. `build_gpu_scene` has already re-packed with a larger
+    /// region that fits the edit, so the scene's copy says it fits; the buffers
+    /// still hold body 0 where the edit lands. Judged by the scene's region,
+    /// the paint is written into that body, and the new body table over the
+    /// old geometry.
+    #[test]
+    fn an_update_that_fits_only_the_new_scene_region_rebuilds() {
+        let scene = scene_at(BUILT.generation, WorldRegion { nodes: 400, voxel_words: 200 });
+        for (nodes, words) in [(100, 50), (99, 51)] {
+            assert!(
+                scene.world_region.fits(nodes, words) && !BUILT.world_region.fits(nodes, words),
+                "({nodes}, {words}) must fit the scene's region and not the buffers', or this \
+                 case tests nothing"
+            );
+            assert!(
+                !can_reuse_buffers(BUILT, &scene, Some(&update_at(nodes, words))),
+                "({nodes}, {words}) outgrew the buffers' region, yet the buffers were reused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_generation_rebuilds() {
+        let scene = scene_at(BUILT.generation + 1, BUILT.world_region);
+        assert!(!can_reuse_buffers(BUILT, &scene, None));
+        assert!(!can_reuse_buffers(BUILT, &scene, Some(&update_at(1, 1))));
+    }
+
+    /// `bodies_past_the_cap_are_not_marched` proves the clamp; this proves the
+    /// uniform the app uploads goes through it.
+    #[test]
+    fn the_uploaded_uniform_marches_no_more_than_the_cap() {
+        let camera = ExtractedMarchCamera { world_from_clip: Mat4::IDENTITY, position: Vec3::ZERO };
+        let scene = GpuSceneData { bodies: vec![GpuBody::default(); MAX_BODIES + 1], ..default() };
+        assert_eq!(frame_uniform(&scene, &camera).volume_params[3], MAX_BODIES as u32);
     }
 
     #[test]
