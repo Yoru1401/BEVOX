@@ -888,6 +888,22 @@ mod tests {
         let mut resting = grid(10.5);
         time(&mut resting, 300);
         let rest = median(time(&mut resting, 1000));
-        println!("16 bodies: falling {fall:.4} ms/tick, resting {rest:.4} ms/tick (median)");
+        // Four stacks of four: every body touching another, and 120 pairs to
+        // consider.
+        let stacks = || -> Vec<Body> {
+            (0..16)
+                .map(|i| {
+                    placed(
+                        cube(4, 4),
+                        Vec3::new(16.0 + (i % 4) as f32 * 12.0, 10.2 + (i / 4) as f32 * 4.0, 32.0),
+                        Quat::IDENTITY,
+                    )
+                })
+                .collect()
+        };
+        let mut piled = stacks();
+        time(&mut piled, 300);
+        let pile = median(time(&mut piled, 1000));
+        println!("16 bodies, median ms/tick: falling {fall:.4}, resting {rest:.4}, stacked {pile:.4}");
     }
 }

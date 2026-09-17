@@ -662,6 +662,47 @@ Tell Flori what to try: `cargo run -p bevox`, then `F` several times in the same
 
 ---
 
+## Measurements
+
+2026-09-18, Intel Core i5-10400, release build:
+
+```
+16 bodies, median ms/tick: falling 0.0168, resting 0.9110, stacked 0.8648
+```
+
+"Stacked" is four stacks of four, so every body rests on another and all 120
+pairs are considered. Against 3a's `0.0071` falling and `0.8394` resting, from
+another process, which says the restructure cost little and nothing more.
+
+**What it says.**
+- **Pairs are nearly free when bodies are apart:** falling went from 0.007 to
+  0.017 ms, which is the 120 box overlap tests. Bodies in open air still cost
+  almost nothing.
+- **A stack costs no more than the same bodies resting alone** (0.86 against
+  0.91). The pair contacts replace world contacts rather than adding to them: a
+  body resting on another does not touch the floor.
+- **CPU time is not what limits the body count.** At 0.9 ms a tick for 16
+  bodies, against a 15.6 ms tick, the binding limit is still `MAX_BODIES = 16`
+  on the GPU side. Sleeping stays deferred.
+
+**A known artifact, measured rather than hidden.** Two equal cubes that do not
+bounce should end a collision travelling together. They part at 4.55 voxels/s
+after a 20 voxels/s impact, about a fifth, because the push-out bias adds
+separation that the relax pass cannot take back (it may push, never pull). The
+gate is set just above that, at 5.5, which is what makes the two subtle breaks
+below visible; a wrong effective mass gives 6.14 and a separation that ignores
+the other body gives 6.60. Soft contacts, which scale the bias impulse rather
+than adding it outright, are the known fix, and are not in this plan.
+
+**Two gates were blind and were replaced,** rather than patched over:
+- A stack's settling could not see a separation that ignores the other body's
+  motion, because a settled stack barely moves.
+- The knock-along could not see an effective mass missing the other body's
+  terms, because momentum is conserved either way.
+
+Both are now caught by asserting the collision is inelastic, which is the
+property both breaks actually destroy.
+
 ## Milestone check
 
 A cube thrown at another knocks it along and stops, momentum conserved. Three cubes stack and stay still over ten thousand ticks. Removing a body from under another drops it. Every milestone 2 and 3a gate still passes, because the world is the same code path with no second body.
