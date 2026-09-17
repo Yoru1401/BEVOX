@@ -8,6 +8,7 @@
 //!
 //! Units are voxels and seconds.
 
+pub mod classify;
 pub mod mass;
 
 use glam::Vec3;

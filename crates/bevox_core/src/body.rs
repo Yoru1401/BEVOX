@@ -8,6 +8,7 @@
 use crate::contree::Contree;
 use crate::march::{Hit, MarchStats, march};
 use crate::material::MaterialTable;
+use crate::physics::classify::{Features, features};
 use crate::physics::mass::{MassProperties, mass_properties};
 use glam::{Affine3A, Quat, UVec3, Vec3};
 
@@ -34,6 +35,9 @@ pub struct Body {
     /// exactly constant, which is what lets the conservation gate demand exact
     /// equality.
     pub angular_momentum: Vec3,
+    /// Corner and edge voxels, the only ones tested for contact. Empty until
+    /// `recompute`.
+    pub features: Features,
 }
 
 impl Body {
@@ -52,6 +56,7 @@ impl Body {
             mass: MassProperties::default(),
             velocity: Vec3::ZERO,
             angular_momentum: Vec3::ZERO,
+            features: Features::default(),
         }
     }
 
@@ -101,11 +106,13 @@ impl Body {
         let voxels = self.volume.voxels();
         let Some((mass, com)) = mass_properties(&voxels, materials) else {
             self.mass = MassProperties::default();
+            self.features = Features::default();
             return false;
         };
         self.position += self.orientation * (com - self.com);
         self.com = com;
         self.mass = mass;
+        self.features = features(&self.volume, &voxels);
         true
     }
 }
@@ -217,6 +224,16 @@ mod tests {
         for (a, b) in before.iter().zip(world(&body, &base)) {
             assert!((*a - b).length() < 1e-4, "an edit moved a voxel from {a:?} to {b:?}");
         }
+    }
+
+    #[test]
+    fn recompute_classifies_the_voxels() {
+        let mut body =
+            Body::new(crate::physics::fixtures::cube(4, 4), Vec3::ZERO, Quat::IDENTITY);
+        assert!(body.features.corners.is_empty());
+        assert!(body.recompute(&crate::physics::fixtures::materials()));
+        assert_eq!(body.features.corners.len(), 8);
+        assert_eq!(body.features.edges.len(), 24);
     }
 
     #[test]
