@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
 use bevox_core::gpu::GpuNode;
-use bevox_core::material::{Material, MaterialId, MaterialTable};
+use bevox_core::material::{DEFAULT_DENSITY, Material, MaterialId, MaterialTable};
 use bevox_render::cull::GpuBodyRect;
 use glam::{Mat4, UVec3, Vec3};
 use wgpu::util::DeviceExt;
@@ -35,8 +35,8 @@ pub struct TestUniform {
 /// every surface black, which is indistinguishable from a broken traversal.
 pub fn parity_materials() -> MaterialTable {
     let mut table = MaterialTable::new();
-    table.push(Material { color: [140, 140, 150, 255] }).unwrap(); // 1: stone
-    table.push(Material { color: [180, 90, 70, 255] }).unwrap(); // 2: brick
+    table.push(Material { color: [140, 140, 150, 255], density: DEFAULT_DENSITY }).unwrap(); // 1: stone
+    table.push(Material { color: [180, 90, 70, 255], density: DEFAULT_DENSITY }).unwrap(); // 2: brick
     table
 }
 

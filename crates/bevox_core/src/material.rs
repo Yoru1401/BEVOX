@@ -13,12 +13,20 @@ impl MaterialId {
     }
 }
 
-/// A material's renderable properties. Physics columns (density, friction,
-/// restitution) are a deferred feature and are deliberately absent.
+/// A material's properties: how it is drawn, and how heavy it is.
+///
+/// Density is relative: only ratios between voxels, and later a joint's force
+/// against them, are observable. `u16` rather than a float so `Material` stays
+/// `Eq`. Friction and restitution arrive with milestone 3.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Material {
     pub color: [u8; 4],
+    pub density: u16,
 }
+
+/// The density a material gets when its source says nothing about mass, such
+/// as a MagicaVoxel palette.
+pub const DEFAULT_DENSITY: u16 = 1000;
 
 #[derive(Clone, Debug)]
 pub struct MaterialTable {
@@ -28,7 +36,7 @@ pub struct MaterialTable {
 impl MaterialTable {
     /// Creates a table whose slot 0 is the reserved empty material.
     pub fn new() -> Self {
-        Self { entries: vec![Material { color: [0, 0, 0, 0] }] }
+        Self { entries: vec![Material { color: [0, 0, 0, 0], density: 0 }] }
     }
 
     /// Appends a material. Returns `None` when all 255 usable slots are taken.
@@ -79,10 +87,19 @@ impl Default for MaterialTable {
 mod tests {
     use super::*;
 
+    /// Density rides along with colour: mass properties read it back by id.
+    #[test]
+    fn a_material_keeps_its_density() {
+        let mut table = MaterialTable::new();
+        let id = table.push(Material { color: [1, 2, 3, 255], density: 2600 }).unwrap();
+        assert_eq!(table.get(id).density, 2600);
+        assert_eq!(table.get(MaterialId::EMPTY).density, 0, "empty space must weigh nothing");
+    }
+
     #[test]
     fn the_gpu_palette_is_always_two_hundred_and_fifty_six_entries() {
         let mut table = MaterialTable::new();
-        table.push(Material { color: [255, 128, 0, 255] }).unwrap();
+        table.push(Material { color: [255, 128, 0, 255], density: DEFAULT_DENSITY }).unwrap();
         let gpu = table.to_gpu();
         assert_eq!(gpu.len(), 256, "the shader indexes this by a byte");
     }
@@ -90,7 +107,7 @@ mod tests {
     #[test]
     fn palette_entries_are_normalised_and_slot_zero_is_transparent() {
         let mut table = MaterialTable::new();
-        let id = table.push(Material { color: [255, 128, 0, 255] }).unwrap();
+        let id = table.push(Material { color: [255, 128, 0, 255], density: DEFAULT_DENSITY }).unwrap();
         let gpu = table.to_gpu();
 
         assert_eq!(gpu[0], [0.0, 0.0, 0.0, 0.0], "slot 0 is empty space");
@@ -118,8 +135,8 @@ mod tests {
     #[test]
     fn push_returns_sequential_ids() {
         let mut table = MaterialTable::new();
-        let a = table.push(Material { color: [255, 0, 0, 255] }).unwrap();
-        let b = table.push(Material { color: [0, 255, 0, 255] }).unwrap();
+        let a = table.push(Material { color: [255, 0, 0, 255], density: DEFAULT_DENSITY }).unwrap();
+        let b = table.push(Material { color: [0, 255, 0, 255], density: DEFAULT_DENSITY }).unwrap();
         assert_eq!(a, MaterialId(1));
         assert_eq!(b, MaterialId(2));
         assert_eq!(table.get(a).color, [255, 0, 0, 255]);
@@ -129,8 +146,8 @@ mod tests {
     fn push_rejects_the_two_hundred_fifty_seventh_material() {
         let mut table = MaterialTable::new();
         for i in 1..=255u16 {
-            assert!(table.push(Material { color: [i as u8, 0, 0, 255] }).is_some());
+            assert!(table.push(Material { color: [i as u8, 0, 0, 255], density: DEFAULT_DENSITY }).is_some());
         }
-        assert!(table.push(Material { color: [1, 2, 3, 4] }).is_none());
+        assert!(table.push(Material { color: [1, 2, 3, 4], density: DEFAULT_DENSITY }).is_none());
     }
 }

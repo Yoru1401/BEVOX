@@ -264,6 +264,54 @@ impl Contree {
         Node::subdivided(mask, base)
     }
 
+    /// Every solid voxel and its material, in no particular order: the
+    /// inverse of `from_voxels`.
+    ///
+    /// Uniform nodes are expanded voxel by voxel, so this is linear in the
+    /// volume a body fills. That is fine for bodies, which are small; it is
+    /// not something to call on the static world.
+    pub fn voxels(&self) -> Vec<(UVec3, MaterialId)> {
+        let mut out = Vec::new();
+        self.collect_voxels(self.root, self.depth - 1, UVec3::ZERO, &mut out);
+        out
+    }
+
+    fn collect_voxels(
+        &self,
+        node: Node,
+        level: u32,
+        origin: UVec3,
+        out: &mut Vec<(UVec3, MaterialId)>,
+    ) {
+        if node.is_empty() {
+            return;
+        }
+        if !node.is_subdivided() {
+            let extent = level_extent(level);
+            let m = node.material();
+            for z in 0..extent {
+                for y in 0..extent {
+                    for x in 0..extent {
+                        out.push((origin + UVec3::new(x, y, z), m));
+                    }
+                }
+            }
+            return;
+        }
+        for i in 0..CHILDREN {
+            let Some(slot) = node.child_slot(i) else { continue };
+            // Inverse of child_index: x + y * 4 + z * 16.
+            let c = UVec3::new(i % 4, (i / 4) % 4, i / 16);
+            if level == 0 {
+                // A brick's children are voxels, in the voxel arena.
+                out.push((origin + c, MaterialId(self.arena.voxel(slot))));
+            } else {
+                let step = level_extent(level - 1);
+                self.collect_voxels(self.arena.node(slot), level - 1, origin + c * step, out);
+            }
+        }
+    }
+
     pub fn get(&self, p: UVec3) -> MaterialId {
         debug_assert!(p.x < self.extent() && p.y < self.extent() && p.z < self.extent());
         let mut node = self.root;
@@ -414,6 +462,36 @@ impl Contree {
 mod tests {
     use super::*;
     use crate::testing::XorShift64;
+
+    /// Listing a tree's voxels and building a tree from the list must agree, or
+    /// mass properties and classification would see a different body from the
+    /// one the renderer draws.
+    #[test]
+    fn voxels_round_trips_through_from_voxels() {
+        let mut rng = XorShift64::new(0x5eed_0001);
+        let mut input = HashMap::new();
+        for _ in 0..3000 {
+            let p = UVec3::new(rng.next_below(64), rng.next_below(64), rng.next_below(64));
+            input.insert(p, MaterialId(1 + rng.next_below(3) as u8));
+        }
+        // A solid block too, so uniform nodes are expanded rather than skipped.
+        for z in 16..32 {
+            for y in 16..32 {
+                for x in 16..32 {
+                    input.insert(UVec3::new(x, y, z), MaterialId(2));
+                }
+            }
+        }
+        let list: Vec<_> = input.iter().map(|(p, m)| (*p, *m)).collect();
+        let tree = Contree::from_voxels(64, &list);
+
+        let key = |(p, m): &(UVec3, MaterialId)| (p.z, p.y, p.x, m.0);
+        let mut want: Vec<_> = list.iter().map(key).collect();
+        let mut got: Vec<_> = tree.voxels().iter().map(key).collect();
+        want.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, want);
+    }
 
     #[test]
     fn level_extents_are_powers_of_four() {
