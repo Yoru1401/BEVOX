@@ -5,7 +5,9 @@
 use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
 use bevox_core::march::{MarchStats, march};
-use bevox_core::material::{DEFAULT_DENSITY, Material, MaterialId, MaterialTable};
+use bevox_core::material::{
+    DEFAULT_DENSITY, DEFAULT_FRICTION, DEFAULT_RESTITUTION, Material, MaterialId, MaterialTable,
+};
 use bevox_core::normal::implicit_normal;
 use glam::{Affine3A, UVec3, Vec3};
 
@@ -14,8 +16,18 @@ const HEIGHT: u32 = 512;
 
 fn main() {
     let mut table = MaterialTable::new();
-    let stone = table.push(Material { color: [140, 140, 150, 255], density: DEFAULT_DENSITY }).unwrap();
-    let brick = table.push(Material { color: [180, 90, 70, 255], density: DEFAULT_DENSITY }).unwrap();
+    let stone = table.push(Material {
+        color: [140, 140, 150, 255],
+        density: DEFAULT_DENSITY,
+        friction: DEFAULT_FRICTION,
+        restitution: DEFAULT_RESTITUTION,
+    }).unwrap();
+    let brick = table.push(Material {
+        color: [180, 90, 70, 255],
+        density: DEFAULT_DENSITY,
+        friction: DEFAULT_FRICTION,
+        restitution: DEFAULT_RESTITUTION,
+    }).unwrap();
 
     let tree = build_scene(stone, brick);
     let sun = Vec3::new(0.4, 1.0, 0.25).normalize();

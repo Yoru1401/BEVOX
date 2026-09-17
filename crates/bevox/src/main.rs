@@ -282,8 +282,18 @@ fn demo_scene() -> (Contree, MaterialTable) {
     tree.apply_sphere(Vec3::new(32.0, 18.0, 32.0), 5.0, MaterialId::EMPTY);
 
     let mut materials = MaterialTable::new();
-    materials.push(Material { color: [140, 140, 150, 255], density: 2600 }).unwrap(); // 1: stone
-    materials.push(Material { color: [180, 90, 70, 255], density: 1900 }).unwrap(); // 2: brick
+    materials
+        .push(Material { color: [140, 140, 150, 255], density: 2600, friction: 60, restitution: 5 })
+        .unwrap(); // 1: stone
+    materials
+        .push(Material { color: [180, 90, 70, 255], density: 1900, friction: 70, restitution: 5 })
+        .unwrap(); // 2: brick
+    materials
+        .push(Material { color: [170, 210, 235, 255], density: 900, friction: 4, restitution: 10 })
+        .unwrap(); // 3: ice
+    materials
+        .push(Material { color: [40, 40, 45, 255], density: 1100, friction: 80, restitution: 80 })
+        .unwrap(); // 4: rubber
     (tree, materials)
 }
 

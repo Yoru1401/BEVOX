@@ -7,7 +7,9 @@
 
 use crate::contree::Contree;
 use crate::dense::DenseVolume;
-use crate::material::{DEFAULT_DENSITY, Material, MaterialId, MaterialTable};
+use crate::material::{
+    DEFAULT_DENSITY, DEFAULT_FRICTION, DEFAULT_RESTITUTION, Material, MaterialId, MaterialTable,
+};
 use dot_vox::{DotVoxData, Frame, SceneNode};
 use glam::{IVec3, UVec3};
 
@@ -118,7 +120,12 @@ pub fn import_scene(data: &DotVoxData) -> Result<(Contree, MaterialTable), VoxEr
     let mut materials = MaterialTable::new();
     for c in data.palette.iter().take(255) {
         materials
-            .push(Material { color: [c.r, c.g, c.b, c.a], density: DEFAULT_DENSITY })
+            .push(Material {
+                color: [c.r, c.g, c.b, c.a],
+                density: DEFAULT_DENSITY,
+                friction: DEFAULT_FRICTION,
+                restitution: DEFAULT_RESTITUTION,
+            })
             .expect("at most 255 entries are pushed");
     }
 
@@ -159,7 +166,12 @@ pub fn import_model(
     let mut materials = MaterialTable::new();
     for c in data.palette.iter().take(255) {
         materials
-            .push(Material { color: [c.r, c.g, c.b, c.a], density: DEFAULT_DENSITY })
+            .push(Material {
+                color: [c.r, c.g, c.b, c.a],
+                density: DEFAULT_DENSITY,
+                friction: DEFAULT_FRICTION,
+                restitution: DEFAULT_RESTITUTION,
+            })
             .expect("at most 255 entries are pushed");
     }
 

@@ -13,20 +13,43 @@ impl MaterialId {
     }
 }
 
-/// A material's properties: how it is drawn, and how heavy it is.
+/// A material's properties: how it is drawn, how heavy it is, and how it
+/// behaves on contact.
 ///
 /// Density is relative: only ratios between voxels, and later a joint's force
-/// against them, are observable. `u16` rather than a float so `Material` stays
-/// `Eq`. Friction and restitution arrive with milestone 3.
+/// against them, are observable. The contact columns are hundredths. All three
+/// are integers so `Material` stays `Eq`: `friction` 60 is a coefficient of
+/// 0.6, `restitution` 80 is 0.8. Friction may exceed 1; restitution above 1
+/// would add energy on every bounce, so it is clamped where it is used.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Material {
     pub color: [u8; 4],
     pub density: u16,
+    pub friction: u8,
+    pub restitution: u8,
 }
 
 /// The density a material gets when its source says nothing about mass, such
 /// as a MagicaVoxel palette.
 pub const DEFAULT_DENSITY: u16 = 1000;
+
+/// What a material's friction is when its source says nothing: like dry stone.
+pub const DEFAULT_FRICTION: u8 = 60;
+
+/// Barely bouncy, which is what most solids are.
+pub const DEFAULT_RESTITUTION: u8 = 5;
+
+/// The friction between two surfaces: the geometric mean, so the slipperier one
+/// dominates and anything against a frictionless surface slides free.
+pub fn combine_friction(a: u8, b: u8) -> f32 {
+    (a as f32 * b as f32).sqrt() / 100.0
+}
+
+/// The bounce between two surfaces: the larger, so one bouncy surface is
+/// enough. Clamped to 1, because more would add energy with every bounce.
+pub fn combine_restitution(a: u8, b: u8) -> f32 {
+    (a.max(b) as f32 / 100.0).min(1.0)
+}
 
 #[derive(Clone, Debug)]
 pub struct MaterialTable {
@@ -36,7 +59,8 @@ pub struct MaterialTable {
 impl MaterialTable {
     /// Creates a table whose slot 0 is the reserved empty material.
     pub fn new() -> Self {
-        Self { entries: vec![Material { color: [0, 0, 0, 0], density: 0 }] }
+        let empty = Material { color: [0, 0, 0, 0], density: 0, friction: 0, restitution: 0 };
+        Self { entries: vec![empty] }
     }
 
     /// Appends a material. Returns `None` when all 255 usable slots are taken.
@@ -87,11 +111,41 @@ impl Default for MaterialTable {
 mod tests {
     use super::*;
 
+    /// Both contact columns are hundredths, so 60 is a coefficient of 0.6.
+    #[test]
+    fn a_material_keeps_its_friction_and_bounce() {
+        let mut table = MaterialTable::new();
+        let id = table
+            .push(Material { color: [1, 2, 3, 255], density: 900, friction: 5, restitution: 80 })
+            .unwrap();
+        assert_eq!(table.get(id).friction, 5);
+        assert_eq!(table.get(id).restitution, 80);
+    }
+
+    /// Friction combines as the geometric mean, so ice against stone is
+    /// slippery rather than the average of the two. Restitution takes the
+    /// larger, so a bouncy ball bounces off a dead floor.
+    #[test]
+    fn coefficients_combine_the_way_two_surfaces_do() {
+        assert!((combine_friction(100, 100) - 1.0).abs() < 1e-6);
+        assert!((combine_friction(4, 100) - 0.2).abs() < 1e-6, "ice against stone");
+        assert_eq!(combine_friction(0, 100), 0.0, "frictionless against anything is frictionless");
+        assert!((combine_restitution(80, 5) - 0.8).abs() < 1e-6);
+        assert_eq!(combine_restitution(0, 0), 0.0);
+    }
+
     /// Density rides along with colour: mass properties read it back by id.
     #[test]
     fn a_material_keeps_its_density() {
         let mut table = MaterialTable::new();
-        let id = table.push(Material { color: [1, 2, 3, 255], density: 2600 }).unwrap();
+        let id = table
+     .push(Material {
+         color: [1, 2, 3, 255],
+         density: 2600,
+         friction: DEFAULT_FRICTION,
+         restitution: DEFAULT_RESTITUTION,
+     })
+     .unwrap();
         assert_eq!(table.get(id).density, 2600);
         assert_eq!(table.get(MaterialId::EMPTY).density, 0, "empty space must weigh nothing");
     }
@@ -99,7 +153,14 @@ mod tests {
     #[test]
     fn the_gpu_palette_is_always_two_hundred_and_fifty_six_entries() {
         let mut table = MaterialTable::new();
-        table.push(Material { color: [255, 128, 0, 255], density: DEFAULT_DENSITY }).unwrap();
+        table
+            .push(Material {
+                color: [255, 128, 0, 255],
+                density: DEFAULT_DENSITY,
+                friction: DEFAULT_FRICTION,
+                restitution: DEFAULT_RESTITUTION,
+            })
+            .unwrap();
         let gpu = table.to_gpu();
         assert_eq!(gpu.len(), 256, "the shader indexes this by a byte");
     }
@@ -107,7 +168,14 @@ mod tests {
     #[test]
     fn palette_entries_are_normalised_and_slot_zero_is_transparent() {
         let mut table = MaterialTable::new();
-        let id = table.push(Material { color: [255, 128, 0, 255], density: DEFAULT_DENSITY }).unwrap();
+        let id = table
+     .push(Material {
+         color: [255, 128, 0, 255],
+         density: DEFAULT_DENSITY,
+         friction: DEFAULT_FRICTION,
+         restitution: DEFAULT_RESTITUTION,
+     })
+     .unwrap();
         let gpu = table.to_gpu();
 
         assert_eq!(gpu[0], [0.0, 0.0, 0.0, 0.0], "slot 0 is empty space");
@@ -135,8 +203,22 @@ mod tests {
     #[test]
     fn push_returns_sequential_ids() {
         let mut table = MaterialTable::new();
-        let a = table.push(Material { color: [255, 0, 0, 255], density: DEFAULT_DENSITY }).unwrap();
-        let b = table.push(Material { color: [0, 255, 0, 255], density: DEFAULT_DENSITY }).unwrap();
+        let a = table
+     .push(Material {
+         color: [255, 0, 0, 255],
+         density: DEFAULT_DENSITY,
+         friction: DEFAULT_FRICTION,
+         restitution: DEFAULT_RESTITUTION,
+     })
+     .unwrap();
+        let b = table
+     .push(Material {
+         color: [0, 255, 0, 255],
+         density: DEFAULT_DENSITY,
+         friction: DEFAULT_FRICTION,
+         restitution: DEFAULT_RESTITUTION,
+     })
+     .unwrap();
         assert_eq!(a, MaterialId(1));
         assert_eq!(b, MaterialId(2));
         assert_eq!(table.get(a).color, [255, 0, 0, 255]);
@@ -146,8 +228,18 @@ mod tests {
     fn push_rejects_the_two_hundred_fifty_seventh_material() {
         let mut table = MaterialTable::new();
         for i in 1..=255u16 {
-            assert!(table.push(Material { color: [i as u8, 0, 0, 255], density: DEFAULT_DENSITY }).is_some());
+            assert!(table.push(Material {
+                color: [i as u8, 0, 0, 255],
+                density: DEFAULT_DENSITY,
+                friction: DEFAULT_FRICTION,
+                restitution: DEFAULT_RESTITUTION,
+            }).is_some());
         }
-        assert!(table.push(Material { color: [1, 2, 3, 4], density: DEFAULT_DENSITY }).is_none());
+        assert!(table.push(Material {
+            color: [1, 2, 3, 4],
+            density: DEFAULT_DENSITY,
+            friction: DEFAULT_FRICTION,
+            restitution: DEFAULT_RESTITUTION,
+        }).is_none());
     }
 }
