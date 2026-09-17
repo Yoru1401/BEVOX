@@ -1546,3 +1546,101 @@ fn a_body_reaching_its_volume_edge_matches_the_cpu_from_past_that_edge() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Culling bodies the camera cannot see must change no pixel.
+///
+/// Seven turned cubes: one fully in view, one straddling each of the four side
+/// planes, one wholly past a side plane, one behind the camera. Each straddler's
+/// centre is outside its plane, so a cull that tested the centre rather than
+/// the whole sphere drops it while part of it is still on screen; the test
+/// checks that is really so, rather than trusting the placement arithmetic.
+///
+/// Identical images alone would also pass a cull that never removed anything,
+/// so the cull is called directly on the same inputs and must keep exactly the
+/// five bodies on screen.
+#[test]
+fn culling_bodies_outside_the_view_leaves_output_bit_identical() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (width, height) = (96u32, 96u32);
+    let eye = Vec3::new(128.0, 60.0, 40.0);
+    let view = Mat4::look_at_rh(eye, eye + Vec3::Z, Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+    let world_from_clip = (projection * view).inverse();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let world = body_world(&[]);
+
+    // Square, so the half-width and half-height at depth d are both
+    // d * tan(0.45). A centre 4 past a side plane there is 3.6 outside it,
+    // and the cube reaches 8 either side of its centre however it is turned.
+    let d = 60.0;
+    let edge = d * 0.45f32.tan() + 4.0;
+    let turned = Quat::from_euler(glam::EulerRot::XYZ, 0.4, 0.8, -0.3);
+    let place =
+        |offset: Vec3| Body::new(body_cube(), eye + offset - turned * Vec3::splat(33.0), turned);
+    let bodies = [
+        place(Vec3::new(0.0, 0.0, d)),
+        place(Vec3::new(edge, 0.0, d)),
+        place(Vec3::new(-edge, 0.0, d)),
+        place(Vec3::new(0.0, edge, d)),
+        place(Vec3::new(0.0, -edge, d)),
+        place(Vec3::new(edge + 40.0, 0.0, d)),
+        place(Vec3::new(0.0, 0.0, -40.0)),
+    ];
+    let cull = march_flags::DEFAULT | march_flags::CULL_BODIES;
+    let no_cull = march_flags::DEFAULT & !march_flags::CULL_BODIES;
+
+    let packed = bevox_render::upload::pack_bodies(&world, &bodies);
+    let camera = bevox_render::upload::ExtractedMarchCamera { world_from_clip, position: eye };
+    let kept: Vec<u32> = bevox_render::cull::bodies_to_march(
+        &packed.bodies, &packed.body_local_bounds, &camera, cull,
+    )
+    .iter()
+    .map(|g| g.node_base)
+    .collect();
+    let on_screen: Vec<u32> = packed.bodies[..5].iter().map(|g| g.node_base).collect();
+    assert_eq!(kept, on_screen, "the cull must keep the five bodies on screen and drop the others");
+
+    // Each straddler is genuine: its centre outside the frustum, its voxels
+    // still hit by some pixel's ray.
+    let frustum = bevox_render::cull::Frustum::from_camera(world_from_clip, eye);
+    let mut stats = MarchStats::default();
+    for i in 1..5 {
+        let local = packed.body_local_bounds[i].expect("the cube has voxels");
+        let centre = bevox_render::cull::world_bound(local, &packed.bodies[i]).centre;
+        assert!(
+            !frustum.sees(bevox_render::cull::BodyBound { centre, radius: 0.0 }),
+            "body {i}'s centre is inside the frustum, so it does not straddle a side plane"
+        );
+        let hit = (0..width * height).any(|p| {
+            let dir = ray_direction(world_from_clip, eye, p % width, p / width, width, height);
+            bodies[i].march_world(eye, dir, 1000.0, &mut stats).is_some()
+        });
+        assert!(hit, "body {i} is meant to straddle a side plane, but no pixel sees it");
+    }
+
+    for entry in ["march_identity", "march_normal", "march"] {
+        let prepare = |flags| {
+            Prepared::new(
+                &device, &shader, entry, &world, world_from_clip, eye, width, height, flags,
+                &bodies,
+            )
+        };
+        let (without, with) = (prepare(no_cull), prepare(cull));
+        assert_eq!(
+            (without.body_count, with.body_count),
+            (bodies.len() as u32, kept.len() as u32),
+            "{entry}: the uniform's body count is not the length of the table written"
+        );
+        let (without, with) = (without.read_back(&device, &queue), with.read_back(&device, &queue));
+        if entry == "march_identity" {
+            // Material 1 is the cube's; the floor is another.
+            let body_pixels = without.chunks(4).filter(|px| px[1] > 0 && px[0] == 1).count();
+            assert!(body_pixels > 100, "only {body_pixels} body pixels; the comparison is vacuous");
+        }
+        let differing = without.chunks(4).zip(with.chunks(4)).filter(|(a, b)| a != b).count();
+        assert_eq!(differing, 0, "{entry}: culling bodies changed {differing} pixels");
+    }
+}

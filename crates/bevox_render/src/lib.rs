@@ -1,6 +1,7 @@
 //! Bevy plugin: uploads voxel data and ray marches it on the GPU.
 
 pub mod camera;
+pub mod cull;
 pub mod pick;
 pub mod pipeline;
 pub mod upload;

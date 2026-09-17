@@ -172,24 +172,32 @@ pub fn can_reuse_buffers(
         })
 }
 
-/// This frame's uniform: `camera` looking at `scene`, marching at most
-/// `MAX_BODIES` of its bodies.
-pub fn frame_uniform(scene: &GpuSceneData, camera: &ExtractedMarchCamera) -> MarchUniform {
-    MarchUniform {
+/// This frame's uniform and the body table it marches: `camera` looking at
+/// `scene`, with `placed` culled under `flags` and at most `MAX_BODIES` of what
+/// is left marched.
+///
+/// Returned together so the count and the table cannot come from different
+/// lists. The cull compacts the table; a count taken from `placed` would march
+/// past the entries written, into stale ones. Write the table this returns and
+/// nothing else. The cap applies after the cull, to visible bodies.
+pub fn frame_uniform(
+    scene: &GpuSceneData,
+    camera: &ExtractedMarchCamera,
+    placed: &[GpuBody],
+    flags: u32,
+) -> (MarchUniform, Vec<GpuBody>) {
+    let table = crate::cull::bodies_to_march(placed, &scene.body_local_bounds, camera, flags);
+    let uniform = MarchUniform {
         world_from_clip: camera.world_from_clip.to_cols_array_2d(),
         camera_position: camera.position.extend(0.0).to_array(),
         sun_direction: crate::upload::SUN_DIRECTION.normalize().extend(0.0).to_array(),
-        volume_params: [
-            scene.depth,
-            scene.extent,
-            crate::upload::march_flags::DEFAULT,
-            marched_body_count(scene.bodies.len()),
-        ],
+        volume_params: [scene.depth, scene.extent, flags, marched_body_count(table.len())],
         // The cell size travels with the edge count rather than a matching
         // shader-side constant, so `march.wgsl` cannot silently disagree with
         // `bevox_core::distance_field::CELL_VOXELS` about how big a cell is.
         field_params: [scene.field_edge, bevox_core::distance_field::CELL_VOXELS, 0, 0],
-    }
+    };
+    (uniform, table)
 }
 
 pub fn init_march_pipeline(
@@ -266,14 +274,21 @@ pub fn prepare_march_buffers(
         return;
     };
 
-    let uniform_value = frame_uniform(&scene, &camera);
-
     // Anything `can_reuse_buffers` refuses falls through to the rebuild below,
     // which re-packs the bodies past a larger region.
     if let Some(buffers) = existing
         && can_reuse_buffers(buffers.built_from, &scene, update.as_deref())
     {
+        // Every frame, edit or not: a body that moved changed only this table,
+        // so it is rewritten here while its geometry stays put. Culled, it may
+        // be shorter than the buffer, which was built for every body; entries
+        // past it are stale, and the uniform's count stops before them.
+        let placed = update.as_deref().map_or(&scene.bodies, |u| &u.bodies);
+        let (uniform_value, table) = frame_uniform(&scene, &camera, placed, march_flags::DEFAULT);
         queue.write_buffer(&buffers.uniform, 0, bytemuck::bytes_of(&uniform_value));
+        if !table.is_empty() {
+            queue.write_buffer(&buffers.bodies, 0, bytemuck::cast_slice(&table));
+        }
 
         if let Some(update) = update {
             // Index 0 is the root, which lives outside the arena and so appears
@@ -291,13 +306,6 @@ pub fn prepare_march_buffers(
                 let offset = u64::from(write.start_word) * 4;
                 queue.write_buffer(&buffers.field, offset, bytemuck::cast_slice(&write.words));
             }
-            // Every frame, edit or not: a body that moved changed only this
-            // table, so it is rewritten here while its geometry above stays
-            // put. It has as many entries as the buffer was built for -- both
-            // count the bodies of the same `GpuSceneData`.
-            if !update.bodies.is_empty() {
-                queue.write_buffer(&buffers.bodies, 0, bytemuck::cast_slice(&update.bodies));
-            }
         }
         return;
     }
@@ -309,8 +317,10 @@ pub fn prepare_march_buffers(
     let node_capacity = scene.world_region.nodes.max(scene.nodes.len() as u32);
     let voxel_word_capacity = scene.world_region.voxel_words.max(scene.voxels.len() as u32);
     let field_words = scene.distance_field.len() as u32;
-    // A zero-length storage buffer is invalid, so an empty body list still
-    // uploads room for one (zeroed) GpuBody; the uniform's count stays at zero.
+    // Room for every body, not only the ones visible now: the buffer outlives
+    // this frame, and a later one may see more. A zero-length storage buffer is
+    // invalid, so an empty body list still uploads room for one (zeroed)
+    // GpuBody; the uniform's count stays at zero.
     let body_capacity = scene.bodies.len().max(1) as u32;
     if !within_budget(node_capacity, voxel_word_capacity, field_words, body_capacity) {
         // Once, not every frame. The rejection returns without replacing the
@@ -332,7 +342,9 @@ pub fn prepare_march_buffers(
     node_bytes.resize(node_capacity as usize * size_of::<GpuNode>(), 0);
     let mut voxel_bytes = bytemuck::cast_slice(&scene.voxels).to_vec();
     voxel_bytes.resize(voxel_word_capacity as usize * 4, 0);
-    let mut body_bytes = bytemuck::cast_slice(&scene.bodies).to_vec();
+    let (uniform_value, table) =
+        frame_uniform(&scene, &camera, &scene.bodies, march_flags::DEFAULT);
+    let mut body_bytes = bytemuck::cast_slice(&table).to_vec();
     body_bytes.resize(body_capacity as usize * size_of::<GpuBody>(), 0);
 
     commands.insert_resource(MarchBuffers {
@@ -621,8 +633,45 @@ mod tests {
     #[test]
     fn the_uploaded_uniform_marches_no_more_than_the_cap() {
         let camera = ExtractedMarchCamera { world_from_clip: Mat4::IDENTITY, position: Vec3::ZERO };
-        let scene = GpuSceneData { bodies: vec![GpuBody::default(); MAX_BODIES + 1], ..default() };
-        assert_eq!(frame_uniform(&scene, &camera).volume_params[3], MAX_BODIES as u32);
+        let bodies = vec![GpuBody::default(); MAX_BODIES + 1];
+        let (uniform, _) =
+            frame_uniform(&GpuSceneData::default(), &camera, &bodies, march_flags::DEFAULT);
+        assert_eq!(uniform.volume_params[3], MAX_BODIES as u32);
+    }
+
+    /// The count the shader loops over is the length of the culled table, not
+    /// of the bodies placed. Counted from the placed list, a culled scene marches
+    /// entries past the ones written.
+    #[test]
+    fn the_uniform_counts_the_culled_table_and_caps_after_the_cull() {
+        let eye = Vec3::ZERO;
+        let view = Mat4::look_at_rh(eye, -Vec3::Z, Vec3::Y);
+        let projection = Mat4::perspective_infinite_reverse_rh(0.9, 16.0 / 9.0, 0.1);
+        let camera =
+            ExtractedMarchCamera { world_from_clip: (projection * view).inverse(), position: eye };
+        let at = |z: f32| {
+            let body = bevox_core::body::Body::new(
+                bevox_core::contree::Contree::empty(2),
+                Vec3::new(-4.0, -4.0, z),
+                Quat::IDENTITY,
+            );
+            GpuBody::default().placed(&body)
+        };
+        let (ahead, behind) = (at(-50.0), at(50.0));
+        let cube = Some((UVec3::ZERO, UVec3::splat(8)));
+        let scene = GpuSceneData { body_local_bounds: vec![cube; 2], ..default() };
+        let cull = march_flags::DEFAULT | march_flags::CULL_BODIES;
+
+        let (uniform, table) = frame_uniform(&scene, &camera, &[behind], cull);
+        assert!(table.is_empty(), "a body behind the camera was kept");
+        assert_eq!(uniform.volume_params[3], 0, "the count includes a body the cull removed");
+
+        // Behind first: capped before the cull, the one marched slot would go
+        // to the body the cull then drops, and nothing would be drawn.
+        assert!(MAX_BODIES < 2, "this case no longer reaches past the cap");
+        let (uniform, table) = frame_uniform(&scene, &camera, &[behind, ahead], cull);
+        assert_eq!(bytemuck::cast_slice::<GpuBody, u8>(&table), bytemuck::bytes_of(&ahead));
+        assert_eq!(uniform.volume_params[3], 1);
     }
 
     #[test]

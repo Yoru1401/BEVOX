@@ -6,7 +6,7 @@ use bevy::prelude::*;
 use bevy::render::Extract;
 use bevy::render::extract_resource::ExtractResource;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
-use bevox_core::body::Body;
+use bevox_core::body::{Body, occupied_bounds};
 use bevox_core::contree::Contree;
 use bevox_core::distance_field::DistanceField;
 use bevox_core::gpu::{GpuNode, GpuVolume};
@@ -78,6 +78,11 @@ pub mod march_flags {
     pub const DISTANCE_FIELD: u32 = 8;
     /// Compose every rigid body into the march alongside the static world.
     pub const BODIES: u32 = 16;
+    /// Leave bodies the camera cannot see out of the body table.
+    ///
+    /// CPU-only: the shader never reads this bit. It changes which bodies are
+    /// uploaded and the count beside them, not how any of them is marched.
+    pub const CULL_BODIES: u32 = 32;
     /// What the app runs. Each optimisation joins this only once it has measured
     /// faster while staying bit-identical.
     ///
@@ -182,6 +187,8 @@ pub struct PackedScene {
     pub nodes: Vec<GpuNode>,
     pub voxels: Vec<u32>,
     pub bodies: Vec<GpuBody>,
+    /// Each body's `occupied_bounds`, in the same order as `bodies`.
+    pub body_local_bounds: Vec<Option<(UVec3, UVec3)>>,
     pub world_region: WorldRegion,
 }
 
@@ -206,6 +213,7 @@ pub fn pack_bodies(world: &Contree, bodies: &[Body]) -> PackedScene {
         voxels.resize(world_region.voxel_words as usize, 0);
     }
     let mut out = Vec::with_capacity(bodies.len());
+    let body_local_bounds = bodies.iter().map(|b| occupied_bounds(&b.volume)).collect();
 
     for body in bodies {
         let volume = GpuVolume::from_contree(&body.volume);
@@ -226,7 +234,7 @@ pub fn pack_bodies(world: &Contree, bodies: &[Body]) -> PackedScene {
         );
     }
 
-    PackedScene { nodes, voxels, bodies: out, world_region }
+    PackedScene { nodes, voxels, bodies: out, body_local_bounds, world_region }
 }
 
 /// The scene as the render world sees it.
@@ -243,6 +251,10 @@ pub struct GpuSceneData {
     /// bases, depth, extent -- is what `SceneUpdate::bodies` re-places each
     /// frame.
     pub bodies: Vec<GpuBody>,
+    /// Each body's `occupied_bounds`, in the same order as `bodies`: geometry,
+    /// so it changes only on a rebuild. The world-space bound is recomputed
+    /// from the live transform every frame.
+    pub body_local_bounds: Vec<Option<(UVec3, UVec3)>>,
     pub palette: Vec<[f32; 4]>,
     /// Reachability masks as low/high halves: WGSL has no 64-bit integer.
     /// Constant, so it is built once rather than per scene.
@@ -269,6 +281,7 @@ impl Default for GpuSceneData {
             nodes: vec![GpuNode::default()],
             voxels: Vec::new(),
             bodies: Vec::new(),
+            body_local_bounds: Vec::new(),
             palette: MaterialTable::new().to_gpu(),
             direction_masks: gpu_direction_masks(),
             // Depth must be at least 1: the shader starts at level `depth - 1`.
@@ -393,6 +406,7 @@ pub fn build_gpu_scene(
         nodes: packed.nodes,
         voxels: packed.voxels,
         bodies: packed.bodies,
+        body_local_bounds: packed.body_local_bounds,
         palette: scene.materials.to_gpu(),
         direction_masks: gpu_direction_masks(),
         depth: scene.tree.depth(),

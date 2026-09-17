@@ -203,6 +203,13 @@ pub struct Prepared {
     /// beam begin/end then main begin/end, so a beam-less configuration simply
     /// leaves the first pair unwritten.
     timestamps: Option<Timestamps>,
+    /// The body count the uniform carries, read back from the uniform itself.
+    ///
+    /// No pixel shows it: past the culled table the buffer holds zeroed
+    /// entries, which draw nothing, so a count from the packed list renders
+    /// the same image while marching bodies the cull removed -- and a
+    /// benchmark would still pay for them. A gate compares this with the cull.
+    pub body_count: u32,
     width: u32,
     height: u32,
 }
@@ -255,6 +262,15 @@ impl Prepared {
         // body list packs out to exactly the static world, so this is also the
         // path every pre-bodies test still runs.
         let packed = bevox_render::upload::pack_bodies(tree, bodies);
+        // Through the app's own cull, so the gates test what the app runs. The
+        // count below is this table's length, never the packed one's: culled,
+        // the table is compacted and shorter.
+        let table = bevox_render::cull::bodies_to_march(
+            &packed.bodies,
+            &packed.body_local_bounds,
+            &bevox_render::upload::ExtractedMarchCamera { world_from_clip, position: eye },
+            flags,
+        );
         let uniform = TestUniform {
             world_from_clip: world_from_clip.to_cols_array_2d(),
             camera_position: eye.extend(0.0).to_array(),
@@ -262,7 +278,7 @@ impl Prepared {
                 .normalize()
                 .extend(0.0)
                 .to_array(),
-            volume_params: [tree.depth(), tree.extent(), flags, packed.bodies.len() as u32],
+            volume_params: [tree.depth(), tree.extent(), flags, table.len() as u32],
             // The cell size travels in the uniform rather than a matching
             // shader-side constant, so the shader cannot silently disagree
             // with `bevox_core::distance_field::CELL_VOXELS`.
@@ -331,14 +347,16 @@ impl Prepared {
             contents: bytemuck::cast_slice(&field_words),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        // A zero-length storage buffer is invalid, so a body-free scene still
-        // uploads room for one zeroed GpuBody; the uniform's count, not the
-        // buffer length, is what the shader loop actually reads.
-        let body_bytes: Vec<u8> = if packed.bodies.is_empty() {
-            bytemuck::bytes_of(&bevox_render::upload::GpuBody::default()).to_vec()
-        } else {
-            bytemuck::cast_slice(&packed.bodies).to_vec()
-        };
+        // Sized for every packed body, as the app sizes it, with the culled
+        // table at the front and zeroes after. A zero-length storage buffer is
+        // invalid, so a body-free scene still uploads room for one zeroed
+        // GpuBody; the uniform's count, not the buffer length, is what the
+        // shader loop actually reads.
+        let mut body_bytes: Vec<u8> = bytemuck::cast_slice(&table).to_vec();
+        body_bytes.resize(
+            packed.bodies.len().max(1) * size_of::<bevox_render::upload::GpuBody>(),
+            0,
+        );
         let body_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bodies"),
             contents: &body_bytes,
@@ -473,6 +491,7 @@ impl Prepared {
             voxel_buffer,
             field_buffer,
             timestamps,
+            body_count: uniform.volume_params[3],
             width,
             height,
         }
