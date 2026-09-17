@@ -50,8 +50,17 @@ pub const VOXEL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 /// 4 and 16 bodies, A/B/A with drift at most 0.01 ms -- so 1.5 bodies fit a
 /// 16.7 ms frame beside it: one. A body costs 27% of the static march, and 16
 /// bodies behind the camera, which no ray enters, still cost 89% of what 16 in
-/// view do. Raise this after a bounding-volume rejection test in front of each
-/// body march has been added and re-measured, not before.
+/// view do. So most of the cost is paid per pixel per body, before any
+/// rejection: reading the body entry, two matrix-vector transforms, and the
+/// call whose root slab test is already a bounding-box test. That per-pixel
+/// cost likely scales with resolution, so this cap is tied to 1280x720.
+///
+/// Raise this only after a body can be rejected before it is read and
+/// transformed, more cheaply than that read, transform and slab test, and the
+/// benchmark has been re-run. Candidates, roughly cheapest first: a CPU frustum
+/// cull, a per-body screen rectangle, a world-space sphere or box, the ray
+/// origin transformed once per body per frame, the slab test hoisted out of the
+/// call. The plan's Measurements section has the reasoning.
 ///
 /// The test harness writes its own uniform and is not capped, which is what
 /// lets the benchmark measure past this.
