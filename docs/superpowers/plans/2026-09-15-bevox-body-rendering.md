@@ -727,3 +727,37 @@ No implicit normals for bodies. A body shades from its face normal, which is fla
 No bounding-volume rejection before the per-body march. Task 5 measures whether it is needed rather than assuming it; adding it first would be optimising something unmeasured.
 
 No body-vs-body anything. Nothing here needs two bodies to interact.
+
+## Measurements
+
+2026-09-17, NVIDIA GeForce GTX 1650, headless, release build. `bodies_are_measured_against_none` in `crates/bevox_render/tests/gpu_bench.rs`:
+
+```
+cargo test --release -p bevox_render --test gpu_bench bodies -- --ignored --nocapture
+```
+
+Bench scene (extent 1024 floor and columns), 1280x720, bench camera (close to geometry, looking along the floor), `march_flags::DEFAULT`. Bodies are the parity tests' 16-voxel cube (25..41 in a 64 volume), turned off-axis, in a 4x4 grid 120 voxels ahead in the open corridor; each count takes the first N. Every row is A/B/A against the zero-body scene, three rounds, medians: wall clock over batches of 30 dispatches, and GPU timestamps (median of 7 per reading). "px changed" diffs each count's image against the zero-body image, proving the bodies are on screen. The last row puts all 16 behind the camera, where no ray enters any body's box; it is not in the slope.
+
+Raw output, verbatim:
+
+```
+scene: extent 1024, 1280x720, bench camera, flags DEFAULT, 16-voxel cube bodies
+ 0 bodies: wall  11.79 ms vs 11.80/11.79 (drift 0.00) =  -0.00 ms | gpu  11.75 ms vs 11.75/11.74 (drift 0.01) =  +0.00 ms |      0 px changed
+ 1 bodies: wall  15.03 ms vs 11.78/11.78 (drift 0.00) =  +3.25 ms | gpu  15.02 ms vs 11.75/11.75 (drift 0.00) =  +3.27 ms |  15663 px changed
+ 4 bodies: wall  24.39 ms vs 11.80/11.80 (drift 0.01) = +12.59 ms | gpu  24.39 ms vs 11.78/11.78 (drift 0.01) = +12.62 ms |  62257 px changed
+16 bodies: wall  62.49 ms vs 11.82/11.83 (drift 0.01) = +50.67 ms | gpu  62.37 ms vs 11.79/11.79 (drift 0.01) = +50.58 ms | 268334 px changed
+16 bodies behind the camera: wall  57.07 ms vs 11.78/11.78 (drift 0.00) = +45.29 ms | gpu  56.99 ms vs 11.75/11.73 (drift 0.02) = +45.25 ms |      0 px changed
+static world: wall 11.80 ms, gpu 11.75 ms
+per body (slope over 0/1/4/16): wall 3.165 ms = 26.8% of the static march, gpu 3.159 ms = 26.9%
+bodies that fit a 16.7 ms frame beside the static world: wall 1.5, gpu 1.6
+```
+
+An earlier run in the same session, before the behind-the-camera row existed, gave a slope of 3.170 ms wall and 3.168 ms GPU against a static 11.78 / 11.75 ms.
+
+**Per body: 3.17 ms.** Linear in the count: 3.25, 3.15 and 3.17 ms per body at 1, 4 and 16. Wall clock and GPU time agree to within 0.1 ms, so this is shader time, not submission overhead.
+
+**Cap: one body.** 11.80 ms of static world plus 3.17 ms a body leaves room for 1.5 bodies in 16.7 ms. `MAX_BODIES = 1` in `crates/bevox_render/src/pipeline.rs`; `prepare_march_buffers` clamps the uniform's body count to it through `marched_body_count`, with `error_once!` when a scene has more. Bodies past the cap are still packed and uploaded, and simply not marched. The test harness writes its own uniform and is not capped, which is how this benchmark measures past it.
+
+**One body costs 27% of the static world's march, well over the 10% line.** Composition as built is too expensive for the milestones that follow: at this camera on this card, a second body already pushes the dispatch past 16.7 ms. The next step is a bounding-volume rejection test before each body march, not a higher cap. The behind-the-camera row says where to aim it: sixteen bodies that no ray comes near still cost 45.3 ms, 89% of the 50.7 ms that sixteen in view cost. `traverse_at` already rejects those rays at its root slab test, so the cost is being paid per call rather than per voxel visited, and a test that skips the call for rays that miss the body's bounds goes straight at it. Where inside the call that time goes is not measured here, and neither is how much a rejection test would recover; both are for the task that adds it, re-measured with this benchmark.
+
+What these numbers do not show. They are dispatch timings at one camera, not frame rates: no present, no vsync, no CPU frame work. One scene, one resolution, one GPU. One body shape, and a loose one: a 16-voxel cube inside a 64-voxel volume, so rays that enter the volume and miss the cube are in the count; a tighter volume would change the in-view cost, though by the behind-the-camera row not most of it. Primary rays only: shadow rays do not compose bodies yet, so bodies casting shadows would add to this rather than share it. The cap test proves `marched_body_count` clamps; it does not prove `prepare_march_buffers` calls it, which needs a render device no unit test has.

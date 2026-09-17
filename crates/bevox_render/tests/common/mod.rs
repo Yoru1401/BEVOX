@@ -10,9 +10,10 @@
 
 use std::sync::OnceLock;
 use bevox_core::contree::Contree;
+use bevox_core::dense::DenseVolume;
 use bevox_core::gpu::GpuNode;
-use bevox_core::material::{Material, MaterialTable};
-use glam::{Mat4, Vec3};
+use bevox_core::material::{Material, MaterialId, MaterialTable};
+use glam::{Mat4, UVec3, Vec3};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -34,6 +35,25 @@ pub fn parity_materials() -> MaterialTable {
     table.push(Material { color: [140, 140, 150, 255] }).unwrap(); // 1: stone
     table.push(Material { color: [180, 90, 70, 255] }).unwrap(); // 2: brick
     table
+}
+
+/// A solid 16-voxel cube in a 64 volume, as in Task 1's body tests, but one
+/// voxel off the 4-voxel brick grid (25..41, not 24..40).
+///
+/// Aligned, every brick is full and collapses to a uniform node, so the body
+/// owns no voxel bytes and a shader that ignored its `voxel_base` would still
+/// read the right material. Off the grid, every surface brick is partial and
+/// its material comes from the body's own voxel bytes.
+pub fn body_cube() -> Contree {
+    let mut dense = DenseVolume::new(64).unwrap();
+    for z in 25..41 {
+        for y in 25..41 {
+            for x in 25..41 {
+                dense.set(UVec3::new(x, y, z), MaterialId(1));
+            }
+        }
+    }
+    dense.into_contree()
 }
 
 /// Whether this device can report GPU time.

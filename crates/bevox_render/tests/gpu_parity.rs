@@ -141,25 +141,6 @@ fn body_world(extra: &[(UVec3, MaterialId)]) -> Contree {
     world
 }
 
-/// A solid 16-voxel cube in a 64 volume, as in Task 1's body tests, but one
-/// voxel off the 4-voxel brick grid (25..41, not 24..40).
-///
-/// Aligned, every brick is full and collapses to a uniform node, so the body
-/// owns no voxel bytes and a shader that ignored its `voxel_base` would still
-/// read the right material. Off the grid, every surface brick is partial and
-/// its material comes from the body's own voxel bytes.
-fn body_cube() -> Contree {
-    let mut dense = DenseVolume::new(64).unwrap();
-    for z in 25..41 {
-        for y in 25..41 {
-            for x in 25..41 {
-                dense.set(UVec3::new(x, y, z), MaterialId(1));
-            }
-        }
-    }
-    dense.into_contree()
-}
-
 /// The display entry point shares `traverse` with `march_identity`, but writes
 /// colours rather than identities. This proves it renders a scene — distinct
 /// sky, floor and column — rather than a uniform field, which is what a

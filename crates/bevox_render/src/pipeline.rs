@@ -41,6 +41,34 @@ pub const MARCH_BINDING_COUNT: usize = 9;
 /// never an allocation attempt.
 pub const VOXEL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Bodies the march composes. Past this, bodies are still packed and uploaded
+/// but not marched: the count the shader loops over is clamped to it.
+///
+/// Set from `bodies_are_measured_against_none` in `tests/gpu_bench.rs` on a GTX
+/// 1650, 2026-09-17. At 1280x720 from the bench camera the static world marches
+/// in 11.80 ms and each body adds 3.17 ms -- the least-squares slope over 0, 1,
+/// 4 and 16 bodies, A/B/A with drift at most 0.01 ms -- so 1.5 bodies fit a
+/// 16.7 ms frame beside it: one. A body costs 27% of the static march, and 16
+/// bodies behind the camera, which no ray enters, still cost 89% of what 16 in
+/// view do. Raise this after a bounding-volume rejection test in front of each
+/// body march has been added and re-measured, not before.
+///
+/// The test harness writes its own uniform and is not capped, which is what
+/// lets the benchmark measure past this.
+pub const MAX_BODIES: usize = 1;
+
+/// How many of `bodies` the shader marches: all of them, up to `MAX_BODIES`.
+///
+/// Clamped, not rejected: the scene still renders, minus the bodies past the
+/// cap. Reported once, like the voxel budget, because this runs every frame and
+/// the condition holds until the scene changes.
+pub fn marched_body_count(bodies: usize) -> u32 {
+    if bodies > MAX_BODIES {
+        error_once!("{bodies} bodies, over the cap of {MAX_BODIES}; marching only the first {MAX_BODIES}");
+    }
+    bodies.min(MAX_BODIES) as u32
+}
+
 /// Entries to allocate for a scene currently using `high_water` of them.
 ///
 /// The headroom is what lets an edit allocate new nodes without forcing the
@@ -187,7 +215,7 @@ pub fn prepare_march_buffers(
             scene.depth,
             scene.extent,
             crate::upload::march_flags::DEFAULT,
-            scene.bodies.len() as u32,
+            marched_body_count(scene.bodies.len()),
         ],
         // The cell size travels with the edge count rather than a matching
         // shader-side constant, so `march.wgsl` cannot silently disagree with
@@ -487,6 +515,17 @@ mod tests {
         // Body geometry counts against the budget the same as the static world.
         let over_on_bodies = (VOXEL_BUDGET_BYTES / size_of::<GpuBody>() as u64) as u32 + 1;
         assert!(!within_budget(1, 1, 0, over_on_bodies));
+    }
+
+    #[test]
+    fn bodies_past_the_cap_are_not_marched() {
+        assert_eq!(marched_body_count(0), 0);
+        assert_eq!(marched_body_count(MAX_BODIES), MAX_BODIES as u32);
+        assert_eq!(
+            marched_body_count(MAX_BODIES + 1),
+            MAX_BODIES as u32,
+            "one body past the cap was marched"
+        );
     }
 
     #[test]

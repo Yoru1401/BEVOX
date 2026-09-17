@@ -89,13 +89,22 @@ pub fn compare_aba(
     baseline: &Prepared,
     variant: &Prepared,
 ) -> (f32, f32, f32) {
+    aba(baseline, variant, |p| time_dispatches(device, queue, p, BATCH))
+}
+
+/// A/B/A with any clock: `time` reads one configuration once.
+fn aba(
+    baseline: &Prepared,
+    variant: &Prepared,
+    mut time: impl FnMut(&Prepared) -> f32,
+) -> (f32, f32, f32) {
     let mut a1 = Vec::new();
     let mut b = Vec::new();
     let mut a2 = Vec::new();
     for _ in 0..ROUNDS {
-        a1.push(time_dispatches(device, queue, baseline, BATCH));
-        b.push(time_dispatches(device, queue, variant, BATCH));
-        a2.push(time_dispatches(device, queue, baseline, BATCH));
+        a1.push(time(baseline));
+        b.push(time(variant));
+        a2.push(time(baseline));
     }
     (median(&mut a1), median(&mut b), median(&mut a2))
 }
@@ -185,9 +194,11 @@ fn optimisations_are_measured_against_the_baseline() {
         ("mask", march_flags::MASK_FILTER),
         ("dda+mask", march_flags::DDA | march_flags::MASK_FILTER),
         ("beam", march_flags::BEAM),
-        ("all", march_flags::DDA | march_flags::MASK_FILTER | march_flags::BEAM),
+        ("dda+mask+beam", march_flags::DDA | march_flags::MASK_FILTER | march_flags::BEAM),
         ("field", march_flags::DISTANCE_FIELD),
-        ("all+field", march_flags::DEFAULT | march_flags::DISTANCE_FIELD),
+        // `DEFAULT`, whatever it currently holds -- today that is all four
+        // optimisations plus `BODIES`, which a body-free scene never runs.
+        ("default", march_flags::DEFAULT),
     ] {
         let variant = make(flags);
         let (a1, b, a2) = compare_aba(&device, &queue, &baseline, &variant);
@@ -195,7 +206,7 @@ fn optimisations_are_measured_against_the_baseline() {
         let scan = (a1 + a2) * 0.5;
         let gain = scan - b;
         println!(
-            "{name:>9}: {b:6.2} ms vs scan {a1:.2}/{a2:.2} (drift {drift:.2})  gain {gain:6.2} ms ({:5.1}%) {}{}",
+            "{name:>13}: {b:6.2} ms vs scan {a1:.2}/{a2:.2} (drift {drift:.2})  gain {gain:6.2} ms ({:5.1}%) {}{}",
             gain / scan * 100.0,
             if gain.abs() > drift { "" } else { "<- within drift, not a result" },
             gpu_time_note(&device, &queue, &variant),
@@ -573,9 +584,9 @@ fn the_dispatches_are_timed_by_the_gpu() {
         ("dda", march_flags::DDA),
         ("mask", march_flags::MASK_FILTER),
         ("beam", march_flags::BEAM),
-        ("all", march_flags::DEFAULT),
+        ("dda+mask+beam", march_flags::DDA | march_flags::MASK_FILTER | march_flags::BEAM),
         ("field", march_flags::DISTANCE_FIELD),
-        ("all+field", march_flags::DEFAULT | march_flags::DISTANCE_FIELD),
+        ("default", march_flags::DEFAULT),
     ] {
         let prepared = Prepared::new(
             &device, &shader, "march", &tree, world_from_clip, eye, 1280, 720, flags,
@@ -597,9 +608,9 @@ fn the_dispatches_are_timed_by_the_gpu() {
         let total = median_of(&mut totals);
         let beam = median_of(&mut beams);
         if beam > 0.0 {
-            println!("{name:>6}: {total:7.3} ms total  (beam {beam:.3} + main {:.3})", total - beam);
+            println!("{name:>13}: {total:7.3} ms total  (beam {beam:.3} + main {:.3})", total - beam);
         } else {
-            println!("{name:>6}: {total:7.3} ms total");
+            println!("{name:>13}: {total:7.3} ms total");
         }
     }
 }
@@ -641,4 +652,141 @@ fn building_the_field_is_timed() {
             field.cells().len() as f64 / (1024.0 * 1024.0),
         );
     }
+}
+
+/// Sixteen copies of the parity tests' 16-voxel cube, a 4x4 grid `ahead`
+/// voxels in front of the bench camera. At 120 that is the open corridor, clear
+/// of the floor and the columns, so each is on screen and unoccluded; at -120
+/// it is behind the camera, where every ray misses every body's box. Turned
+/// off-axis, as the demo body spins, rather than meeting every ray square-on.
+fn bench_bodies(eye: Vec3, ahead: f32) -> Vec<bevox_core::body::Body> {
+    let cube = body_cube();
+    let orientation = glam::Quat::from_euler(glam::EulerRot::XYZ, 0.4, 0.7, 0.0);
+    let mut bodies = Vec::new();
+    for row in 0..4 {
+        for column in 0..4 {
+            let centre = eye
+                + Vec3::new((column as f32 - 1.5) * 40.0, 8.0 + (row as f32 - 1.5) * 24.0, ahead);
+            // The cube spans 25..41 of its volume, so its centre is local 33.
+            let position = centre - orientation * Vec3::splat(33.0);
+            bodies.push(bevox_core::body::Body::new(cube.clone(), position, orientation));
+        }
+    }
+    bodies
+}
+
+/// What composing rigid bodies costs, and so how many the frame can afford.
+///
+/// Composition is `1 + N` marches per ray, and a body march gets neither the
+/// beam seed nor the distance-field skip -- both know only the static world --
+/// so each is an unaccelerated march over the whole ray. The static world's
+/// accelerated cost says nothing about that, so it is measured.
+///
+/// Every count is A/B/A against the zero-body scene, on the wall clock and the
+/// GPU's own. The zero-body row is a second, separately built zero-body
+/// configuration, so what it reads is the noise floor. Per-body cost is the
+/// least-squares slope over all four counts, not any single one.
+///
+/// Before any timing, each count's image is diffed against the zero-body image:
+/// a body off screen or hidden would time a march that finds nothing, and the
+/// changed-pixel count growing with every count is the proof that it does not.
+///
+/// One extra row puts all sixteen behind the camera, where no ray enters any
+/// body's box. It is not part of the slope; it separates what a body costs a
+/// ray that traverses it from what it costs a ray that never comes near it,
+/// which is the question a bounding-volume rejection test would answer.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench bodies --
+/// --ignored --nocapture`. `MAX_BODIES` in `bevox_render::pipeline` is set from
+/// its output.
+#[test]
+#[ignore]
+fn bodies_are_measured_against_none() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    if !timestamps_supported(&device) {
+        eprintln!("adapter has no TIMESTAMP_QUERY, skipping");
+        return;
+    }
+
+    let (tree, extent) = bench_scene();
+    let (eye, world_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let (ahead, behind) = (bench_bodies(eye, 120.0), bench_bodies(eye, -120.0));
+    let make = |bodies: &[bevox_core::body::Body]| {
+        Prepared::new(
+            &device, &shader, "march", &tree, world_from_clip, eye, 1280, 720,
+            march_flags::DEFAULT, bodies,
+        )
+    };
+    // Median of seven GPU readings, after one untimed dispatch.
+    let gpu_ms = |p: &Prepared| {
+        p.dispatch(&device, &queue);
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let mut t: Vec<f32> =
+            (0..7).map(|_| p.dispatch_timed(&device, &queue).expect("timestamps").total()).collect();
+        median(&mut t)
+    };
+
+    let baseline = make(&[]);
+    let empty_image = baseline.read_back(&device, &queue);
+
+    println!("scene: extent {extent}, 1280x720, bench camera, flags DEFAULT, 16-voxel cube bodies");
+    let mut previous_coverage = 0;
+    let (mut statics, mut gpu_statics) = (Vec::new(), Vec::new());
+    let mut points = Vec::new();
+    for (n, visible) in [(0usize, true), (1, true), (4, true), (16, true), (16, false)] {
+        let variant = make(&(if visible { &ahead } else { &behind })[..n]);
+        let coverage = empty_image
+            .chunks(4)
+            .zip(variant.read_back(&device, &queue).chunks(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            if n == 0 || !visible { coverage == 0 } else { coverage > previous_coverage },
+            "{n} bodies (visible: {visible}) changed {coverage} pixels after {previous_coverage}"
+        );
+        previous_coverage = coverage;
+
+        let (a1, b, a2) = compare_aba(&device, &queue, &baseline, &variant);
+        let (g1, gb, g2) = aba(&baseline, &variant, gpu_ms);
+        let (wall, gpu) = (b - (a1 + a2) * 0.5, gb - (g1 + g2) * 0.5);
+        println!(
+            "{n:>2} bodies{}: wall {b:6.2} ms vs {a1:.2}/{a2:.2} (drift {:.2}) = {wall:+6.2} ms | \
+             gpu {gb:6.2} ms vs {g1:.2}/{g2:.2} (drift {:.2}) = {gpu:+6.2} ms | {coverage:>6} px changed",
+            if visible { "" } else { " behind the camera" },
+            (a1 - a2).abs(),
+            (g1 - g2).abs(),
+        );
+        assert!(b > 0.0 && gb > 0.0, "{n} bodies: the timer returned nothing");
+        statics.extend([a1, a2]);
+        gpu_statics.extend([g1, g2]);
+        if visible {
+            points.push((n as f32, wall, gpu));
+        }
+    }
+
+    // Least-squares slope of the added cost against the body count.
+    let slope = |pick: fn(&(f32, f32, f32)) -> f32| {
+        let mean_n = points.iter().map(|p| p.0).sum::<f32>() / points.len() as f32;
+        let mean_y = points.iter().map(pick).sum::<f32>() / points.len() as f32;
+        let covariance: f32 = points.iter().map(|p| (p.0 - mean_n) * (pick(p) - mean_y)).sum();
+        let variance: f32 = points.iter().map(|p| (p.0 - mean_n).powi(2)).sum();
+        covariance / variance
+    };
+    let (per_body, gpu_per_body) = (slope(|p| p.1), slope(|p| p.2));
+    let static_wall = median(&mut statics);
+    let static_gpu = median(&mut gpu_statics);
+    println!(
+        "static world: wall {static_wall:.2} ms, gpu {static_gpu:.2} ms\n\
+         per body (slope over 0/1/4/16): wall {per_body:.3} ms = {:.1}% of the static march, \
+         gpu {gpu_per_body:.3} ms = {:.1}%\n\
+         bodies that fit a 16.7 ms frame beside the static world: wall {:.1}, gpu {:.1}",
+        per_body / static_wall * 100.0,
+        gpu_per_body / static_gpu * 100.0,
+        (16.7 - static_wall) / per_body,
+        (16.7 - static_gpu) / gpu_per_body,
+    );
 }
