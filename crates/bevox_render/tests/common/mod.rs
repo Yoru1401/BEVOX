@@ -8,6 +8,7 @@
 // one of them uses look dead to the other.
 #![allow(dead_code)]
 
+use std::sync::OnceLock;
 use bevox_core::contree::Contree;
 use bevox_core::gpu::GpuNode;
 use bevox_core::material::{Material, MaterialTable};
@@ -55,26 +56,45 @@ pub fn storage_entry(binding: u32, min_size: u64) -> wgpu::BindGroupLayoutEntry 
 }
 
 pub fn gpu_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    pollster::block_on(async {
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .ok()?;
-        // Timestamps are requested when the adapter has them and silently
-        // dropped when it does not, so a device without the feature still runs
-        // every test -- it just cannot report GPU time. `timestamps_supported`
-        // is how a caller finds out which it got.
-        let features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
-        adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("bevox_test_device"),
-                required_features: features,
-                ..Default::default()
+    // One device for every test in this binary, created on first use.
+    //
+    // Each test used to build its own `Instance`, adapter and `Device`, and the
+    // test harness runs them on parallel threads, so a binary brought up a
+    // dozen Vulkan devices against one GPU at once. That deadlocked in the
+    // driver about one run in ten: a stress test of 20 runs at
+    // --test-threads=16 hung twice, once before a single test finished and
+    // once with twelve tests blocked at the same time, including the trivial
+    // shader test that does nothing but acquire a device. The stuck process
+    // burned CPU for hours and survived a session reset.
+    //
+    // `Device` and `Queue` are cheap handles that wgpu makes `Clone`, so every
+    // test gets its own clone of the one device. Each test still builds its
+    // own pipelines and buffers, so nothing a test checks is shared.
+    static DEVICE: OnceLock<Option<(wgpu::Device, wgpu::Queue)>> = OnceLock::new();
+    DEVICE
+        .get_or_init(|| {
+            pollster::block_on(async {
+                let instance = wgpu::Instance::default();
+                let adapter = instance
+                    .request_adapter(&wgpu::RequestAdapterOptions::default())
+                    .await
+                    .ok()?;
+                // Timestamps are requested when the adapter has them and silently
+                // dropped when it does not, so a device without the feature still
+                // runs every test -- it just cannot report GPU time.
+                // `timestamps_supported` is how a caller finds out which it got.
+                let features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+                adapter
+                    .request_device(&wgpu::DeviceDescriptor {
+                        label: Some("bevox_test_device"),
+                        required_features: features,
+                        ..Default::default()
+                    })
+                    .await
+                    .ok()
             })
-            .await
-            .ok()
-    })
+        })
+        .clone()
 }
 
 pub fn storage_target(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
