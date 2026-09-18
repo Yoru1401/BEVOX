@@ -12,8 +12,11 @@
 //! bias added, so pushing a body out of the floor does not make it bounce.
 
 use super::contact::{Contact, RADIUS, detect, detect_pair, world_box};
-use super::{BASE_MARGIN, BIAS, MAX_PUSH, MAX_TRAVEL, RESTITUTION_SWEEPS, SLOP, SUBSTEPS};
-use crate::body::{Body, occupied_bounds};
+use super::{
+    BASE_MARGIN, BIAS, GRAB_DAMPING, GRAB_FREQUENCY, GRAB_MAX_ACCEL, GRAB_SPIN_DAMPING, MAX_PUSH,
+    MAX_TRAVEL, RESTITUTION_SWEEPS, SLOP, SUBSTEPS,
+};
+use crate::body::{Body, BodyId, occupied_bounds};
 use crate::contree::Contree;
 use crate::distance_field::DistanceField;
 use crate::material::MaterialTable;
@@ -25,6 +28,26 @@ pub struct ContactImpulse {
     pub normal: f32,
     /// Along the contact's two tangents, in their order.
     pub tangent: Vec2,
+}
+
+/// A body held by the mouse: a damped spring from `target` to the point
+/// `anchor` of the body with id `body`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Grab {
+    pub body: BodyId,
+    /// The grabbed point, in the body's volume coordinates, so that recomputing
+    /// the body's centre of mass after an edit does not move it.
+    pub anchor: Vec3,
+    /// Where the spring pulls the grabbed point, in the world.
+    pub target: Vec3,
+}
+
+impl Grab {
+    /// Grabs `body` at the world point `at`, which is also where it is held
+    /// until the target moves.
+    pub fn new(body: &Body, at: Vec3) -> Self {
+        Self { body: body.id, anchor: body.local_from_world().transform_point3(at), target: at }
+    }
 }
 
 /// A contact and the bodies it joins: the one it belongs to, and the one it is
@@ -48,6 +71,7 @@ pub fn step(
     materials: &MaterialTable,
     gravity: Vec3,
     dt: f32,
+    grab: Option<&Grab>,
 ) -> bool {
     let before = bodies.len();
     bodies.retain(|b| world_box(b, 0.0).is_none_or(|(_, max)| max.y >= 0.0));
@@ -83,6 +107,9 @@ pub fn step(
     for _ in 0..SUBSTEPS {
         for (b, &r) in bodies.iter_mut().zip(&radii).filter(|(b, _)| b.mass.mass > 0.0) {
             b.velocity += gravity * h;
+            if let Some(grab) = grab.filter(|g| g.body == b.id) {
+                pull(b, grab, h);
+            }
             cap_speed(b, world_inverse_inertia(b), r, dt);
         }
 
@@ -195,6 +222,24 @@ fn apply_restitution(
             push(a, b.as_deref_mut(), c, c.normal * delta);
         }
     }
+}
+
+/// Pulls the grabbed point toward the target with a damped spring, applied at
+/// the point, so the body turns as well as moves; and damps the body's spin,
+/// which the spring alone does nothing about.
+///
+/// The spring is an acceleration scaled by the body's mass, so every body is
+/// held alike. It runs once per substep, which keeps `w h` small enough for an
+/// explicit spring to stay stable.
+fn pull(body: &mut Body, grab: &Grab, h: f32) {
+    let w = std::f32::consts::TAU * GRAB_FREQUENCY;
+    let point = body.world_from_local().transform_point3(grab.anchor);
+    let r = point - body.position;
+    let spring = w * w * (grab.target - point) - 2.0 * GRAB_DAMPING * w * point_velocity(body, r);
+    let impulse = spring.clamp_length_max(GRAB_MAX_ACCEL) * body.mass.mass * h;
+    body.velocity += impulse * body.mass.inverse_mass();
+    body.angular_momentum += r.cross(impulse);
+    body.angular_momentum *= (1.0 - GRAB_SPIN_DAMPING * h).max(0.0);
 }
 
 /// The two bodies a contact joins, borrowed at once.
@@ -401,7 +446,7 @@ mod tests {
         ticks: u32,
     ) {
         for _ in 0..ticks {
-            step(bodies, world, field, materials, gravity, DT);
+            step(bodies, world, field, materials, gravity, DT, None);
         }
     }
 
@@ -492,6 +537,73 @@ mod tests {
         assert!(landed_at < started_at - 1.0, "it never fell: {started_at} to {landed_at}");
         assert!(bodies[0].velocity.length() < 0.5, "it never settled: {:?}", bodies[0].velocity);
         assert!(landed_at > 8.0, "it fell through the floor to {landed_at}");
+    }
+
+    /// Held at its centre and moved, a body springs to the target and settles
+    /// there, hanging the little gravity asks for.
+    #[test]
+    fn a_grabbed_body_settles_at_the_target() {
+        let materials = materials();
+        let world = Contree::empty(3);
+        let field = DistanceField::build(&world);
+        let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
+        let mut grab = Grab::new(&bodies[0], Vec3::new(30.0, 30.0, 30.0));
+        grab.target = Vec3::new(34.0, 32.0, 30.0);
+        for _ in 0..300 {
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, Some(&grab));
+        }
+        let held = bodies[0].world_from_local().transform_point3(grab.anchor);
+        assert!((held - grab.target).length() < 0.3, "held at {held:?}, target {:?}", grab.target);
+        assert!(bodies[0].velocity.length() < 0.05, "still moving at {:?}", bodies[0].velocity);
+    }
+
+    /// Held by a corner, a body hangs straight down from it, and the swing dies
+    /// away rather than going on forever.
+    #[test]
+    fn a_body_held_by_its_corner_hangs_below_it() {
+        let materials = materials();
+        let world = Contree::empty(3);
+        let field = DistanceField::build(&world);
+        let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
+        let corner = bodies[0].world_from_local().transform_point3(Vec3::ZERO);
+        let grab = Grab::new(&bodies[0], corner);
+        for _ in 0..900 {
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, Some(&grab));
+        }
+        let com = bodies[0].position;
+        let off = com - grab.target;
+        assert!(off.y < -2.0, "the body is not hanging below the grab: {off:?}");
+        assert!(Vec3::new(off.x, 0.0, off.z).length() < 0.2, "the body hangs askew: {off:?}");
+        assert!(bodies[0].angular_velocity().length() < 0.05, "still swinging");
+    }
+
+    /// A target across the world accelerates the body hard, but no harder than
+    /// the grab's cap: no yank to full speed in a single tick.
+    #[test]
+    fn a_far_target_cannot_yank_a_body() {
+        let materials = materials();
+        let world = Contree::empty(3);
+        let field = DistanceField::build(&world);
+        let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
+        let mut grab = Grab::new(&bodies[0], Vec3::new(30.0, 30.0, 30.0));
+        grab.target = Vec3::new(3000.0, 30.0, 30.0);
+        step(&mut bodies, &world, &field, &materials, Vec3::ZERO, DT, Some(&grab));
+        let speed = bodies[0].velocity.length();
+        assert!(speed <= GRAB_MAX_ACCEL * DT * 1.001, "one tick reached {speed}");
+        assert!(speed > 0.5 * GRAB_MAX_ACCEL * DT, "the grab barely pulled: {speed}");
+    }
+
+    /// A grab on a body that is gone does nothing, rather than panicking.
+    #[test]
+    fn a_grab_on_a_missing_body_does_nothing() {
+        let materials = materials();
+        let world = Contree::empty(3);
+        let field = DistanceField::build(&world);
+        let gone = placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY);
+        let grab = Grab::new(&gone, Vec3::new(30.0, 30.0, 30.0));
+        let mut bodies = vec![placed(cube(4, 4), Vec3::new(40.0, 30.0, 30.0), Quat::IDENTITY)];
+        step(&mut bodies, &world, &field, &materials, Vec3::ZERO, DT, Some(&grab));
+        assert_eq!(bodies[0].velocity, Vec3::ZERO);
     }
 
     /// A moving cube hitting a still one of equal mass gives its motion away:
@@ -606,7 +718,7 @@ mod tests {
         run(&mut bodies, &world, &field, &materials(), GRAVITY, 8000);
         let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
         for _ in 0..1000 {
-            step(&mut bodies, &world, &field, &materials(), GRAVITY, DT);
+            step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None);
             low = low.min(bodies[0].position.y);
             high = high.max(bodies[0].position.y);
         }
@@ -741,7 +853,7 @@ mod tests {
             let mut top: f32 = 0.0;
             let mut landed = false;
             for _ in 0..400 {
-                step(&mut bodies, &world, &field, &materials, GRAVITY, DT);
+                step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None);
                 let y = bodies[0].position.y;
                 landed |= y < 10.2;
                 if landed {
@@ -775,7 +887,7 @@ mod tests {
         assert!((settled - 10.0).abs() < 0.1, "settled at {settled}, not on the floor");
         let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
         for _ in 0..1000 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT);
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None);
             low = low.min(bodies[0].position.y);
             high = high.max(bodies[0].position.y);
         }
@@ -797,7 +909,7 @@ mod tests {
         run(&mut bodies, &world, &field, &materials, GRAVITY, 3000);
         let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
         for _ in 0..500 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT);
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None);
             low = low.min(bodies[0].position.y);
             high = high.max(bodies[0].position.y);
         }
@@ -837,7 +949,7 @@ mod tests {
         assert!(bodies[0].velocity.y.abs() < 0.05, "not at rest before the edit");
         // Erasing leaves the field under-estimating, which is its safe direction.
         world.apply_sphere(Vec3::new(32.0, 6.0, 32.0), 6.0, MaterialId::EMPTY);
-        step(&mut bodies, &world, &field, &materials(), GRAVITY, DT);
+        step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None);
         assert!(bodies[0].velocity.y < -1.0, "still held up: {:?}", bodies[0].velocity);
     }
 
@@ -854,7 +966,7 @@ mod tests {
             k
         };
         let before = keys(&bodies[0]);
-        step(&mut bodies, &world, &field, &materials(), GRAVITY, DT);
+        step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None);
         assert!(!before.is_empty());
         assert_eq!(keys(&bodies[0]), before);
     }
@@ -864,10 +976,10 @@ mod tests {
         let world = slab(64, 0..8);
         let field = DistanceField::build(&world);
         let mut bodies = vec![placed(cube(4, 4), Vec3::new(32.0, -60.0, 32.0), Quat::IDENTITY)];
-        assert!(step(&mut bodies, &world, &field, &materials(), GRAVITY, DT));
+        assert!(step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None));
         assert!(bodies.is_empty());
         let mut bodies = vec![placed(cube(4, 4), Vec3::new(32.0, 40.0, 32.0), Quat::IDENTITY)];
-        assert!(!step(&mut bodies, &world, &field, &materials(), GRAVITY, DT));
+        assert!(!step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None));
         assert_eq!(bodies.len(), 1);
     }
 
@@ -905,7 +1017,7 @@ mod tests {
             (0..ticks)
                 .map(|_| {
                     let start = std::time::Instant::now();
-                    step(bodies, &world, &field, &materials, GRAVITY, DT);
+                    step(bodies, &world, &field, &materials, GRAVITY, DT, None);
                     start.elapsed().as_secs_f64() * 1000.0
                 })
                 .collect()

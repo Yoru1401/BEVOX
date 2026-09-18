@@ -145,6 +145,7 @@ fn physics_system(time: Res<Time>, mut scene: ResMut<VoxelScene>) {
         &scene.materials,
         GRAVITY,
         time.delta_secs(),
+        None,
     );
     if changed {
         // A body left the world. The body list is packed into the scene

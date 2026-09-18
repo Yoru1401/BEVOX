@@ -21,7 +21,8 @@ disconnects becomes a body, as in Dwyer's engine. Everything below serves that.
 
 Two interactions come later but constrain the design now:
 
-- **Picking up bodies.** A mouse grab drives the body through a joint.
+- **Picking up bodies.** A damped spring pulls the clicked point toward the
+  cursor, and the body keeps simulating.
 - **Editing bodies with the brush.** Painting grows a body, erasing shrinks it,
   and pieces that end up disconnected split into separate bodies.
 
@@ -237,16 +238,33 @@ Detachment is coupled to edit throughput. A single paint already stages about
 2.2 MB of distance-field data at extent 4096, so the search is bounded to the
 affected region.
 
-## Joints and the mouse grab
+## The mouse grab, and joints
 
 Every joint is one error function `C` of the constrained bodies' transforms,
 satisfied when `C = 0`. Its gradient `J` gives the constraint direction. The
 constraint impulse `λ` comes from the same expression for every joint type, and
 the TGS solver handles joints and contacts together.
 
-**The mouse grab is a joint** that drives the grabbed point, and the body's
-rotation, toward a target in front of the camera. It is not an explicit spring:
-Dwyer's spring version bounced and was unstable, and the joint replaced it.
+**The mouse grab is a damped spring** from a target in front of the camera to
+the exact point that was clicked. This is Flori's design, after the oscillator
+grab in Joe Binns' *Get Me Out*, which pulls at the centre of mass; this one
+pulls at the clicked point, so a body held by its corner hangs from it.
+
+- **It feels the same on every body.** The spring is given as a frequency and a
+  damping ratio, and its acceleration is scaled by mass.
+- **The held body keeps simulating.** It collides, stacks, and falls under
+  gravity, sagging `g / w^2` below the target. Releasing it is simply not
+  holding it, so it keeps the momentum the spring gave it, and a flick throws
+  it.
+- **It is stable, although Dwyer's explicit spring was not.** It runs inside the
+  solver's substeps, which keeps `w h` small, and its acceleration is capped, so
+  a target far across the world pulls hard rather than instantly.
+- **It damps the held body's spin.** A spring on one point does nothing about
+  rotation around that point, so without the damping a body held by its corner
+  would swing forever.
+
+Dwyer's engine drives the grab with a joint instead. Joints are milestone 6, and
+the grab does not depend on them.
 
 A joint on a body that splits must follow the piece that holds its anchor voxel.
 
@@ -281,7 +299,8 @@ correctness are checked by deliberately breaking the code they guard.
 | 2 | Material density, recomputable mass properties, voxel classification, rounded-voxel contacts against the world, TGS solver with angular response and warm starting, gravity | A body lands, tumbles and rests on real terrain |
 | 3 | Friction and restitution per material; body against body | Bodies slide, bounce and pile |
 | 4 | Detachment from the world, and brush editing of bodies with splitting | The thing this was for |
-| 5 | Joints, and the mouse grab as a joint | Bodies can be picked up |
+| 5 | Mouse grab: a damped spring from the cursor to the clicked point | Bodies can be picked up |
+| 6 | Joints | Hinges, ragdolls and machines |
 
 Deferred until a measurement asks for them: sleeping, merging settled debris
 back into the terrain, fracture on hard impacts, and multithreading. Dwyer's
@@ -339,6 +358,8 @@ Filled in by this design, **not** shown in his devlogs:
 
 - the exact pair-test formulas and rounding radii;
 - the voxel-level detachment search, its budget and its early exit;
+- the mouse grab as a spring at the clicked point, with spin damping, which is
+  Flori's design after *Get Me Out* rather than Dwyer's joint;
 - the lookup reach;
 - the ownership rules that report each touch once;
 - the unbiased relax solve after each substep's position update, after Erin
