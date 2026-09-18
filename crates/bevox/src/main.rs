@@ -1,19 +1,19 @@
+mod scenes;
+
 use bevy::prelude::*;
-use bevox_core::body::Body;
-use bevox_core::contree::Contree;
-use bevox_core::dense::DenseVolume;
 use bevox_core::distance_field::DistanceField;
-use bevox_core::material::{Material, MaterialId, MaterialTable};
+use bevox_core::material::MaterialId;
 use bevox_core::physics::GRAVITY;
 use bevox_core::physics::detach::detach;
 use bevox_core::physics::joint::{Joint, follow};
 use bevox_core::physics::sculpt::sculpt;
 use bevox_core::physics::solver::step;
 use bevox_render::BevoxRenderPlugin;
-use bevox_render::camera::{FlyCamera, fly_camera_system, start_camera};
+use bevox_render::camera::{FlyCamera, fly_camera_system};
 use bevox_render::pick::{Target, cursor_ray, pick};
 use bevox_render::pipeline::MAX_BODIES;
 use bevox_render::upload::{VoxelScene, apply_brush, build_gpu_scene};
+use scenes::{SceneKind, demo_body};
 
 fn main() {
     App::new()
@@ -48,6 +48,7 @@ fn main() {
         .init_resource::<BrushSettings>()
         .init_resource::<GrabState>()
         .init_resource::<Joints>()
+        .init_resource::<SceneKind>()
         .add_systems(Startup, setup)
         // Before the rebuild too, not merely before staging. On a frame that
         // rebuilds because the last stroke outgrew the world region, a stroke
@@ -55,6 +56,10 @@ fn main() {
         // the render world discards in favour of the snapshot -- which was
         // taken before that stroke. It is then lost until the next rebuild.
         .add_systems(Update, toggle_grab_mode.before(brush_input).before(grab_input))
+        .add_systems(
+            Update,
+            scene_keys.before(build_gpu_scene).before(grab_input).before(brush_input),
+        )
         .add_systems(Update, brush_input.after(fly_camera_system).before(build_gpu_scene))
         .add_systems(Update, grab_input.after(fly_camera_system))
         // Fixed timestep: physics must not depend on the frame rate. Bevy runs
@@ -69,7 +74,7 @@ fn setup(mut commands: Commands) {
     // 2D camera composites the sprite showing the marched image.
     commands.spawn(Camera2d);
 
-    let (tree, materials) = match std::env::args().nth(1) {
+    let scene = match std::env::args().nth(1) {
         Some(path) => match bevox_core::vox::load_scene(std::path::Path::new(&path)) {
             Ok((tree, materials)) => {
                 info!(
@@ -77,67 +82,84 @@ fn setup(mut commands: Commands) {
                     tree.extent(),
                     tree.arena().nodes().len()
                 );
-                (tree, materials)
+                scenes::with_falling_body(tree, materials)
             }
             Err(e) => {
                 // A bad path is a typo, not a crash: say so and show the demo.
                 error!("could not load {path}: {e}");
-                demo_scene()
+                scenes::demo()
             }
         },
-        None => demo_scene(),
+        None => scenes::demo(),
     };
-
-    let (eye, look_at) = start_camera(&tree);
 
     // 3D camera exists only to supply view and projection matrices to the
     // shader; it renders nothing itself.
     commands.spawn((
         Camera3d::default(),
         Camera { order: -1, is_active: false, ..default() },
-        Transform::from_translation(eye),
+        Transform::from_translation(scene.eye),
         // Yaw and pitch must agree with the intended direction: the fly camera
         // rewrites the transform's rotation from them every frame.
-        FlyCamera::looking_at(eye, look_at),
+        FlyCamera::looking_at(scene.eye, scene.look_at),
     ));
 
-    // Fourteen voxels ahead, ten short of the surface the camera faces, so on
-    // screen at start whatever scene was loaded, and six to the right of the
-    // line of sight, so it does not hide what the camera is looking at.
-    let forward = (look_at - eye).normalize();
-    let right = forward.cross(Vec3::Y).normalize_or_zero();
-    let mut body = demo_body(eye + forward * 14.0 + right * 6.0, Quat::IDENTITY);
-    // With mass, it falls from there onto whatever is below it.
-    body.recompute(&materials);
-
-    let field = DistanceField::build(&tree);
+    let field = DistanceField::build(&scene.tree);
     commands.insert_resource(VoxelScene {
-        tree,
-        materials,
+        tree: scene.tree,
+        materials: scene.materials,
         generation: 1,
         field,
         field_dirty: None,
-        bodies: vec![body],
+        bodies: scene.bodies,
     });
+    commands.insert_resource(Joints(scene.joints));
 }
 
-/// A six-voxel cube of material 2 -- brick, in the demo palette -- whose middle
-/// is at `centre`, turned by `orientation`. Call `recompute` before simulating
-/// it.
+/// `1` loads the demo scene and `2` the joint scene; pressing either again
+/// resets it.
 ///
-/// Off the 4-voxel brick grid (5..11 in a 16 volume) so its bricks are partial
-/// and it owns real voxel bytes, like the body the parity tests prove, rather
-/// than collapsing to uniform nodes.
-fn demo_body(centre: Vec3, orientation: Quat) -> Body {
-    let mut dense = DenseVolume::new(16).unwrap();
-    for z in 5..11 {
-        for y in 5..11 {
-            for x in 5..11 {
-                dense.set(UVec3::new(x, y, z), MaterialId(2));
-            }
-        }
+/// Loading replaces the world, the bodies and the joints, lets go of any grab,
+/// asks for a rebuild, and puts the camera where the scene starts it.
+fn scene_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut kind: ResMut<SceneKind>,
+    mut scene: ResMut<VoxelScene>,
+    mut joints: ResMut<Joints>,
+    mut grab: ResMut<GrabState>,
+    mut camera: Query<(&mut Transform, &mut FlyCamera), With<Camera3d>>,
+    mut windows: Query<&mut Window>,
+) {
+    let chosen = if keys.just_pressed(KeyCode::Digit1) {
+        SceneKind::Demo
+    } else if keys.just_pressed(KeyCode::Digit2) {
+        SceneKind::Joints
+    } else {
+        return;
+    };
+    let built = chosen.build();
+    if let Ok((mut transform, mut fly)) = camera.single_mut() {
+        transform.translation = built.eye;
+        let facing = FlyCamera::looking_at(built.eye, built.look_at);
+        fly.yaw = facing.yaw;
+        fly.pitch = facing.pitch;
     }
-    Body::new(dense.into_contree(), centre - orientation * Vec3::splat(8.0), orientation)
+    let field = DistanceField::build(&built.tree);
+    let generation = scene.generation + 1;
+    *scene = VoxelScene {
+        tree: built.tree,
+        materials: built.materials,
+        generation,
+        field,
+        field_dirty: None,
+        bodies: built.bodies,
+    };
+    joints.0 = built.joints;
+    grab.held = None;
+    *kind = chosen;
+    if let Ok(mut window) = windows.single_mut() {
+        window.title = title(&grab, chosen);
+    }
 }
 
 /// One physics tick for every body.
@@ -204,6 +226,7 @@ struct GrabState {
 fn toggle_grab_mode(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<GrabState>,
+    kind: Res<SceneKind>,
     mut windows: Query<&mut Window>,
 ) {
     if !keys.just_pressed(KeyCode::KeyG) {
@@ -212,13 +235,14 @@ fn toggle_grab_mode(
     state.enabled = !state.enabled;
     state.held = None;
     if let Ok(mut window) = windows.single_mut() {
-        window.title = title(&state);
+        window.title = title(&state, *kind);
     }
 }
 
-/// The window title, naming the tool in use.
-fn title(grab: &GrabState) -> String {
-    if grab.enabled { "BEVOX \u{2014} grab mode (G)".into() } else { "BEVOX".into() }
+/// The window title: the scene, and the tool in use.
+fn title(grab: &GrabState, scene: SceneKind) -> String {
+    let mode = if grab.enabled { ", grab mode (G)" } else { "" };
+    format!("BEVOX \u{2014} {} scene (1, 2){mode}", scene.name())
 }
 
 /// Every joint in the scene.
@@ -418,59 +442,10 @@ fn erase_and_detach(scene: &mut VoxelScene, centre: Vec3, radius: f32) {
     }
 }
 
-/// The same floor, column and carved sphere the parity test uses, so what is on
-/// screen is what the test proved correct, together with the palette it is
-/// drawn from.
-fn demo_scene() -> (Contree, MaterialTable) {
-    let mut dense = DenseVolume::new(64).unwrap();
-    for z in 0..64 {
-        for x in 0..64 {
-            for y in 0..6 {
-                dense.set(UVec3::new(x, y, z), MaterialId(1));
-            }
-        }
-    }
-    // A slippery strip and a bouncy patch in the floor's top layer, so a
-    // dropped body shows friction and restitution without any editing.
-    for z in 0..64 {
-        for x in 8..24 {
-            dense.set(UVec3::new(x, 5, z), MaterialId(3)); // ice
-        }
-    }
-    for z in 40..56 {
-        for x in 40..56 {
-            dense.set(UVec3::new(x, 5, z), MaterialId(4)); // rubber
-        }
-    }
-    for z in 28..36 {
-        for y in 6..26 {
-            for x in 28..36 {
-                dense.set(UVec3::new(x, y, z), MaterialId(2));
-            }
-        }
-    }
-    let mut tree = dense.into_contree();
-    tree.apply_sphere(Vec3::new(32.0, 18.0, 32.0), 5.0, MaterialId::EMPTY);
-
-    let mut materials = MaterialTable::new();
-    materials
-        .push(Material { color: [140, 140, 150, 255], density: 2600, friction: 60, restitution: 5 })
-        .unwrap(); // 1: stone
-    materials
-        .push(Material { color: [180, 90, 70, 255], density: 1900, friction: 70, restitution: 5 })
-        .unwrap(); // 2: brick
-    materials
-        .push(Material { color: [170, 210, 235, 255], density: 900, friction: 4, restitution: 10 })
-        .unwrap(); // 3: ice
-    materials
-        .push(Material { color: [40, 40, 45, 255], density: 1100, friction: 80, restitution: 80 })
-        .unwrap(); // 4: rubber
-    (tree, materials)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scenes::demo_scene;
 
     /// The demo floor has an ice strip and a rubber patch, so dropping bodies
     /// shows friction and bounce without editing anything.
@@ -542,6 +517,7 @@ mod tests {
     fn g_toggles_grab_mode() {
         let mut world = World::new();
         world.init_resource::<GrabState>();
+        world.init_resource::<SceneKind>();
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyG);
         world.insert_resource(keys);
@@ -588,6 +564,52 @@ mod tests {
         world.run_system(physics).unwrap();
         let v = world.resource::<VoxelScene>().bodies[0].velocity;
         assert!(v.x > 0.5, "the grab did not pull: {v:?}");
+    }
+
+    /// `2` loads the joint scene, and pressing it again resets it; `1` goes back
+    /// to the demo. Each load asks for a rebuild and lets go of any grab.
+    #[test]
+    fn number_keys_load_and_reset_scenes() {
+        let mut world = World::new();
+        let demo = scenes::demo();
+        let field = DistanceField::build(&demo.tree);
+        let held = Joint::grab(&demo.bodies[0], demo.bodies[0].position);
+        world.insert_resource(VoxelScene {
+            tree: demo.tree,
+            materials: demo.materials,
+            generation: 1,
+            field,
+            field_dirty: None,
+            bodies: demo.bodies,
+        });
+        world.insert_resource(GrabState { enabled: true, held: Some(held), distance: 10.0 });
+        world.init_resource::<Joints>();
+        world.init_resource::<SceneKind>();
+        let keys = world.register_system(scene_keys);
+        let press = |world: &mut World, key: KeyCode| {
+            let mut input = ButtonInput::<KeyCode>::default();
+            input.press(key);
+            world.insert_resource(input);
+            world.run_system(keys).unwrap();
+        };
+
+        press(&mut world, KeyCode::Digit2);
+        assert_eq!(world.resource::<VoxelScene>().bodies.len(), 12);
+        assert_eq!(world.resource::<VoxelScene>().generation, 2, "loading did not ask for a rebuild");
+        assert_eq!(world.resource::<Joints>().0.len(), 13);
+        assert!(world.resource::<GrabState>().held.is_none(), "a grab outlived its scene");
+        assert_eq!(*world.resource::<SceneKind>(), SceneKind::Joints);
+
+        let fresh = scenes::joints().bodies[0].position;
+        world.resource_mut::<VoxelScene>().bodies[0].position += Vec3::splat(5.0);
+        press(&mut world, KeyCode::Digit2);
+        assert_eq!(world.resource::<VoxelScene>().bodies[0].position, fresh, "2 did not reset");
+        assert_eq!(world.resource::<VoxelScene>().generation, 3);
+
+        press(&mut world, KeyCode::Digit1);
+        assert_eq!(world.resource::<VoxelScene>().bodies.len(), 1);
+        assert!(world.resource::<Joints>().0.is_empty());
+        assert_eq!(*world.resource::<SceneKind>(), SceneKind::Demo);
     }
 
     /// The system steps the scene's bodies, and a body leaving the world bumps
