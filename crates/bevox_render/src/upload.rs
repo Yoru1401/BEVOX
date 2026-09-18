@@ -89,6 +89,10 @@ pub mod march_flags {
     /// entry is read or the ray transformed. Read by the shader, unlike
     /// `CULL_BODIES`.
     pub const BODY_RECT: u32 = 64;
+    /// Shadow rays test every body as well as the static world, so bodies cast
+    /// shadows. Read by the shader. The bodies it tests are
+    /// `pipeline::shadow_casters`, never the culled table.
+    pub const BODY_SHADOWS: u32 = 128;
     /// What the app runs. Each optimisation joins this only once it has measured
     /// faster while staying bit-identical.
     ///

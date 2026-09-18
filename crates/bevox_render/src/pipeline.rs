@@ -75,6 +75,35 @@ pub fn marched_body_count(bodies: usize) -> u32 {
     bodies.min(MAX_BODIES) as u32
 }
 
+/// The bodies a shadow ray tests: every placed body, up to `MAX_BODIES`.
+///
+/// Never the culled table. The cull keeps what the camera can see, and a body
+/// just off screen can shadow what is on it: taken from the table, its shadow
+/// would pop in as the body came into view.
+pub fn shadow_casters(placed: &[GpuBody]) -> &[GpuBody] {
+    &placed[..placed.len().min(MAX_BODIES)]
+}
+
+/// Room for this many bodies in each half of the body buffer: the placed
+/// count, and at least one, because a zero-length storage buffer is invalid.
+pub fn body_room(placed: usize) -> usize {
+    placed.max(1)
+}
+
+/// What the body buffer holds: the marched table from index 0, padded to
+/// `room`, then the shadow casters from index `room`, padded to twice that.
+///
+/// One buffer, so shadows need no binding of their own. The uniform's
+/// `field_params.zw` say how many casters there are and where they start.
+pub fn body_buffer_contents(table: &[GpuBody], casters: &[GpuBody], room: usize) -> Vec<GpuBody> {
+    debug_assert!(table.len() <= room && casters.len() <= room);
+    let mut contents = table.to_vec();
+    contents.resize(room, GpuBody::default());
+    contents.extend_from_slice(casters);
+    contents.resize(2 * room, GpuBody::default());
+    contents
+}
+
 /// Entries to allocate for a scene currently using `high_water` of them.
 ///
 /// The headroom is what lets an edit allocate new nodes without forcing the
@@ -100,7 +129,8 @@ pub fn within_budget(
 }
 
 /// Bytes the scene's storage buffers would occupy at these capacities. A body
-/// is its table entry and its screen rectangle.
+/// is two table entries, one marched and one casting shadows, and its screen
+/// rectangle.
 pub fn budget_bytes(
     node_capacity: u32,
     voxel_word_capacity: u32,
@@ -113,8 +143,8 @@ pub fn budget_bytes(
         + u64::from(body_count) * BODY_BYTES
 }
 
-/// GPU bytes per body: its table entry and its screen rectangle.
-const BODY_BYTES: u64 = (size_of::<GpuBody>() + size_of::<GpuBodyRect>()) as u64;
+/// GPU bytes per body: its two table entries and its screen rectangle.
+const BODY_BYTES: u64 = (2 * size_of::<GpuBody>() + size_of::<GpuBodyRect>()) as u64;
 
 #[derive(Resource)]
 pub struct MarchPipeline {
@@ -175,10 +205,10 @@ pub fn can_reuse_buffers(
         })
 }
 
-/// This frame's uniform, the body table it marches and each body's screen
-/// rectangle: `camera` looking at `scene` through a target of `size`, with
-/// `placed` culled under `flags` and at most `MAX_BODIES` of what is left
-/// marched.
+/// This frame's uniform, the body table it marches, each body's screen
+/// rectangle and the shadow casters: `camera` looking at `scene` through a
+/// target of `size`, with `placed` culled under `flags` and at most
+/// `MAX_BODIES` of what is left marched. The casters are not culled.
 ///
 /// Returned together so the count, the table and the rectangles cannot come
 /// from different lists. The cull compacts the table; a count taken from
@@ -192,9 +222,10 @@ pub fn frame_uniform(
     placed: &[GpuBody],
     flags: u32,
     size: UVec2,
-) -> (MarchUniform, Vec<GpuBody>, Vec<GpuBodyRect>) {
+) -> (MarchUniform, Vec<GpuBody>, Vec<GpuBodyRect>, Vec<GpuBody>) {
     let (table, rects) =
         crate::cull::bodies_to_march(placed, &scene.body_local_bounds, camera, flags, size);
+    let casters = shadow_casters(placed).to_vec();
     let uniform = MarchUniform {
         offset_from_clip: camera.offset_from_clip.to_cols_array_2d(),
         camera_position: camera.position.extend(0.0).to_array(),
@@ -203,9 +234,14 @@ pub fn frame_uniform(
         // The cell size travels with the edge count rather than a matching
         // shader-side constant, so `march.wgsl` cannot silently disagree with
         // `bevox_core::distance_field::CELL_VOXELS` about how big a cell is.
-        field_params: [scene.field_edge, bevox_core::distance_field::CELL_VOXELS, 0, 0],
+        field_params: [
+            scene.field_edge,
+            bevox_core::distance_field::CELL_VOXELS,
+            casters.len() as u32,
+            body_room(placed.len()) as u32,
+        ],
     };
-    (uniform, table, rects)
+    (uniform, table, rects, casters)
 }
 
 pub fn init_march_pipeline(
@@ -312,12 +348,18 @@ pub fn prepare_march_buffers(
         // rectangles too, and even for a body that did not move: they follow
         // the camera.
         let placed = update.as_deref().map_or(&scene.bodies, |u| &u.bodies);
-        let (uniform_value, table, rects) =
+        let (uniform_value, table, rects, casters) =
             frame_uniform(&scene, &camera, placed, march_flags::DEFAULT, size);
         queue.write_buffer(&buffers.uniform, 0, bytemuck::bytes_of(&uniform_value));
         if !table.is_empty() {
             queue.write_buffer(&buffers.bodies, 0, bytemuck::cast_slice(&table));
             queue.write_buffer(&buffers.body_rects, 0, bytemuck::cast_slice(&rects));
+        }
+        // After the table's room, which is the room this buffer was built with:
+        // a change in the number of bodies bumps the generation and rebuilds.
+        if !casters.is_empty() {
+            let at = (body_room(placed.len()) * size_of::<GpuBody>()) as u64;
+            queue.write_buffer(&buffers.bodies, at, bytemuck::cast_slice(&casters));
         }
 
         if let Some(update) = update {
@@ -351,7 +393,7 @@ pub fn prepare_march_buffers(
     // this frame, and a later one may see more. A zero-length storage buffer is
     // invalid, so an empty body list still uploads room for one (zeroed)
     // GpuBody; the uniform's count stays at zero.
-    let body_capacity = scene.bodies.len().max(1) as u32;
+    let body_capacity = body_room(scene.bodies.len()) as u32;
     if !within_budget(node_capacity, voxel_word_capacity, field_words, body_capacity) {
         // Once, not every frame. The rejection returns without replacing the
         // buffers, so the condition holds again next frame and an `error!`
@@ -372,10 +414,14 @@ pub fn prepare_march_buffers(
     node_bytes.resize(node_capacity as usize * size_of::<GpuNode>(), 0);
     let mut voxel_bytes = bytemuck::cast_slice(&scene.voxels).to_vec();
     voxel_bytes.resize(voxel_word_capacity as usize * 4, 0);
-    let (uniform_value, table, rects) =
+    let (uniform_value, table, rects, casters) =
         frame_uniform(&scene, &camera, &scene.bodies, march_flags::DEFAULT, size);
-    let mut body_bytes = bytemuck::cast_slice(&table).to_vec();
-    body_bytes.resize(body_capacity as usize * size_of::<GpuBody>(), 0);
+    let body_bytes = bytemuck::cast_slice(&body_buffer_contents(
+        &table,
+        &casters,
+        body_capacity as usize,
+    ))
+    .to_vec();
     let mut rect_bytes = bytemuck::cast_slice(&rects).to_vec();
     rect_bytes.resize(body_capacity as usize * size_of::<GpuBodyRect>(), 0);
 
@@ -696,7 +742,7 @@ mod tests {
         let (camera, ahead, _, cube) = camera_and_bodies();
         let bodies = vec![ahead; MAX_BODIES + 1];
         let scene = GpuSceneData { body_local_bounds: vec![Some(cube); bodies.len()], ..default() };
-        let (uniform, table, _) =
+        let (uniform, table, _, _) =
             frame_uniform(&scene, &camera, &bodies, march_flags::DEFAULT, UVec2::new(160, 90));
         // Every body is in view, so whether or not `DEFAULT` culls, only the
         // cap can stop the count short of them all.
@@ -714,7 +760,7 @@ mod tests {
         let cull = march_flags::DEFAULT | march_flags::CULL_BODIES;
 
         let size = UVec2::new(160, 90);
-        let (uniform, table, rects) = frame_uniform(&scene, &camera, &[behind], cull, size);
+        let (uniform, table, rects, _) = frame_uniform(&scene, &camera, &[behind], cull, size);
         assert!(table.is_empty(), "a body behind the camera was kept");
         assert_eq!(uniform.volume_params[3], 0, "the count includes a body the cull removed");
         assert!(rects.is_empty(), "a rectangle was kept for a body the cull removed");
@@ -724,13 +770,42 @@ mod tests {
         // marched slot would go to a body the cull then drops, and nothing would
         // be drawn; capped after it, the cap's worth of bodies ahead are.
         let placed = [vec![behind; MAX_BODIES], vec![ahead; MAX_BODIES + 1]].concat();
-        let (uniform, table, rects) = frame_uniform(&scene, &camera, &placed, cull, size);
+        let (uniform, table, rects, _) = frame_uniform(&scene, &camera, &placed, cull, size);
         let kept = vec![ahead; MAX_BODIES + 1];
         assert_eq!(bytemuck::cast_slice::<GpuBody, u8>(&table), bytemuck::cast_slice::<GpuBody, u8>(&kept));
         let own =
             crate::cull::screen_rect(cube, &ahead, camera.offset_from_clip.inverse(), Vec3::ZERO, size);
         assert_eq!(rects, vec![own; MAX_BODIES + 1]);
         assert_eq!(uniform.volume_params[3], MAX_BODIES as u32);
+    }
+
+    /// Shadow rays need every body, not only the ones the camera sees: the
+    /// casters include bodies the cull dropped, stop at the cap, and start at
+    /// the table's room, which the uniform carries.
+    #[test]
+    fn the_shadow_casters_are_every_body_not_the_culled_table() {
+        let bytes = |b: &[GpuBody]| bytemuck::cast_slice::<GpuBody, u8>(b).to_vec();
+        let (camera, ahead, behind, cube) = camera_and_bodies();
+        let scene = GpuSceneData { body_local_bounds: vec![Some(cube); 2 * MAX_BODIES + 1], ..default() };
+        let cull = march_flags::DEFAULT | march_flags::CULL_BODIES;
+        let size = UVec2::new(160, 90);
+
+        let (uniform, table, _, casters) = frame_uniform(&scene, &camera, &[behind, ahead], cull, size);
+        assert_eq!(table.len(), 1, "the cull no longer drops the body behind the camera");
+        assert_eq!(bytes(&casters), bytes(&[behind, ahead]), "a body the cull dropped casts no shadow");
+        assert_eq!(uniform.field_params[2], 2);
+        assert_eq!(uniform.field_params[3], 2, "the casters do not start past the table's room");
+
+        let placed = vec![behind; 2 * MAX_BODIES + 1];
+        let (uniform, _, _, casters) = frame_uniform(&scene, &camera, &placed, cull, size);
+        assert_eq!(casters.len(), MAX_BODIES, "the casters are not capped");
+        assert_eq!(uniform.field_params[2], MAX_BODIES as u32);
+        assert_eq!(uniform.field_params[3], placed.len() as u32);
+
+        let contents = body_buffer_contents(&table, &casters, placed.len());
+        assert_eq!(contents.len(), 2 * placed.len());
+        assert_eq!(bytes(&contents[..1]), bytes(&table));
+        assert_eq!(bytes(&contents[placed.len()..placed.len() + MAX_BODIES]), bytes(&casters));
     }
 
     #[test]

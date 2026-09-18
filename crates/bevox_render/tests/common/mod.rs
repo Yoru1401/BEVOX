@@ -299,6 +299,10 @@ impl Prepared {
             flags,
             glam::UVec2::new(texture.width(), texture.height()),
         );
+        // The shadow casters are every body, laid out after the table's room,
+        // as the app lays them out.
+        let casters = bevox_render::pipeline::shadow_casters(&packed.bodies);
+        let room = bevox_render::pipeline::body_room(packed.bodies.len());
         let uniform = TestUniform {
             offset_from_clip: offset_from_clip.to_cols_array_2d(),
             camera_position: eye.extend(0.0).to_array(),
@@ -310,7 +314,12 @@ impl Prepared {
             // The cell size travels in the uniform rather than a matching
             // shader-side constant, so the shader cannot silently disagree
             // with `bevox_core::distance_field::CELL_VOXELS`.
-            field_params: [field.edge(), bevox_core::distance_field::CELL_VOXELS, 0, 0],
+            field_params: [
+                field.edge(),
+                bevox_core::distance_field::CELL_VOXELS,
+                casters.len() as u32,
+                room as u32,
+            ],
         };
 
         // Root first, arena shifted by one: the layout the shader indexes.
@@ -380,11 +389,10 @@ impl Prepared {
         // invalid, so a body-free scene still uploads room for one zeroed
         // GpuBody; the uniform's count, not the buffer length, is what the
         // shader loop actually reads.
-        let mut body_bytes: Vec<u8> = bytemuck::cast_slice(&table).to_vec();
-        body_bytes.resize(
-            packed.bodies.len().max(1) * size_of::<bevox_render::upload::GpuBody>(),
-            0,
-        );
+        let body_bytes: Vec<u8> = bytemuck::cast_slice(
+            &bevox_render::pipeline::body_buffer_contents(&table, casters, room),
+        )
+        .to_vec();
         let body_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bodies"),
             contents: &body_bytes,
