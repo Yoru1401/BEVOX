@@ -300,7 +300,11 @@ correctness are checked by deliberately breaking the code they guard.
 | 3 | Friction and restitution per material; body against body | Bodies slide, bounce and pile |
 | 4 | Detachment from the world, and brush editing of bodies with splitting | The thing this was for |
 | 5 | Mouse grab: a damped spring from the cursor to the clicked point | Bodies can be picked up |
-| 6 | Joints | Hinges, ragdolls and machines |
+| 6 | Ball and hinge joints, made with a tool in the app | Hinges, chains, hanging things |
+
+Still to do, as Flori flagged: **bodies cast no shadows** (see Rendering).
+Shadow rays must compose bodies without the frustum cull and the screen
+rectangle, because a body just off screen can shadow what is on it.
 
 Deferred until a measurement asks for them: sleeping, merging settled debris
 back into the terrain, fracture on hard impacts, and multithreading. Dwyer's

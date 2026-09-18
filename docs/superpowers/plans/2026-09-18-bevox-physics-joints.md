@@ -497,6 +497,25 @@ Restore each.
 
 ---
 
+## What changed during execution
+
+- **Joints are undamped, so the "settles" gates were wrong as planned.** A body
+  pinned by its corner is a frictionless pendulum and never stops, and neither
+  does a knocked chain. The gates now check what must hold instead: a joint
+  stays shut the whole time, and total energy never grows, which is how an
+  unstable solver shows itself. A body hung from its centre top, already in
+  equilibrium, must stay put.
+- **Solving the ball constraint one axis at a time passes every gate too.**
+  The substeps correct what one pass misses. The full 3x3 solve is kept, as the
+  correct formulation at the same cost, and the source says the gates cannot
+  tell the two apart.
+- **Two gates were blind and were rebuilt.**
+  - Two deeply overlapping jointed cubes never collided anyway, because each
+    one's corners sat in the other's interior, where no contact is made. The
+    gate uses a shallow overlap.
+  - Nothing checked that `follow` refuses an unrelated body that happens to
+    hold a voxel at the same coordinates. A second cube elsewhere now does.
+
 ## Milestone check
 
 A body pinned by its corner hangs below the pivot. A three-link chain hangs together and comes to rest. A hinged door turns only about its axis and does not tip. Joints conserve momentum. Jointed bodies do not fight each other. A joint follows its pivot across a split and goes with its pivot.
