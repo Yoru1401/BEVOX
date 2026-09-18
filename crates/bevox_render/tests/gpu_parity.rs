@@ -92,8 +92,9 @@ fn run_march(
 }
 
 /// Renders one frame with the given bodies packed after the static world, with
-/// body composition on. Mirrors `run_march_flagged`, but the flag the loop
-/// needs is nonnegotiable, so callers only choose geometry and entry point.
+/// body composition and body shadows on. Mirrors `run_march_flagged`, but the
+/// flags the loops need are nonnegotiable, so callers only choose geometry and
+/// entry point.
 #[allow(clippy::too_many_arguments)]
 fn run_bodies(
     device: &wgpu::Device,
@@ -109,7 +110,7 @@ fn run_bodies(
 ) -> Vec<u8> {
     Prepared::new(
         device, source, entry_point, world, offset_from_clip, eye, width, height,
-        march_flags::DEFAULT | march_flags::BODIES, bodies,
+        march_flags::DEFAULT | march_flags::BODIES | march_flags::BODY_SHADOWS, bodies,
     )
     .read_back(device, queue)
 }
@@ -1176,11 +1177,13 @@ fn a_scene_with_no_bodies_is_bit_identical_with_bodies_enabled() {
             &device, &queue, &shader, entry, offset_from_clip, eye, &tree, width,
             height, march_flags::DEFAULT & !march_flags::BODIES,
         );
-        // With the rectangles on too: the loop runs zero times, and the
-        // rectangle buffer is one zeroed entry nothing reads.
+        // With the rectangles and body shadows on too: both loops run zero
+        // times, and the buffers they would read are zeroed entries.
         let with = run_march_flagged(
             &device, &queue, &shader, entry, offset_from_clip, eye, &tree, width,
-            height, march_flags::DEFAULT | march_flags::BODIES | march_flags::BODY_RECT,
+            height,
+            march_flags::DEFAULT | march_flags::BODIES | march_flags::BODY_RECT
+                | march_flags::BODY_SHADOWS,
         );
         let differing = without.chunks(4).zip(with.chunks(4)).filter(|(a, b)| a != b).count();
         assert_eq!(
@@ -1373,14 +1376,11 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
                         body_pixels += 1;
                         // The CPU hit's face normal is in the body's frame.
                         let n = orientation * hit.face_normal;
-                        // Bodies cast no shadows, so the reference marches the
-                        // static world only, from the world-space hit point
-                        // lifted 0.25 off the surface.
+                        // From the world-space hit point lifted 0.25 off the
+                        // surface, toward the static world and the body itself:
+                        // a face turned from the sun is shadowed by its own body.
                         let origin = eye + dir * hit.t + n * 0.25;
-                        let cpu_shadowed = march(
-                            &world, Affine3A::IDENTITY, origin, sun, 500.0, true, &mut stats,
-                        )
-                        .is_some();
+                        let cpu_shadowed = cpu_shadowed(&world, std::slice::from_ref(&body), origin, sun, &mut stats);
                         (Some(n), cpu_shadowed, shadows[i] > 127)
                     }
                 };
@@ -1443,6 +1443,211 @@ fn cpu_composed(
     match body.march_world(eye, dir, 1000.0, stats) {
         Some(b) if static_hit.is_none_or(|s| b.t < s.t) => Some((b, true)),
         _ => static_hit.map(|s| (s, false)),
+    }
+}
+
+/// Whether the ray toward the sun from `origin` is blocked, as `shadowed` in the
+/// shader decides it: the static world, then every body.
+fn cpu_shadowed(world: &Contree, bodies: &[Body], origin: Vec3, sun: Vec3, stats: &mut MarchStats) -> bool {
+    march(world, Affine3A::IDENTITY, origin, sun, 500.0, true, stats).is_some()
+        || bodies.iter().any(|b| b.march_world(origin, sun, 1000.0, stats).is_some())
+}
+
+/// The nearest of the static world's hit and every body's, and which body won,
+/// if one did. A body must be strictly nearer, as in `compose_bodies`.
+fn cpu_composed_all(
+    world: &Contree,
+    bodies: &[Body],
+    eye: Vec3,
+    dir: Vec3,
+    stats: &mut MarchStats,
+) -> Option<(bevox_core::march::Hit, Option<usize>)> {
+    let mut best = march(world, Affine3A::IDENTITY, eye, dir, 1000.0, false, stats).map(|h| (h, None));
+    for (i, body) in bodies.iter().enumerate() {
+        if let Some(h) = body.march_world(eye, dir, 1000.0, stats)
+            && best.as_ref().is_none_or(|(b, _)| h.t < b.t)
+        {
+            best = Some((h, Some(i)));
+        }
+    }
+    best
+}
+
+/// An L in a 64 volume: a slab, and a wall standing on its +X edge. With the sun
+/// toward +X, the wall shadows the slab's top: a body shadowing itself on a
+/// face turned toward the sun.
+fn l_body() -> Contree {
+    let mut dense = DenseVolume::new(64).unwrap();
+    for z in 20..44 {
+        for x in 20..44 {
+            for y in 20..28 {
+                dense.set(UVec3::new(x, y, z), MaterialId(1));
+            }
+        }
+        for x in 36..44 {
+            for y in 28..44 {
+                dense.set(UVec3::new(x, y, z), MaterialId(1));
+            }
+        }
+    }
+    dense.into_contree()
+}
+
+/// Bodies cast shadows on the world, on each other and on themselves, and the
+/// GPU agrees with the CPU on every pixel.
+///
+/// A turned L floats over a cube, which stands over the floor. The reference
+/// marches, from the same origin as the shader, the static world and then every
+/// body. Each kind of shadow must actually occur, or the agreement proves
+/// nothing: floor shadowed only by a body, one body shadowed by the other, and
+/// the L shadowed by its own wall on a face turned toward the sun.
+#[test]
+fn bodies_cast_shadows_that_match_the_cpu() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (width, height) = (128u32, 128u32);
+    // From the side the shadows fall toward, -X -Z, so they are not hidden
+    // behind the bodies that cast them.
+    let eye = Vec3::new(40.0, 160.0, 50.0);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(100.0, 20.0, 100.0) - eye, Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+    let offset_from_clip = (projection * view).inverse();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let world = body_world(&[]);
+    let sun = bevox_render::upload::SUN_DIRECTION.normalize();
+
+    let turn = Quat::from_rotation_y(0.3);
+    let l = Body::new(l_body(), Vec3::new(112.0, 60.0, 112.0) - turn * Vec3::splat(32.0), turn);
+    // Under the L, where its shadow falls: the cube spans 25..41 of its volume.
+    let cube = Body::new(body_cube(), Vec3::new(104.0, 20.0, 106.0) - Vec3::splat(33.0), Quat::IDENTITY);
+    let bodies = [l, cube];
+
+    let pixels = run_bodies(
+        &device, &queue, &shader, "march_shadow", offset_from_clip, eye, &world, &bodies, width, height,
+    );
+
+    let mut stats = MarchStats::default();
+    let (mut floor_by_body, mut by_other, mut by_itself, mut mismatches) = (0usize, 0usize, 0usize, 0usize);
+    let mut first = String::new();
+    for y in 0..height {
+        for x in 0..width {
+            let dir = ray_direction(offset_from_clip, x, y, width, height);
+            let i = ((y * width + x) * 4) as usize;
+            let (gpu_hit, gpu_shadowed) = (pixels[i + 3] > 0, pixels[i] > 127);
+            let Some((hit, owner)) = cpu_composed_all(&world, &bodies, eye, dir, &mut stats) else {
+                if gpu_hit {
+                    mismatches += 1;
+                }
+                continue;
+            };
+            let (origin, normal) = match owner {
+                None => (hit.voxel.as_vec3() + Vec3::splat(0.5) + hit.face_normal * 0.75, hit.face_normal),
+                Some(k) => {
+                    let n = bodies[k].orientation * hit.face_normal;
+                    (eye + dir * hit.t + n * 0.25, n)
+                }
+            };
+            let expected = cpu_shadowed(&world, &bodies, origin, sun, &mut stats);
+            let by_world = march(&world, Affine3A::IDENTITY, origin, sun, 500.0, true, &mut stats).is_some();
+            let blockers: Vec<usize> = (0..bodies.len())
+                .filter(|&j| bodies[j].march_world(origin, sun, 1000.0, &mut stats).is_some())
+                .collect();
+            match owner {
+                None if !by_world && !blockers.is_empty() => floor_by_body += 1,
+                Some(k) if blockers.iter().any(|&j| j != k) => by_other += 1,
+                Some(k) if blockers.contains(&k) && normal.dot(sun) > 0.0 && !by_world => by_itself += 1,
+                _ => {}
+            }
+            if !gpu_hit || gpu_shadowed != expected {
+                if mismatches == 0 {
+                    first = format!("at ({x},{y}) owner={owner:?} cpu={expected} gpu_hit={gpu_hit} gpu={gpu_shadowed}");
+                }
+                mismatches += 1;
+            }
+        }
+    }
+    eprintln!("{floor_by_body} floor pixels shadowed by a body, {by_other} by the other body, {by_itself} by itself; {mismatches} mismatches");
+    assert!(floor_by_body > 100, "only {floor_by_body} floor pixels are shadowed by a body; the test is vacuous");
+    assert!(by_other > 20, "only {by_other} pixels of one body are shadowed by the other");
+    assert!(by_itself > 20, "only {by_itself} sunward pixels of a body are shadowed by itself");
+    assert_eq!(mismatches, 0, "{mismatches} pixels disagreed; first {first}");
+}
+
+/// The camera and body for the off-screen caster tests: a cube high above and
+/// behind the camera's view, whose shadow lands on the floor in the middle of
+/// it.
+fn off_screen_caster() -> (Vec3, Mat4, Body) {
+    let eye = Vec3::new(100.0, 40.0, 140.0);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(100.0, 0.0, 100.0) - eye, Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+    let offset_from_clip = (projection * view).inverse();
+    // A hundred voxels up the sun's direction from the floor the camera faces.
+    let above = Vec3::new(100.0, 3.0, 100.0) + bevox_render::upload::SUN_DIRECTION.normalize() * 100.0;
+    let body = Body::new(body_cube(), above - Vec3::splat(33.0), Quat::IDENTITY);
+    (eye, offset_from_clip, body)
+}
+
+/// A body the camera cannot see still shadows what it can.
+///
+/// The cull must drop the body, or this tests nothing; then more of the floor
+/// is shadowed with the body than without it.
+#[test]
+fn an_off_screen_body_shadows_what_is_on_screen() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (width, height) = (96u32, 96u32);
+    let (eye, offset_from_clip, body) = off_screen_caster();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let world = body_world(&[]);
+    let flags = march_flags::DEFAULT | march_flags::BODIES | march_flags::CULL_BODIES | march_flags::BODY_SHADOWS;
+
+    let packed = bevox_render::upload::pack_bodies(&world, std::slice::from_ref(&body));
+    let (table, _) = bevox_render::cull::bodies_to_march(
+        &packed.bodies,
+        &packed.body_local_bounds,
+        &bevox_render::upload::ExtractedMarchCamera { offset_from_clip, position: eye },
+        flags,
+        glam::UVec2::new(width, height),
+    );
+    assert!(table.is_empty(), "the cull keeps the body, so it is not off screen and this proves nothing");
+
+    let shadowed = |bodies: &[Body]| {
+        let pixels = Prepared::new(
+            &device, &shader, "march_shadow", &world, offset_from_clip, eye, width, height, flags, bodies,
+        )
+        .read_back(&device, &queue);
+        pixels.chunks(4).filter(|p| p[3] > 0 && p[0] > 127).count()
+    };
+    let (without, with) = (shadowed(&[]), shadowed(std::slice::from_ref(&body)));
+    eprintln!("{without} pixels shadowed without the body, {with} with it");
+    assert!(with > without + 50, "an off-screen body shadowed only {} more pixels", with - without);
+}
+
+/// With body shadows off, a body casts nothing: the off-screen caster's scene
+/// renders exactly as the scene without it, on every entry point that shades.
+#[test]
+fn body_shadows_off_leave_the_image_as_with_no_caster() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (width, height) = (96u32, 96u32);
+    let (eye, offset_from_clip, body) = off_screen_caster();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let world = body_world(&[]);
+    let flags = (march_flags::DEFAULT | march_flags::BODIES | march_flags::CULL_BODIES) & !march_flags::BODY_SHADOWS;
+    for entry in ["march_shadow", "march"] {
+        let render = |bodies: &[Body]| {
+            Prepared::new(&device, &shader, entry, &world, offset_from_clip, eye, width, height, flags, bodies)
+                .read_back(&device, &queue)
+        };
+        let (without, with) = (render(&[]), render(std::slice::from_ref(&body)));
+        let differing = without.chunks(4).zip(with.chunks(4)).filter(|(a, b)| a != b).count();
+        assert_eq!(differing, 0, "{entry}: with body shadows off, a body changed {differing} pixels");
     }
 }
 
@@ -1594,8 +1799,8 @@ fn culling_bodies_outside_the_view_leaves_output_bit_identical() {
         place(Vec3::new(edge + 40.0, 0.0, d)),
         place(Vec3::new(0.0, 0.0, -40.0)),
     ];
-    let cull = march_flags::DEFAULT | march_flags::CULL_BODIES;
-    let no_cull = march_flags::DEFAULT & !march_flags::CULL_BODIES;
+    let cull = march_flags::DEFAULT | march_flags::CULL_BODIES | march_flags::BODY_SHADOWS;
+    let no_cull = (march_flags::DEFAULT & !march_flags::CULL_BODIES) | march_flags::BODY_SHADOWS;
 
     let packed = bevox_render::upload::pack_bodies(&world, &bodies);
     let camera = bevox_render::upload::ExtractedMarchCamera { offset_from_clip, position: eye };

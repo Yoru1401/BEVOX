@@ -11,7 +11,8 @@ struct MarchUniform {
     camera_position: vec4<f32>,
     sun_direction: vec4<f32>,
     volume_params: vec4<u32>,  // [depth, extent, flags, 0]
-    field_params: vec4<u32>,  // [field_edge, field_cell_size, 0, 0]
+    // [field_edge, field_cell_size, shadow caster count, where the casters start]
+    field_params: vec4<u32>,
 };
 
 // Traversal optimisations, matching bevox_render::upload::march_flags. One
@@ -23,6 +24,7 @@ const FLAG_BEAM: u32 = 4u;
 const FLAG_DISTANCE_FIELD: u32 = 8u;
 const FLAG_BODIES: u32 = 16u;
 const FLAG_BODY_RECT: u32 = 64u;
+const FLAG_BODY_SHADOWS: u32 = 128u;
 
 @group(0) @binding(0) var<uniform> view: MarchUniform;
 @group(0) @binding(1) var<storage, read> nodes: array<vec4<u32>>;
@@ -846,6 +848,34 @@ fn traverse_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
     return traverse(origin, dir, t_seed, max_dist).hit;
 }
 
+/// Whether the ray toward the sun from `origin` is blocked: by the static world,
+/// or, with FLAG_BODY_SHADOWS, by any body.
+///
+/// Every body up to the cap, from the shadow casters after the table's room,
+/// never from the culled table: a body just off screen can shadow what is on it.
+/// No screen rectangle either, for the same reason. From t = 0, as
+/// `compose_bodies` marches: the beam seed and the distance field know nothing
+/// of bodies. The first hit ends it, since which body blocks does not matter.
+fn shadowed(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
+    if traverse_any(origin, dir, max_dist) {
+        return true;
+    }
+    if !flag_enabled(FLAG_BODY_SHADOWS) {
+        return false;
+    }
+    let count = view.field_params.z;
+    let start = view.field_params.w;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let b = bodies[start + i];
+        let local_origin = (b.local_from_world * vec4<f32>(origin, 1.0)).xyz;
+        let local_dir = (b.local_from_world * vec4<f32>(dir, 0.0)).xyz;
+        if traverse_at(local_origin, local_dir, 0.0, max_dist, b.node_base, b.voxel_base, b.depth, b.extent).hit {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn beam_dims(size: vec2<u32>) -> vec2<u32> {
     return max((size + vec2<u32>(BEAM_SCALE - 1u)) / BEAM_SCALE, vec2<u32>(1u));
 }
@@ -968,11 +998,11 @@ fn march_shadow(@builtin(global_invocation_id) id: vec3<u32>) {
     var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if hit.hit {
         let origin = shadow_origin(hit, id, size);
-        var shadowed = 0.0;
-        if traverse_any(origin, view.sun_direction.xyz, max_ray_distance()) {
-            shadowed = 1.0;
+        var flag = 0.0;
+        if shadowed(origin, view.sun_direction.xyz, max_ray_distance()) {
+            flag = 1.0;
         }
-        colour = vec4<f32>(shadowed, 0.0, 0.0, 1.0);
+        colour = vec4<f32>(flag, 0.0, 0.0, 1.0);
     }
     textureStore(output, vec2<i32>(id.xy), colour);
 }
@@ -1044,10 +1074,9 @@ fn march(@builtin(global_invocation_id) id: vec3<u32>) {
         let n = shading_normal(hit);
         let sun = view.sun_direction.xyz;
 
-        // Bodies cast no shadows yet: traverse_any marches the static world only.
         let origin = shadow_origin(hit, id, size);
         var diffuse = max(dot(n, sun), 0.0) * 0.75;
-        if traverse_any(origin, sun, max_ray_distance()) {
+        if shadowed(origin, sun, max_ray_distance()) {
             diffuse = 0.0;
         }
 
