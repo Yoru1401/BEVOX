@@ -4,6 +4,7 @@
 //! to a frame of them, and it avoids a GPU readback with its latency and its
 //! second copy of the traversal to keep in agreement.
 
+use bevox_core::body::Body;
 use bevox_core::contree::Contree;
 use bevox_core::march::{MarchStats, march};
 use glam::{Affine3A, Mat4, UVec3, Vec2, Vec3};
@@ -18,29 +19,80 @@ pub struct Pick {
     pub normal: Vec3,
 }
 
-/// The voxel under a point in normalised device coordinates.
+/// The ray through a point in normalised device coordinates.
 ///
 /// `ndc` is -1 to 1 on each axis, y up, matching what the shader's `primary_ray`
-/// builds from a pixel — so a pick agrees with what was drawn there.
+/// builds from a pixel, so a pick agrees with what was drawn there.
+fn ray(world_from_clip: Mat4, eye: Vec3, ndc: Vec2) -> Vec3 {
+    let far = world_from_clip * glam::Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
+    (far.truncate() / far.w - eye).normalize()
+}
+
+/// How far a pick looks: far enough to cross the whole world from outside it.
+fn reach(tree: &Contree) -> f32 {
+    (tree.extent() as f32 * 8.0).max(1000.0)
+}
+
+/// The voxel of the world under a point in normalised device coordinates.
 pub fn pick_voxel(
     tree: &Contree,
     world_from_clip: Mat4,
     eye: Vec3,
     ndc: Vec2,
 ) -> Option<Pick> {
-    let far = world_from_clip * glam::Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
-    let dir = (far.truncate() / far.w - eye).normalize();
-
-    // Generous: the ray has to cross the whole volume from outside it.
-    let max_dist = (tree.extent() as f32 * 8.0).max(1000.0);
+    let dir = ray(world_from_clip, eye, ndc);
     let mut stats = MarchStats::default();
-    let hit = march(tree, Affine3A::IDENTITY, eye, dir, max_dist, false, &mut stats)?;
+    let hit = march(tree, Affine3A::IDENTITY, eye, dir, reach(tree), false, &mut stats)?;
 
     Some(Pick {
         voxel: hit.voxel,
         position: eye + dir * hit.t,
         normal: hit.face_normal,
     })
+}
+
+/// What a pick landed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    World,
+    /// The body at this index of the scene's list.
+    Body(usize),
+}
+
+/// Where a ray through the screen met the world or a body.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hit {
+    pub target: Target,
+    /// The point on the surface, in world space.
+    pub position: Vec3,
+    /// The face the ray entered through, in world space.
+    pub normal: Vec3,
+}
+
+/// Whatever is under a point on screen: the nearest of the world and every body.
+///
+/// A body's march answers in the body's own frame for its normal, and in world
+/// distance for `t`, which the rigid transform preserves, so hits compare
+/// directly and the normal needs only the body's rotation.
+pub fn pick(
+    tree: &Contree,
+    bodies: &[Body],
+    world_from_clip: Mat4,
+    eye: Vec3,
+    ndc: Vec2,
+) -> Option<Hit> {
+    let dir = ray(world_from_clip, eye, ndc);
+    let max = reach(tree);
+    let mut stats = MarchStats::default();
+    let mut best = march(tree, Affine3A::IDENTITY, eye, dir, max, false, &mut stats)
+        .map(|h| (h.t, Target::World, h.face_normal));
+    for (i, body) in bodies.iter().enumerate() {
+        let Some(h) = body.march_world(eye, dir, max, &mut stats) else { continue };
+        if best.is_none_or(|(t, _, _)| h.t < t) {
+            best = Some((h.t, Target::Body(i), body.orientation * h.face_normal));
+        }
+    }
+    best.map(|(t, target, normal)| Hit { target, position: eye + dir * t, normal })
 }
 
 #[cfg(test)]
@@ -171,5 +223,35 @@ mod tests {
         let centre = pick_voxel(&tree, world_from_clip, eye, Vec2::ZERO).unwrap();
         let offset = pick_voxel(&tree, world_from_clip, eye, Vec2::new(0.1, 0.0)).unwrap();
         assert_ne!(centre.voxel, offset.voxel);
+    }
+
+    /// A body in front of the world is what the cursor is on, and its normal
+    /// comes back in world space, facing the eye.
+    #[test]
+    fn a_body_in_front_of_the_world_is_picked() {
+        let tree = block_scene();
+        let eye = Vec3::new(32.0, 32.0, -20.0);
+        let world_from_clip = camera(eye, Vec3::splat(32.0));
+        let solid: Vec<_> = (0..64u32)
+            .map(|i| (UVec3::new(i % 4, (i / 4) % 4, i / 16), MaterialId(2)))
+            .collect();
+        let turned = glam::Quat::from_rotation_y(0.6);
+        let body = Body::new(Contree::from_voxels(4, &solid), Vec3::new(30.0, 30.0, 5.0), turned);
+
+        let hit = pick(&tree, std::slice::from_ref(&body), world_from_clip, eye, Vec2::ZERO).unwrap();
+        assert_eq!(hit.target, Target::Body(0));
+        assert!(hit.position.z < 10.0, "hit {:?}, behind the body", hit.position);
+        assert!((hit.normal.length() - 1.0).abs() < 1e-4);
+        assert!(hit.normal.dot(eye - hit.position) > 0.0, "the normal faces away from the eye");
+        assert!(
+            (hit.normal - turned * -Vec3::Z).length() < 1e-4
+                || (hit.normal - turned * -Vec3::X).length() < 1e-4,
+            "the normal {:?} is not one of the turned body's faces",
+            hit.normal
+        );
+
+        let empty = Body::new(Contree::empty(1), Vec3::new(30.0, 30.0, 5.0), turned);
+        let hit = pick(&tree, std::slice::from_ref(&empty), world_from_clip, eye, Vec2::ZERO).unwrap();
+        assert_eq!(hit.target, Target::World);
     }
 }
