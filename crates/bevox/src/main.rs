@@ -1,17 +1,17 @@
 use bevy::prelude::*;
-use bevox_core::body::{Body, BodyId};
+use bevox_core::body::Body;
 use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
 use bevox_core::distance_field::DistanceField;
 use bevox_core::material::{Material, MaterialId, MaterialTable};
 use bevox_core::physics::GRAVITY;
 use bevox_core::physics::detach::detach;
-use bevox_core::physics::joint::{Joint, JointKind, follow};
+use bevox_core::physics::joint::{Joint, follow};
 use bevox_core::physics::sculpt::sculpt;
 use bevox_core::physics::solver::{Grab, step};
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system, start_camera};
-use bevox_render::pick::{Hit, Target, cursor_ray, pick};
+use bevox_render::pick::{Target, cursor_ray, pick};
 use bevox_render::pipeline::MAX_BODIES;
 use bevox_render::upload::{VoxelScene, apply_brush, build_gpu_scene};
 
@@ -47,7 +47,6 @@ fn main() {
         .add_plugins(BevoxRenderPlugin)
         .init_resource::<BrushSettings>()
         .init_resource::<GrabState>()
-        .init_resource::<JointState>()
         .init_resource::<Joints>()
         .add_systems(Startup, setup)
         // Before the rebuild too, not merely before staging. On a frame that
@@ -56,8 +55,6 @@ fn main() {
         // the render world discards in favour of the snapshot -- which was
         // taken before that stroke. It is then lost until the next rebuild.
         .add_systems(Update, toggle_grab_mode.before(brush_input).before(grab_input))
-        .add_systems(Update, toggle_joint_mode.after(toggle_grab_mode).before(joint_input))
-        .add_systems(Update, joint_input.after(fly_camera_system))
         .add_systems(Update, brush_input.after(fly_camera_system).before(build_gpu_scene))
         .add_systems(Update, grab_input.after(fly_camera_system))
         // Fixed timestep: physics must not depend on the frame rate. Bevy runs
@@ -207,7 +204,6 @@ struct GrabState {
 fn toggle_grab_mode(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<GrabState>,
-    mut joint: ResMut<JointState>,
     mut windows: Query<&mut Window>,
 ) {
     if !keys.just_pressed(KeyCode::KeyG) {
@@ -215,131 +211,19 @@ fn toggle_grab_mode(
     }
     state.enabled = !state.enabled;
     state.held = None;
-    if state.enabled {
-        joint.enabled = false;
-        joint.pending = None;
-    }
     if let Ok(mut window) = windows.single_mut() {
-        window.title = title(&state, &joint);
+        window.title = title(&state);
     }
 }
 
 /// The window title, naming the tool in use.
-fn title(grab: &GrabState, joint: &JointState) -> String {
-    if grab.enabled {
-        "BEVOX \u{2014} grab mode (G)".into()
-    } else if joint.enabled {
-        let kind = match joint.kind {
-            JointKind::Ball => "ball",
-            JointKind::Hinge => "hinge",
-        };
-        format!("BEVOX \u{2014} joint mode: {kind} (J; H switches)")
-    } else {
-        "BEVOX".into()
-    }
+fn title(grab: &GrabState) -> String {
+    if grab.enabled { "BEVOX \u{2014} grab mode (G)".into() } else { "BEVOX".into() }
 }
 
 /// Every joint in the scene.
 #[derive(Resource, Default)]
 struct Joints(Vec<Joint>);
-
-/// The joint tool: whether the left mouse makes joints, which kind, and the
-/// first click of a joint still waiting for its second: the body, the pivot,
-/// and the hinge axis.
-#[derive(Resource)]
-struct JointState {
-    enabled: bool,
-    kind: JointKind,
-    pending: Option<(BodyId, Vec3, Vec3)>,
-}
-
-impl Default for JointState {
-    fn default() -> Self {
-        Self { enabled: false, kind: JointKind::Ball, pending: None }
-    }
-}
-
-/// `J` switches joint mode on and off, turning grab mode off; `H`, in joint
-/// mode, switches between ball and hinge.
-fn toggle_joint_mode(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut state: ResMut<JointState>,
-    mut grab: ResMut<GrabState>,
-    mut windows: Query<&mut Window>,
-) {
-    let mut changed = false;
-    if keys.just_pressed(KeyCode::KeyJ) {
-        state.enabled = !state.enabled;
-        state.pending = None;
-        if state.enabled {
-            grab.enabled = false;
-            grab.held = None;
-        }
-        changed = true;
-    }
-    if state.enabled && keys.just_pressed(KeyCode::KeyH) {
-        state.kind = match state.kind {
-            JointKind::Ball => JointKind::Hinge,
-            JointKind::Hinge => JointKind::Ball,
-        };
-        changed = true;
-    }
-    if changed && let Ok(mut window) = windows.single_mut() {
-        window.title = title(&grab, &state);
-    }
-}
-
-/// One click of the joint tool.
-///
-/// The first, on a body, sets the pivot just inside the clicked face, and for a
-/// hinge takes the face's normal as the axis. The second fastens that pivot to
-/// what was clicked, a body or the world, wherever it is: nothing moves. A
-/// second click on the same body cancels.
-fn joint_click(state: &mut JointState, joints: &mut Joints, bodies: &[Body], hit: Hit) {
-    let Some((first, pivot, axis)) = state.pending else {
-        if let Target::Body(i) = hit.target {
-            state.pending = Some((bodies[i].id, hit.position - hit.normal * 0.01, hit.normal));
-        }
-        return;
-    };
-    state.pending = None;
-    let Some(a) = bodies.iter().find(|b| b.id == first) else {
-        return;
-    };
-    let b = match hit.target {
-        Target::World => None,
-        Target::Body(i) if bodies[i].id == first => return,
-        Target::Body(i) => Some(&bodies[i]),
-    };
-    joints.0.push(Joint::new(state.kind, a, b, pivot, axis));
-}
-
-/// In joint mode, a left click picks what is under the cursor and makes the
-/// next click of a joint.
-fn joint_input(
-    buttons: Res<ButtonInput<MouseButton>>,
-    mut state: ResMut<JointState>,
-    mut joints: ResMut<Joints>,
-    scene: Res<VoxelScene>,
-    camera: Query<(&GlobalTransform, &Projection), With<Camera3d>>,
-    windows: Query<&Window>,
-) {
-    if !state.enabled || !buttons.just_pressed(MouseButton::Left) {
-        return;
-    }
-    let (Ok((transform, projection)), Ok(window)) = (camera.single(), windows.single()) else {
-        return;
-    };
-    let Some(ndc) = cursor_ndc(window) else {
-        return;
-    };
-    let eye = transform.translation();
-    let world_from_clip =
-        (projection.get_clip_from_view() * transform.to_matrix().inverse()).inverse();
-    if let Some(hit) = pick(&scene.tree, &scene.bodies, world_from_clip, eye, ndc) {
-        joint_click(&mut state, &mut joints, &scene.bodies, hit);
-    }
-}
 
 /// In grab mode, holding the left mouse on a body picks it up: a spring pulls
 /// the clicked point toward a point on the cursor's ray, as far away as it was
@@ -446,7 +330,6 @@ fn brush_input(
     mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
     mut brush: ResMut<BrushSettings>,
     grab: Res<GrabState>,
-    joint: Res<JointState>,
     mut scene: ResMut<VoxelScene>,
     camera: Query<(&GlobalTransform, &Projection), With<Camera3d>>,
     windows: Query<&Window>,
@@ -458,9 +341,8 @@ fn brush_input(
         }
     }
 
-    // In grab and joint mode the left mouse is the tool's; only the erase is
-    // left here.
-    let paint = buttons.just_pressed(MouseButton::Left) && !grab.enabled && !joint.enabled;
+    // In grab mode the left mouse grabs; only the erase is left here.
+    let paint = buttons.just_pressed(MouseButton::Left) && !grab.enabled;
     let erase = buttons.just_pressed(MouseButton::Right);
     if !paint && !erase {
         return;
@@ -660,7 +542,6 @@ mod tests {
     fn g_toggles_grab_mode() {
         let mut world = World::new();
         world.init_resource::<GrabState>();
-        world.init_resource::<JointState>();
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyG);
         world.insert_resource(keys);
@@ -709,59 +590,6 @@ mod tests {
         world.run_system(physics).unwrap();
         let v = world.resource::<VoxelScene>().bodies[0].velocity;
         assert!(v.x > 0.5, "the grab did not pull: {v:?}");
-    }
-
-    /// Two clicks make a joint: the first on a body sets the pivot, the second
-    /// on the world fastens it there.
-    #[test]
-    fn two_clicks_make_a_joint() {
-        let materials = demo_scene().1;
-        let mut body = demo_body(Vec3::new(20.0, 40.0, 20.0), Quat::IDENTITY);
-        assert!(body.recompute(&materials));
-        let bodies = vec![body];
-        let mut state = JointState { enabled: true, kind: JointKind::Hinge, pending: None };
-        let mut joints = Joints::default();
-        let on_body =
-            Hit { target: Target::Body(0), position: Vec3::new(20.0, 43.0, 20.0), normal: Vec3::Y };
-        joint_click(&mut state, &mut joints, &bodies, on_body);
-        assert!(joints.0.is_empty() && state.pending.is_some(), "the first click made a joint");
-        let on_world =
-            Hit { target: Target::World, position: Vec3::new(20.0, 6.0, 20.0), normal: Vec3::Y };
-        joint_click(&mut state, &mut joints, &bodies, on_world);
-        assert_eq!(joints.0.len(), 1);
-        assert_eq!(joints.0[0].kind, JointKind::Hinge);
-        assert!(joints.0[0].b.is_none(), "not fastened to the world");
-        assert!(state.pending.is_none());
-
-        // Clicking the same body twice cancels rather than joining it to itself.
-        joint_click(&mut state, &mut joints, &bodies, on_body);
-        joint_click(&mut state, &mut joints, &bodies, on_body);
-        assert_eq!(joints.0.len(), 1, "a body was joined to itself");
-        assert!(state.pending.is_none());
-    }
-
-    /// `J` and `G` are exclusive: one tool at a time.
-    #[test]
-    fn joint_and_grab_modes_exclude_each_other() {
-        let mut world = World::new();
-        world.init_resource::<GrabState>();
-        world.init_resource::<JointState>();
-        world.resource_mut::<GrabState>().enabled = true;
-        let mut keys = ButtonInput::<KeyCode>::default();
-        keys.press(KeyCode::KeyJ);
-        world.insert_resource(keys);
-        let toggle = world.register_system(toggle_joint_mode);
-        world.run_system(toggle).unwrap();
-        assert!(world.resource::<JointState>().enabled);
-        assert!(!world.resource::<GrabState>().enabled, "grab mode stayed on");
-
-        let mut keys = ButtonInput::<KeyCode>::default();
-        keys.press(KeyCode::KeyG);
-        world.insert_resource(keys);
-        let toggle = world.register_system(toggle_grab_mode);
-        world.run_system(toggle).unwrap();
-        assert!(world.resource::<GrabState>().enabled);
-        assert!(!world.resource::<JointState>().enabled, "joint mode stayed on");
     }
 
     /// The system steps the scene's bodies, and a body leaving the world bumps
