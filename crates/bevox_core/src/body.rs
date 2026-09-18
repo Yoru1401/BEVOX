@@ -126,6 +126,22 @@ impl Body {
         march(&self.volume, self.world_from_local(), origin, dir, max_dist, false, stats)
     }
 
+    /// The inverse inertia tensor in world axes.
+    fn world_inverse_inertia(&self) -> glam::Mat3 {
+        let r = glam::Mat3::from_quat(self.orientation);
+        r * self.mass.inverse_inertia * r.transpose()
+    }
+
+    /// How fast the body turns, in world axes.
+    pub fn angular_velocity(&self) -> Vec3 {
+        self.world_inverse_inertia() * self.angular_momentum
+    }
+
+    /// Sets the spin, by setting the angular momentum that produces it.
+    pub fn set_angular_velocity(&mut self, omega: Vec3) {
+        self.angular_momentum = self.world_inverse_inertia().inverse() * omega;
+    }
+
     /// Recomputes mass properties after the volume changed, or for the first
     /// time. The pivot moves to the new centre of mass and `position` moves
     /// with it, so every voxel stays where it was in the world.
@@ -276,6 +292,28 @@ mod tests {
         assert_ne!(a.id, b.id);
         assert_eq!(a.id, a.clone().id);
         assert_ne!(a.id, BodyId::WORLD, "the world's id is reserved");
+    }
+
+    /// Spin set is spin read back, for a body turned any way: the world inertia
+    /// turns with it.
+    #[test]
+    fn angular_velocity_round_trips() {
+        let mut voxels = Vec::new();
+        for x in 0..6 {
+            voxels.push((UVec3::new(x, 0, 0), MaterialId(1)));
+        }
+        voxels.push((UVec3::new(0, 1, 0), MaterialId(2)));
+        let materials = crate::physics::fixtures::materials();
+        let mut body = Body::new(
+            Contree::from_voxels(16, &voxels),
+            Vec3::ZERO,
+            Quat::from_euler(glam::EulerRot::XYZ, 0.4, 1.2, -0.3),
+        );
+        assert!(body.recompute(&materials));
+        let omega = Vec3::new(0.7, -1.1, 0.4);
+        body.set_angular_velocity(omega);
+        let back = body.angular_velocity();
+        assert!((back - omega).length() < 1e-4, "{back:?}");
     }
 
     #[test]

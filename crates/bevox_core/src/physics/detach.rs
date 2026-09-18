@@ -95,6 +95,37 @@ fn walk(
     Some(piece)
 }
 
+/// Every face-connected piece of `tree`, each sorted, largest first.
+///
+/// No floor and no budget: inside a body every piece is loose, and a body is
+/// small enough to label in full. This is what decides whether an erase cut a
+/// body in two.
+pub fn components(tree: &Contree) -> Vec<Vec<UVec3>> {
+    let mut seen: std::collections::HashSet<IVec3> = std::collections::HashSet::new();
+    let mut pieces = Vec::new();
+    for (voxel, _) in tree.voxels() {
+        let seed = voxel.as_ivec3();
+        if !seen.insert(seed) {
+            continue;
+        }
+        let mut stack = vec![seed];
+        let mut piece = Vec::new();
+        while let Some(p) = stack.pop() {
+            piece.push(p.as_uvec3());
+            for step in NEIGHBOURS {
+                let n = p + step;
+                if solid_at(tree, n) && seen.insert(n) {
+                    stack.push(n);
+                }
+            }
+        }
+        piece.sort_unstable_by_key(|p| (p.z, p.y, p.x));
+        pieces.push(piece);
+    }
+    pieces.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    pieces
+}
+
 /// Turns the pieces an edit cut free into bodies, removing them from the world.
 ///
 /// `room` is how many more bodies the scene can draw. Past it, the largest
@@ -389,6 +420,31 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn components_are_labelled_largest_first() {
+        let mut voxels = Vec::new();
+        for x in 0..5 {
+            voxels.push((UVec3::new(x, 0, 0), MaterialId(1)));
+        }
+        for x in 8..10 {
+            voxels.push((UVec3::new(x, 0, 0), MaterialId(1)));
+        }
+        let tree = Contree::from_voxels(16, &voxels);
+        let pieces = components(&tree);
+        assert_eq!(pieces.iter().map(Vec::len).collect::<Vec<_>>(), vec![5, 2]);
+        assert!(components(&Contree::empty(2)).is_empty());
+    }
+
+    /// Diagonals do not join a body's pieces either.
+    #[test]
+    fn components_do_not_join_diagonals() {
+        let tree = Contree::from_voxels(
+            4,
+            &[(UVec3::new(0, 0, 0), MaterialId(1)), (UVec3::new(1, 1, 1), MaterialId(1))],
+        );
+        assert_eq!(components(&tree).len(), 2);
     }
 
     /// What a detachment costs. Not a gate; its numbers go in the plan's
