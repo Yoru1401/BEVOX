@@ -68,6 +68,9 @@ themselves.
   rectangle, because a body just off screen can shadow what is on it.
 - Each caster carries its world bounding sphere, so a ray that passes nowhere
   near a body skips it before any transform.
+- Shadows fall in voxels on bodies, as on terrain. A body hit's shadow ray
+  starts from the centre of the voxel that was hit, in the body's frame, 0.75
+  along its face, so a whole voxel face is lit or shadowed together.
 - Measured: +4.85 ms for sixteen bodies in view, for 22.6 ms in all, and free
   for bodies the rays miss. Flori chose to keep shadows on and the cap at
   sixteen. The plan

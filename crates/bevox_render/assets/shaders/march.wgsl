@@ -55,6 +55,10 @@ struct GpuBody {
     bound: vec4<f32>,
 };
 @group(0) @binding(8) var<storage, read> bodies: array<GpuBody>;
+// Which marched-table entry produced this invocation's primary hit, when a body
+// did. Set by `compose_bodies`, read by `shadow_origin`. Kept out of `Hit`, which
+// every traversal builds and returns, so the traversal is untouched by it.
+var<private> hit_body: u32;
 // Each body's screen footprint in pixels, inclusive, in the same order as
 // `bodies`. A separate 16-byte array rather than a field of GpuBody, so testing
 // it cannot load the whole 160-byte entry. The eighth storage buffer in the
@@ -677,6 +681,7 @@ fn compose_bodies(origin: vec3<f32>, dir: vec3<f32>, world_hit: Hit, max_dist: f
             best = h;
             best.face_normal = (b.rotation * vec4<f32>(h.face_normal, 0.0)).xyz;
             best.from_body = true;
+            hit_body = i;
             limit = h.t;
         }
     }
@@ -986,12 +991,29 @@ fn shading_normal(hit: Hit) -> vec3<f32> {
 }
 
 /// Where the shadow ray toward the sun starts for this hit.
+///
+/// From the centre of the voxel that was hit, 0.75 along its face, for bodies
+/// as for the static world. So a whole voxel face is lit or shadowed together:
+/// shadows fall in voxels, on bodies as on terrain.
 fn shadow_origin(hit: Hit, id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
     if hit.from_body {
-        // A body voxel is not on the world grid, so the start is the world-space
-        // hit point, lifted off the surface by the same 0.25 the static path
-        // ends up at (voxel centre + 0.75 along the face = entered face + 0.25).
-        return view.camera_position.xyz + primary_ray(id, size) * hit.t + hit.face_normal * 0.25;
+        // From the world hit point to the voxel's centre, a move made in the
+        // body's own frame and carried back through its rotation: for a rigid
+        // `local = A world + b`, a local offset `d` is `Aᵀ d` in the world.
+        // `face_normal` is already in the world, and 0.75 along it is 0.75
+        // along the local face, which clears the voxel as on the world grid.
+        //
+        // Through the hit point rather than straight from the voxel, which
+        // gives the same centre: measured A/B/A, dropping `primary_ray` from
+        // this branch, which a body-free scene never runs, cost that scene
+        // 0.58 ms of 11.8, a driver codegen cliff over the whole march. This
+        // form costs +0.04 ms.
+        let b = bodies[hit_body];
+        let a = mat3x3<f32>(b.local_from_world[0].xyz, b.local_from_world[1].xyz, b.local_from_world[2].xyz);
+        let point = view.camera_position.xyz + primary_ray(id, size) * hit.t;
+        let local_point = a * point + b.local_from_world[3].xyz;
+        let centre = point + transpose(a) * (vec3<f32>(hit.voxel) + vec3<f32>(0.5) - local_point);
+        return centre + hit.face_normal * 0.75;
     }
     // Offset along the FACE normal, not the smoothed one. The implicit
     // normal is a blend of neighbouring empty faces, so at a three-way

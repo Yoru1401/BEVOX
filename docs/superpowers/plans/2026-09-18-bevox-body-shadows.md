@@ -88,8 +88,20 @@
    - The break (radius halved) fails the parity gate: 376 pixels disagree.
 2. **`bodies_cast_shadows_that_match_the_cpu` looks from the shadow side (−X −Z).** From the planned camera the floor shadows lay behind the bodies casting them, and only 98 pixels of floor were shadowed by a body, under the 100 required. From the other side: 381 floor pixels, 259 pixels of one body shadowed by the other, and 73 self-shadowed pixels facing the sun; 0 mismatches.
 3. **Sixteen bodies in view go over the frame: 22.6 ms against 16.7.** Flori chose to keep shadows on by default and the cap at sixteen (option 1 of 4), over lowering the cap to about six, a toggle, or further optimisation first. `BODY_SHADOWS` joined `DEFAULT`, and the numbers are recorded at `MAX_BODIES` and `DEFAULT`.
-4. **Breaks, all reverted, each failing its gate:**
+4. **Voxelized shadows on bodies (Flori, after testing).**
+   - Terrain shadows fall in whole voxels, because a world hit's shadow ray starts at the voxel's centre. A body hit's started at the exact pixel point, so shadows on bodies had smooth edges.
+   - Now a body hit's ray starts at the hit voxel's centre too, in the body's frame, 0.75 along the face.
+   - `bodies_cast_shadows_that_match_the_cpu` runs at 256×256 and checks that no body voxel face covering two or more pixels is partly lit. The old per-pixel shader splits 47 faces.
+   - **A codegen cliff on the way.** A/B/A of shader sources in one session, against the shader before this change, with no bodies:
+     - moving the body index into `Hit`: +0.58 ms of 11.8;
+     - keeping `Hit` and holding the index in a `var<private>`: +0.64;
+     - only replacing the never-run body branch with a one-line stub: +0.58.
+     - The trigger was dropping `primary_ray` from that branch. Reaching the centre from the world hit point keeps the call: +0.04 ms with no bodies, −0.04 with 16 in view.
+     - That form ships, with `Hit` unchanged.
+5. **Breaks, all reverted, each failing its gate:**
    - casters taken from the culled table (CPU test, and the off-screen test through the shader);
    - the body loop removed;
    - the shadow origin pushed inside the body's surface;
-   - the sphere too small.
+   - the sphere too small;
+   - the old per-pixel body origin, which splits 47 voxel faces;
+   - the voxel-centre offset cut to 0.25, which is inside the voxel: 1544 pixels disagree.

@@ -1376,10 +1376,11 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
                         body_pixels += 1;
                         // The CPU hit's face normal is in the body's frame.
                         let n = orientation * hit.face_normal;
-                        // From the world-space hit point lifted 0.25 off the
-                        // surface, toward the static world and the body itself:
-                        // a face turned from the sun is shadowed by its own body.
-                        let origin = eye + dir * hit.t + n * 0.25;
+                        // From the hit voxel's centre, 0.75 along its face, as the
+                        // shader starts it, toward the static world and the body
+                        // itself: a face turned from the sun is shadowed by its
+                        // own body.
+                        let origin = body_shadow_origin(&body, &hit, n);
                         let cpu_shadowed = cpu_shadowed(&world, std::slice::from_ref(&body), origin, sun, &mut stats);
                         (Some(n), cpu_shadowed, shadows[i] > 127)
                     }
@@ -1446,6 +1447,12 @@ fn cpu_composed(
     }
 }
 
+/// Where the shader starts a body hit's shadow ray: the hit voxel's centre,
+/// carried into the world, then 0.75 along the face, whose world normal is `n`.
+fn body_shadow_origin(body: &Body, hit: &bevox_core::march::Hit, n: Vec3) -> Vec3 {
+    body.world_from_local().transform_point3(hit.voxel.as_vec3() + Vec3::splat(0.5)) + n * 0.75
+}
+
 /// Whether the ray toward the sun from `origin` is blocked, as `shadowed` in the
 /// shader decides it: the static world, then every body.
 fn cpu_shadowed(world: &Contree, bodies: &[Body], origin: Vec3, sun: Vec3, stats: &mut MarchStats) -> bool {
@@ -1507,7 +1514,9 @@ fn bodies_cast_shadows_that_match_the_cpu() {
         eprintln!("no GPU adapter available, skipping");
         return;
     };
-    let (width, height) = (128u32, 128u32);
+    // Fine enough that a body voxel face covers several pixels, so the check
+    // that each face is lit or shadowed whole can see a face split.
+    let (width, height) = (256u32, 256u32);
     // From the side the shadows fall toward, -X -Z, so they are not hidden
     // behind the bodies that cast them.
     let eye = Vec3::new(40.0, 160.0, 50.0);
@@ -1530,6 +1539,9 @@ fn bodies_cast_shadows_that_match_the_cpu() {
 
     let mut stats = MarchStats::default();
     let (mut floor_by_body, mut by_other, mut by_itself, mut mismatches) = (0usize, 0usize, 0usize, 0usize);
+    // Each body voxel face seen, and the GPU's shadow flags across its pixels.
+    let mut faces: std::collections::HashMap<(usize, [u32; 3], [i32; 3]), (usize, usize)> =
+        std::collections::HashMap::new();
     let mut first = String::new();
     for y in 0..height {
         for x in 0..width {
@@ -1546,7 +1558,7 @@ fn bodies_cast_shadows_that_match_the_cpu() {
                 None => (hit.voxel.as_vec3() + Vec3::splat(0.5) + hit.face_normal * 0.75, hit.face_normal),
                 Some(k) => {
                     let n = bodies[k].orientation * hit.face_normal;
-                    (eye + dir * hit.t + n * 0.25, n)
+                    (body_shadow_origin(&bodies[k], &hit, n), n)
                 }
             };
             let expected = cpu_shadowed(&world, &bodies, origin, sun, &mut stats);
@@ -1566,8 +1578,23 @@ fn bodies_cast_shadows_that_match_the_cpu() {
                 }
                 mismatches += 1;
             }
+            if let Some(k) = owner {
+                let face = (k, hit.voxel.to_array(), hit.face_normal.round().as_ivec3().to_array());
+                let seen = faces.entry(face).or_default();
+                if gpu_shadowed {
+                    seen.1 += 1;
+                } else {
+                    seen.0 += 1;
+                }
+            }
         }
     }
+    // Voxelized, as on terrain: no face both lit and shadowed. The faces must be
+    // several pixels across, or every face is trivially whole.
+    let split = faces.values().filter(|(lit, dark)| *lit > 0 && *dark > 0).count();
+    let wide = faces.values().filter(|(lit, dark)| lit + dark >= 2).count();
+    assert!(wide > 50, "only {wide} body voxel faces cover two pixels or more; the check below is vacuous");
+    assert_eq!(split, 0, "{split} body voxel faces are partly lit and partly shadowed: the shadows are not voxelized");
     eprintln!("{floor_by_body} floor pixels shadowed by a body, {by_other} by the other body, {by_itself} by itself; {mismatches} mismatches");
     assert!(floor_by_body > 100, "only {floor_by_body} floor pixels are shadowed by a body; the test is vacuous");
     assert!(by_other > 20, "only {by_other} pixels of one body are shadowed by the other");
