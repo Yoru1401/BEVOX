@@ -67,8 +67,29 @@
 
 ## Measurements
 
-(Filled in during execution.)
+`body_shadows_are_measured`: GTX 1650, 1280x720, bench camera, extent 1024. Each row is `BODY_SHADOWS` A/B/A against the same flags without it, in one session; the figures are what B adds over its bracketing A readings, wall / GPU, with drift in brackets.
+
+| Scene | Before the sphere test | With it |
+|---|---|---|
+| no bodies | +0.00 (0.13) / −0.50 (0.03) | +0.04 (0.11) / −0.00 (0.03) |
+| 16 bodies in view, 88,171 px shadowed | +27.29 (0.10) / +26.56 (0.96) | **+4.85 (0.03) / +5.31 (0.04)** |
+| 16 bodies behind the camera, none shadowing | +20.22 (0.01) / +20.34 (0.19) | −0.23 (0.02) / −0.34 (0.51) |
+
+- **The frame, with the sphere test:** sixteen bodies in view take 22.64 ms on the wall clock (22.88 on the GPU) against a 16.7 ms frame. Without shadows the same view took 17.81 ms in this session, already over the frame.
+- **No codegen cliff:** the body-free row changes nothing.
+- **The entry's growth from 144 to 160 bytes** did not move the primary march: 16 bodies in view without shadows read 17.81/17.91 ms before the change and 17.81/17.78 after, in the same session. This is not an A/B/A, since both builds cannot run in one binary.
+- **The workspace:** 331 pass, 10 ignored, no warnings.
 
 ## What changed during execution
 
-(Filled in during execution.)
+1. **The sphere test was built after all.** The plan held it back until the bench asked, and the bench did: sixteen bodies behind the camera, shadowing nothing, cost +20 ms a frame in rejection alone.
+   - Each caster now carries its world bounding sphere, and the shader reads that one field before loading the entry.
+   - A body with no voxels is left out of the casters.
+   - The break (radius halved) fails the parity gate: 376 pixels disagree.
+2. **`bodies_cast_shadows_that_match_the_cpu` looks from the shadow side (−X −Z).** From the planned camera the floor shadows lay behind the bodies casting them, and only 98 pixels of floor were shadowed by a body, under the 100 required. From the other side: 381 floor pixels, 259 pixels of one body shadowed by the other, and 73 self-shadowed pixels facing the sun; 0 mismatches.
+3. **Sixteen bodies in view go over the frame: 22.6 ms against 16.7.** Flori chose to keep shadows on by default and the cap at sixteen (option 1 of 4), over lowering the cap to about six, a toggle, or further optimisation first. `BODY_SHADOWS` joined `DEFAULT`, and the numbers are recorded at `MAX_BODIES` and `DEFAULT`.
+4. **Breaks, all reverted, each failing its gate:**
+   - casters taken from the culled table (CPU test, and the off-screen test through the shader);
+   - the body loop removed;
+   - the shadow origin pushed inside the body's surface;
+   - the sphere too small.

@@ -61,6 +61,11 @@ pub const VOXEL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 ///
 /// The test harness writes its own uniform and is not capped, which is what
 /// lets the benchmark measure past this.
+///
+/// Set before bodies cast shadows. With them (2026-09-18, same GPU and
+/// camera), sixteen bodies in view measured 22.6 ms: 17.8 without shadows in
+/// that session, plus 4.85 for the shadows. Flori kept the cap at sixteen and
+/// shadows on, knowing that only a crowded view goes over the frame.
 pub const MAX_BODIES: usize = 16;
 
 /// How many of `bodies` the shader marches: all of them, up to `MAX_BODIES`.

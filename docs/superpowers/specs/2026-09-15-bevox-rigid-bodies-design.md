@@ -60,9 +60,18 @@ body cheap:
 `MAX_BODIES` is 16 at 1280x720 on a GTX 1650. The measurements are in
 `docs/superpowers/plans/2026-09-17-bevox-body-culling.md`.
 
-Bodies do not cast shadows yet. When they do, shadow rays must compose bodies
-without the frustum cull, because a body just off screen can shadow what is on
-it.
+**Bodies cast shadows** (2026-09-18) on the world, on each other and on
+themselves.
+- A shadow ray the static world leaves clear tests every body, up to the cap,
+  stopping at the first hit.
+- Those bodies are a caster list, never the culled table and with no screen
+  rectangle, because a body just off screen can shadow what is on it.
+- Each caster carries its world bounding sphere, so a ray that passes nowhere
+  near a body skips it before any transform.
+- Measured: +4.85 ms for sixteen bodies in view, for 22.6 ms in all, and free
+  for bodies the rays miss. Flori chose to keep shadows on and the cap at
+  sixteen. The plan
+  `docs/superpowers/plans/2026-09-18-bevox-body-shadows.md` has the numbers.
 
 Each body owns its own `Contree`, packed into the shared node and voxel buffers
 behind a per-body base offset.
@@ -373,10 +382,7 @@ correctness are checked by deliberately breaking the code they guard.
 | 5 | Mouse grab: a damped spring from the cursor to the clicked point (a joint since 7) | Bodies can be picked up |
 | 6 | Ball and hinge joints, made with a tool in the app (the tool removed in 7) | Hinges, chains, hanging things |
 | 7 | Dwyer's joints: sixteen types, friction and motors; the grab as a joint; a joint scene | Doors, ropes and machines; bodies held steady |
-
-Still to do, as Flori flagged: **bodies cast no shadows** (see Rendering).
-Shadow rays must compose bodies without the frustum cull and the screen
-rectangle, because a body just off screen can shadow what is on it.
+| 8 | Body shadows, from every body including those off screen | Bodies sit in the scene rather than on it |
 
 Deferred until a measurement asks for them: sleeping, merging settled debris
 back into the terrain, fracture on hard impacts, and multithreading. Dwyer's

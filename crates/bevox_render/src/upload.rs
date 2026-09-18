@@ -118,8 +118,23 @@ pub mod march_flags {
     /// 0.27). Alone it saves nothing behind the camera, where a body gets the
     /// whole screen; the cull removes those. Neither changes a pixel, and a
     /// body-free scene runs neither.
-    pub const DEFAULT: u32 =
-        DDA | MASK_FILTER | BEAM | DISTANCE_FIELD | BODIES | CULL_BODIES | BODY_RECT;
+    ///
+    /// `BODY_SHADOWS` is a feature, as `BODIES` is, and Flori chose it on
+    /// knowing its cost (2026-09-18). In `body_shadows_are_measured` (GTX 1650,
+    /// 1280x720, bench camera, A/B/A against the same flags without it, wall /
+    /// GPU): a body-free scene +0.04 / -0.00 ms, so no codegen cliff; sixteen
+    /// bodies behind the camera -0.23 / -0.34 ms, thanks to the sphere test;
+    /// sixteen in view, shadowing 88,171 pixels, +4.85 / +5.31 ms, for 22.6 ms
+    /// in all against a 16.7 ms frame. That last is the bench's worst case, a
+    /// wall of cubes across the view.
+    pub const DEFAULT: u32 = DDA
+        | MASK_FILTER
+        | BEAM
+        | DISTANCE_FIELD
+        | BODIES
+        | CULL_BODIES
+        | BODY_RECT
+        | BODY_SHADOWS;
 }
 
 /// The sun direction the renderer and the parity tests share.
