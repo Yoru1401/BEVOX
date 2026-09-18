@@ -21,8 +21,8 @@ disconnects becomes a body, as in Dwyer's engine. Everything below serves that.
 
 Two interactions come later but constrain the design now:
 
-- **Picking up bodies.** A damped spring pulls the clicked point toward the
-  cursor, and the body keeps simulating.
+- **Picking up bodies.** A joint holds the clicked point at the cursor and keeps
+  the body's orientation, and the body keeps simulating.
 - **Editing bodies with the brush.** Painting grows a body, erasing shrinks it,
   and pieces that end up disconnected split into separate bodies.
 
@@ -238,35 +238,103 @@ Detachment is coupled to edit throughput. A single paint already stages about
 2.2 MB of distance-field data at extent 4096, so the search is bounded to the
 affected region.
 
-## The mouse grab, and joints
+## Joints and the mouse grab
 
-Every joint is one error function `C` of the constrained bodies' transforms,
-satisfied when `C = 0`. Its gradient `J` gives the constraint direction. The
-constraint impulse `λ` comes from the same expression for every joint type, and
-the TGS solver handles joints and contacts together.
+> **Revised 2026-09-18, milestone 7.** Joints were rebuilt after Dwyer's devlog
+> #30: sixteen types, friction, motors, and the mouse grab as a joint. This
+> replaces milestone 5's spring grab and milestone 6's two joint types and its
+> J tool.
 
-**The mouse grab is a damped spring** from a target in front of the camera to
-the exact point that was clicked. This is Flori's design, after the oscillator
-grab in Joe Binns' *Get Me Out*, which pulls at the centre of mass; this one
-pulls at the clicked point, so a body held by its corner hangs from it.
+**One equation for every joint, Dwyer's.** A joint is an error function `C` of
+the two bodies' transforms, satisfied when `C = 0`, and `J` is its Jacobian.
+Asking that `J·V₂ = 0`, with the force along `J` as `F = Jᵀλ`, Newton's law
+gives
 
-- **It feels the same on every body.** The spring is given as a frequency and a
-  damping ratio, and its acceleration is scaled by mass.
-- **The held body keeps simulating.** It collides, stacks, and falls under
-  gravity, sagging `g / w^2` below the target. Releasing it is simply not
-  holding it, so it keeps the momentum the spring gave it, and a flick throws
-  it.
-- **It is stable, although Dwyer's explicit spring was not.** It runs inside the
-  solver's substeps, which keeps `w h` small, and its acceleration is capped, so
-  a target far across the world pulls hard rather than instantly.
-- **It damps the held body's spin.** A spring on one point does nothing about
-  rotation around that point, so without the damping a body held by its corner
-  would swing forever.
+```
+λ = −(J M⁻¹ Jᵀ)⁻¹ (J·V + bias)
+```
 
-Dwyer's engine drives the grab with a joint instead. Joints are milestone 6, and
-the grab does not depend on them.
+Each part of a joint is solved as one block of its one to three rows, so a
+point's `J M⁻¹ Jᵀ` is the 3×3 `1/m − [r]× I⁻¹ [r]×` summed over both bodies.
+The bias, `BIAS` of `C` per substep, is this design's; Dwyer shows none. It is
+left out of the relax pass, as it is for contacts.
 
-A joint on a body that splits must follow the piece that holds its anchor voxel.
+**Sixteen types**, each one linear part and one angular part. `pa` and `pb` are
+the two anchors in the world, `wa` and `wb` the two axes.
+
+| Part | `C` | Rows |
+|---|---|---|
+| Linear free | none | 0 |
+| Point | `pa − pb` | 3 |
+| Line | `pa − pb` along two normals to the line | 2 |
+| Distance(`L`) | `abs(pa − pb) − L ≤ 0`: a rope, which pulls and never pushes | 1, one-sided |
+| Angular free | none | 0 |
+| Locked | the relative turn away from `rest` | 3 |
+| Axis | `wa × wb` across the axis (Dwyer: `a₁·b₂`, `a₁·c₂`) | 2 |
+| Cone(`θ`) | `angle(wa, wb) − θ ≤ 0` | 1, one-sided |
+
+A one-sided row behaves like a contact: while it is slack, the bodies may close
+exactly the gap. A joint has two anchors, so a rope can reach from a beam to a
+body, and `rest`, the bodies' relative orientation when it was made. Anchors
+are in volume coordinates, as the grab's always were, or in the world on the
+world's side.
+
+**Friction** acts on the motion a joint leaves free, asking for a relative
+velocity of zero. Its accumulated impulse is clamped as a vector, as contact
+friction is, to `force·h` for linear motion and `torque·h` for angular.
+
+- Linear: Free and Distance on three axes at the pivot, Line along the line,
+  Point on nothing.
+- Angular: Free and Cone on three axes, Axis about the axis, Locked on nothing.
+
+Free and Free with friction is Box2D's friction joint: a capped drag between
+two bodies.
+
+**Motors** drive the one free motion of an Axis or a Line part, and creating one
+on any other part panics.
+
+- `Speed(v)` asks for the relative velocity `v`.
+- `Target(x)` asks for `(x − current)·BIAS/h`: a servo. On a hinge the angle
+  error is wrapped to ±π, so it takes the short way round.
+- The impulse is clamped to `±max·h`, so a motor stalls against a load beyond
+  `max`.
+- On its own motion a motor replaces friction, and `Speed(0)` is a brake.
+
+**Order in each pass**, after Box2D v3, so the hard constraints have the last
+word: motors, then friction, then the one-sided rows, then the equality blocks.
+Motors and friction run in the relax pass too, because they are velocity goals
+and not drift corrections. Joints are solved before contacts.
+
+**Jointed bodies do not collide with each other.** A joint to the world does
+not stop its body colliding with the world, so a door is hung a voxel's gap from
+its post.
+
+**A joint follows its pivot.** After any edit, a joint moves to whichever piece
+holds its first anchor's voxel at the same place in the world. It is removed if
+no piece does, or if either of its bodies is gone.
+
+**The mouse grab is a joint**, as in Dwyer's engine: Point and Locked, from the
+clicked point to a target on the cursor's ray, holding the orientation the body
+had when it was grabbed.
+
+- A body grabbed by its corner keeps its pose rather than hanging from the
+  corner, which is what makes stacking easy.
+- Its force and torque are capped absolutely, by `GRAB_MAX_FORCE` and
+  `GRAB_MAX_TORQUE`, and not scaled by mass. A heavy body sags and drags, and
+  the grab cannot force a body through the terrain, since contacts are solved
+  after it.
+- Letting go removes the joint, and the body keeps its momentum, so a flick
+  throws it.
+- `G` toggles grab mode, and the wheel moves the held point nearer or farther.
+
+This replaces milestone 5's grab, a damped spring at the clicked point that was
+Flori's design after Joe Binns' *Get Me Out*.
+
+**Joints are made by scenes, not by a tool.** `1` loads the demo scene and `2`
+the joint scene, and pressing either again resets it. The joint scene holds
+twelve bodies, under the cap of sixteen: a door, a chain, a rope, a cone, a
+shelf, a crank and slider, a servo arm and a friction block. Every linear part
+and every angular part appears in it at least once.
 
 ## Testing
 
@@ -299,8 +367,9 @@ correctness are checked by deliberately breaking the code they guard.
 | 2 | Material density, recomputable mass properties, voxel classification, rounded-voxel contacts against the world, TGS solver with angular response and warm starting, gravity | A body lands, tumbles and rests on real terrain |
 | 3 | Friction and restitution per material; body against body | Bodies slide, bounce and pile |
 | 4 | Detachment from the world, and brush editing of bodies with splitting | The thing this was for |
-| 5 | Mouse grab: a damped spring from the cursor to the clicked point | Bodies can be picked up |
-| 6 | Ball and hinge joints, made with a tool in the app | Hinges, chains, hanging things |
+| 5 | Mouse grab: a damped spring from the cursor to the clicked point (a joint since 7) | Bodies can be picked up |
+| 6 | Ball and hinge joints, made with a tool in the app (the tool removed in 7) | Hinges, chains, hanging things |
+| 7 | Dwyer's joints: sixteen types, friction and motors; the grab as a joint; a joint scene | Doors, ropes and machines; bodies held steady |
 
 Still to do, as Flori flagged: **bodies cast no shadows** (see Rendering).
 Shadow rays must compose bodies without the frustum cull and the screen
@@ -345,7 +414,18 @@ this list is all that is known of it here:
   - Fracturing.
   - Voxel objects that can be edited and break apart.
 - **#30, [Adding joints to my physics engine](https://www.youtube.com/watch?v=RvhYKj9kEP8).**
-  - Joints as an error function `C`, Jacobian `J` and impulse `λ`.
+  - Joints as an error function `C`, Jacobian `J` and impulse `λ`, with one
+    expression for every joint, `λ = −(J M⁻¹ Jᵀ)⁻¹ J·V₁/Δt`, shown at 7:25.
+  - The constraint forms, shown at 4:36:
+    - contact penetration, `(x₂+r₂−x₁−r₁)·n₁`;
+    - point, `x₂+r₂−x₁−r₁`;
+    - line, that offset along two normals;
+    - locked, `θ₂ − θ₁` on each axis;
+    - hinge, `a₁·b₂` and `a₁·c₂`.
+  - Sixteen joint types, each one linear part (point, line, radius) and one
+    angular part (one axis, cone).
+  - Friction on a door, and motors with a maximum force, driven to a speed or
+    to a target (a clock).
   - The mouse grab moved from an unstable explicit-Euler spring to a joint that
     constrains position and rotation.
   - Joints following the body that holds them after a split.
@@ -362,8 +442,11 @@ Filled in by this design, **not** shown in his devlogs:
 
 - the exact pair-test formulas and rounding radii;
 - the voxel-level detachment search, its budget and its early exit;
-- the mouse grab as a spring at the clicked point, with spin damping, which is
-  Flori's design after *Get Me Out* rather than Dwyer's joint;
+- the free and locked parts that make his list sixteen types, which is a
+  reading of it;
+- the distance joint as a rope, which he describes as "within a radius";
+- the cone's formula, joint friction and motors as rows, and their order;
+- the bias on joints, and the grab's absolute caps;
 - the lookup reach;
 - the ownership rules that report each touch once;
 - the unbiased relax solve after each substep's position update, after Erin
