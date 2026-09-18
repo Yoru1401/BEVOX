@@ -11,6 +11,7 @@
 pub mod classify;
 pub mod contact;
 pub mod detach;
+pub mod joint;
 pub mod mass;
 pub mod sculpt;
 pub mod solver;

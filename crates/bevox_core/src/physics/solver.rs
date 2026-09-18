@@ -12,6 +12,7 @@
 //! bias added, so pushing a body out of the floor does not make it bounce.
 
 use super::contact::{Contact, RADIUS, detect, detect_pair, world_box};
+use super::joint::{self, Joint};
 use super::{
     BASE_MARGIN, BIAS, GRAB_DAMPING, GRAB_FREQUENCY, GRAB_MAX_ACCEL, GRAB_SPIN_DAMPING, MAX_PUSH,
     MAX_TRAVEL, RESTITUTION_SWEEPS, SLOP, SUBSTEPS,
@@ -21,6 +22,7 @@ use crate::contree::Contree;
 use crate::distance_field::DistanceField;
 use crate::material::MaterialTable;
 use glam::{Mat3, Quat, Vec2, Vec3};
+use std::collections::{HashMap, HashSet};
 
 /// What a contact carried last tick, for warm starting.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -64,6 +66,7 @@ struct Joined {
 /// Bodies entirely below the world are removed first. Returns whether any were:
 /// the body list changed, so the caller must rebuild what is packed from it. A
 /// body with no mass is not simulated.
+#[allow(clippy::too_many_arguments)]
 pub fn step(
     bodies: &mut Vec<Body>,
     tree: &Contree,
@@ -72,6 +75,7 @@ pub fn step(
     gravity: Vec3,
     dt: f32,
     grab: Option<&Grab>,
+    joints: &mut [Joint],
 ) -> bool {
     let before = bodies.len();
     bodies.retain(|b| world_box(b, 0.0).is_none_or(|(_, max)| max.y >= 0.0));
@@ -89,7 +93,26 @@ pub fn step(
         })
         .collect();
 
-    let joined = collect_contacts(bodies, tree, field, materials, &travel);
+    // Which bodies each joint joins, by index, this tick. A joint whose body is
+    // gone, or has no mass, sits the tick out; `follow` is what removes it.
+    let index: HashMap<BodyId, usize> = bodies.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+    let alive = |id: BodyId| index.get(&id).copied().filter(|&i| bodies[i].mass.mass > 0.0);
+    let links: Vec<Option<(usize, Option<usize>)>> = joints
+        .iter()
+        .map(|j| {
+            let a = alive(j.a)?;
+            match j.b {
+                None => Some((a, None)),
+                Some(id) => Some((a, Some(alive(id)?))),
+            }
+        })
+        .collect();
+    // Jointed pairs do not collide: a hinge where a door meets its frame would
+    // otherwise have the contact pushing out while the joint pulls back.
+    let jointed: HashSet<(BodyId, BodyId)> =
+        joints.iter().filter_map(|j| j.b.map(|b| pair_key(j.a, b))).collect();
+
+    let joined = collect_contacts(bodies, tree, field, materials, &travel, &jointed);
     let mut impulses: Vec<ContactImpulse> = joined
         .iter()
         .map(|j| bodies[j.body].warm.get(&j.contact.key).copied().unwrap_or_default())
@@ -117,6 +140,13 @@ pub fn step(
             let (a, b) = pair_mut(bodies, j.body, j.other);
             warm_start(a, b, &j.contact, impulse);
         }
+        for (joint, link) in joints.iter().zip(&links) {
+            if let Some((a, b)) = *link {
+                let (a, b) = pair_mut(bodies, a, b);
+                joint::warm_start(a, b, joint);
+            }
+        }
+        solve_joints(bodies, joints, &links, inv_h, true);
         for (j, impulse) in joined.iter().zip(impulses.iter_mut()) {
             let (a, mut b) = pair_mut(bodies, j.body, j.other);
             solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, true);
@@ -127,6 +157,7 @@ pub fn step(
             integrate(b, h);
         }
 
+        solve_joints(bodies, joints, &links, inv_h, false);
         for (j, impulse) in joined.iter().zip(impulses.iter_mut()) {
             let (a, mut b) = pair_mut(bodies, j.body, j.other);
             solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, false);
@@ -157,6 +188,7 @@ fn collect_contacts(
     field: &DistanceField,
     materials: &MaterialTable,
     travel: &[f32],
+    jointed: &HashSet<(BodyId, BodyId)>,
 ) -> Vec<Joined> {
     let mut joined = Vec::new();
     for (i, body) in bodies.iter().enumerate() {
@@ -170,6 +202,9 @@ fn collect_contacts(
     for i in 0..bodies.len() {
         for j in (i + 1)..bodies.len() {
             if bodies[i].mass.mass <= 0.0 || bodies[j].mass.mass <= 0.0 {
+                continue;
+            }
+            if jointed.contains(&pair_key(bodies[i].id, bodies[j].id)) {
                 continue;
             }
             let margin = travel[i].max(travel[j]) + BASE_MARGIN;
@@ -242,6 +277,27 @@ fn pull(body: &mut Body, grab: &Grab, h: f32) {
     body.angular_momentum *= (1.0 - GRAB_SPIN_DAMPING * h).max(0.0);
 }
 
+/// The same key for a pair whichever way round it is named.
+fn pair_key(a: BodyId, b: BodyId) -> (BodyId, BodyId) {
+    (a.min(b), a.max(b))
+}
+
+/// One iteration over every joint whose bodies are here.
+fn solve_joints(
+    bodies: &mut [Body],
+    joints: &mut [Joint],
+    links: &[Option<(usize, Option<usize>)>],
+    inv_h: f32,
+    use_bias: bool,
+) {
+    for (joint, link) in joints.iter_mut().zip(links) {
+        if let Some((a, b)) = *link {
+            let (a, b) = pair_mut(bodies, a, b);
+            joint::solve(a, b, joint, inv_h, use_bias);
+        }
+    }
+}
+
 /// The two bodies a contact joins, borrowed at once.
 fn pair_mut(bodies: &mut [Body], i: usize, j: Option<usize>) -> (&mut Body, Option<&mut Body>) {
     match j {
@@ -256,8 +312,7 @@ fn pair_mut(bodies: &mut [Body], i: usize, j: Option<usize>) -> (&mut Body, Opti
 
 /// The inverse inertia tensor in world axes.
 fn world_inverse_inertia(body: &Body) -> Mat3 {
-    let r = Mat3::from_quat(body.orientation);
-    r * body.mass.inverse_inertia * r.transpose()
+    body.world_inverse_inertia()
 }
 
 /// How far the body's furthest voxel lies from its centre of mass.
@@ -285,7 +340,7 @@ fn cap_speed(body: &mut Body, inv_inertia: Mat3, radius: f32, dt: f32) -> f32 {
 
 /// How fast a point fixed to the body, `r` from its centre of mass, is moving.
 fn point_velocity(body: &Body, r: Vec3) -> Vec3 {
-    body.velocity + (world_inverse_inertia(body) * body.angular_momentum).cross(r)
+    body.point_velocity(r)
 }
 
 /// How fast the two surfaces are moving apart, as a vector. The world
@@ -446,7 +501,7 @@ mod tests {
         ticks: u32,
     ) {
         for _ in 0..ticks {
-            step(bodies, world, field, materials, gravity, DT, None);
+            step(bodies, world, field, materials, gravity, DT, None, &mut []);
         }
     }
 
@@ -550,7 +605,7 @@ mod tests {
         let mut grab = Grab::new(&bodies[0], Vec3::new(30.0, 30.0, 30.0));
         grab.target = Vec3::new(34.0, 32.0, 30.0);
         for _ in 0..300 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, Some(&grab));
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, Some(&grab), &mut []);
         }
         let held = bodies[0].world_from_local().transform_point3(grab.anchor);
         assert!((held - grab.target).length() < 0.3, "held at {held:?}, target {:?}", grab.target);
@@ -568,7 +623,7 @@ mod tests {
         let corner = bodies[0].world_from_local().transform_point3(Vec3::ZERO);
         let grab = Grab::new(&bodies[0], corner);
         for _ in 0..900 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, Some(&grab));
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, Some(&grab), &mut []);
         }
         let com = bodies[0].position;
         let off = com - grab.target;
@@ -587,7 +642,7 @@ mod tests {
         let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
         let mut grab = Grab::new(&bodies[0], Vec3::new(30.0, 30.0, 30.0));
         grab.target = Vec3::new(3000.0, 30.0, 30.0);
-        step(&mut bodies, &world, &field, &materials, Vec3::ZERO, DT, Some(&grab));
+        step(&mut bodies, &world, &field, &materials, Vec3::ZERO, DT, Some(&grab), &mut []);
         let speed = bodies[0].velocity.length();
         assert!(speed <= GRAB_MAX_ACCEL * DT * 1.001, "one tick reached {speed}");
         assert!(speed > 0.5 * GRAB_MAX_ACCEL * DT, "the grab barely pulled: {speed}");
@@ -602,8 +657,160 @@ mod tests {
         let gone = placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY);
         let grab = Grab::new(&gone, Vec3::new(30.0, 30.0, 30.0));
         let mut bodies = vec![placed(cube(4, 4), Vec3::new(40.0, 30.0, 30.0), Quat::IDENTITY)];
-        step(&mut bodies, &world, &field, &materials, Vec3::ZERO, DT, Some(&grab));
+        step(&mut bodies, &world, &field, &materials, Vec3::ZERO, DT, Some(&grab), &mut []);
         assert_eq!(bodies[0].velocity, Vec3::ZERO);
+    }
+
+    /// Total mechanical energy: motion, spin, and height in gravity.
+    fn energy(bodies: &[Body]) -> f32 {
+        bodies
+            .iter()
+            .map(|b| {
+                0.5 * b.mass.mass * b.velocity.length_squared()
+                    + 0.5 * b.angular_velocity().dot(b.angular_momentum)
+                    + b.mass.mass * -GRAVITY.y * b.position.y
+            })
+            .sum()
+    }
+
+    /// How far apart a joint's two sides have come.
+    fn opening(bodies: &[Body], j: &crate::physics::joint::Joint) -> f32 {
+        let a = bodies.iter().find(|b| b.id == j.a).unwrap();
+        let b = j.b.map(|id| bodies.iter().find(|b| b.id == id).unwrap());
+        let (pa, pb) = j.pivots(a, b);
+        (pa - pb).length()
+    }
+
+    /// Hung from its centre top, a body stays exactly where it is: the joint
+    /// holds its weight.
+    #[test]
+    fn a_body_hung_from_its_top_stays_put() {
+        use crate::physics::joint::{Joint, JointKind};
+        let materials = materials();
+        let world = Contree::empty(3);
+        let field = DistanceField::build(&world);
+        let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
+        let top = bodies[0].world_from_local().transform_point3(Vec3::new(2.0, 3.99, 2.0));
+        let mut joints = vec![Joint::new(JointKind::Ball, &bodies[0], None, top, Vec3::Y)];
+        for _ in 0..1000 {
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut joints);
+        }
+        assert!(opening(&bodies, &joints[0]) < 0.05, "the joint gave way");
+        assert!(bodies[0].velocity.length() < 0.01, "it moved: {:?}", bodies[0].velocity);
+    }
+
+    /// Pinned by a corner, a body swings as a pendulum. Nothing damps a joint,
+    /// so it never stops; what must hold is that the pivot stays shut all the
+    /// while, and that the swing never gains energy, which is how an unstable
+    /// solver shows itself.
+    #[test]
+    fn a_pendulum_keeps_its_pivot_and_gains_no_energy() {
+        use crate::physics::joint::{Joint, JointKind};
+        let materials = materials();
+        let world = Contree::empty(3);
+        let field = DistanceField::build(&world);
+        let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
+        let corner = bodies[0].world_from_local().transform_point3(Vec3::new(0.01, 3.99, 0.01));
+        let mut joints = vec![Joint::new(JointKind::Ball, &bodies[0], None, corner, Vec3::Y)];
+        let start = energy(&bodies);
+        let scale = bodies[0].mass.mass * -GRAVITY.y * 4.0;
+        let (mut widest, mut fastest, mut highest) = (0.0f32, 0.0f32, f32::NEG_INFINITY);
+        for _ in 0..3000 {
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut joints);
+            widest = widest.max(opening(&bodies, &joints[0]));
+            fastest = fastest.max(bodies[0].velocity.length());
+            highest = highest.max(energy(&bodies));
+        }
+        assert!(fastest > 1.0, "it never swung, so this proves nothing");
+        assert!(widest < 0.05, "the pivot opened by {widest}");
+        assert!(
+            highest - start < 0.02 * scale,
+            "the pendulum gained energy: {start} rose to {highest}"
+        );
+    }
+
+    /// A chain of three, hanging and then knocked sideways, stays together and
+    /// gains no energy.
+    #[test]
+    fn a_knocked_chain_stays_together() {
+        use crate::physics::joint::{Joint, JointKind};
+        let materials = materials();
+        let world = Contree::empty(3);
+        let field = DistanceField::build(&world);
+        // Each cube hangs from the bottom of the one above; the top one from the
+        // world.
+        let mut bodies: Vec<Body> = (0..3)
+            .map(|i| placed(cube(4, 4), Vec3::new(30.0, 38.0 - i as f32 * 4.0, 30.0), Quat::IDENTITY))
+            .collect();
+        let mut joints = vec![Joint::new(JointKind::Ball, &bodies[0], None, Vec3::new(30.0, 39.99, 30.0), Vec3::Y)];
+        for i in 1..3 {
+            let meet = Vec3::new(30.0, 39.99 - i as f32 * 4.0, 30.0);
+            joints.push(Joint::new(JointKind::Ball, &bodies[i], Some(&bodies[i - 1]), meet, Vec3::Y));
+        }
+        bodies[2].velocity = Vec3::new(6.0, 0.0, 2.0);
+        let start = energy(&bodies);
+        let scale = bodies.iter().map(|b| b.mass.mass).sum::<f32>() * -GRAVITY.y * 4.0;
+        let (mut widest, mut highest) = (0.0f32, f32::NEG_INFINITY);
+        for _ in 0..5000 {
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut joints);
+            for j in &joints {
+                widest = widest.max(opening(&bodies, j));
+            }
+            highest = highest.max(energy(&bodies));
+        }
+        assert!(widest < 0.1, "a joint opened by {widest}");
+        assert!(highest - start < 0.02 * scale, "the chain gained energy: {start} rose to {highest}");
+    }
+
+    /// A joint between two free bodies moves momentum between them but never
+    /// makes or destroys it.
+    #[test]
+    fn a_joint_conserves_momentum() {
+        use crate::physics::joint::{Joint, JointKind};
+        let materials = materials();
+        let world = Contree::empty(3);
+        let field = DistanceField::build(&world);
+        let mut bodies = vec![
+            placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY),
+            placed(cube_of(4, 4, MaterialId(2)), Vec3::new(34.0, 30.0, 30.0), Quat::IDENTITY),
+        ];
+        bodies[0].velocity = Vec3::new(0.0, 6.0, -3.0);
+        let before: Vec3 = bodies.iter().map(|b| b.velocity * b.mass.mass).sum();
+        let pivot = Vec3::new(32.0, 30.0, 30.0);
+        let mut joints = vec![Joint::new(JointKind::Ball, &bodies[1], Some(&bodies[0]), pivot, Vec3::Y)];
+        for _ in 0..200 {
+            step(&mut bodies, &world, &field, &materials, Vec3::ZERO, DT, None, &mut joints);
+        }
+        let after: Vec3 = bodies.iter().map(|b| b.velocity * b.mass.mass).sum();
+        assert!(
+            (after - before).length() < 1e-3 * before.length(),
+            "momentum {after:?}, was {before:?}"
+        );
+        assert!(bodies[1].velocity.length() > 0.5, "the joint moved nothing, so this proves nothing");
+    }
+
+    /// Two jointed bodies that overlap slightly do not push each other apart:
+    /// jointed pairs have no contacts. The overlap is shallow on purpose; a deep
+    /// one puts each body's corners in the other's interior, where no contact
+    /// is ever made, and the gate would pass with the contacts left on.
+    #[test]
+    fn jointed_bodies_do_not_collide() {
+        use crate::physics::joint::{Joint, JointKind};
+        let materials = materials();
+        let world = Contree::empty(3);
+        let field = DistanceField::build(&world);
+        let mut bodies = vec![
+            placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY),
+            placed(cube(4, 4), Vec3::new(33.7, 30.0, 30.0), Quat::IDENTITY),
+        ];
+        let pivot = Vec3::new(31.85, 30.0, 30.0);
+        let mut joints = vec![Joint::new(JointKind::Ball, &bodies[1], Some(&bodies[0]), pivot, Vec3::Y)];
+        for _ in 0..30 {
+            step(&mut bodies, &world, &field, &materials, Vec3::ZERO, DT, None, &mut joints);
+        }
+        for b in &bodies {
+            assert!(b.velocity.length() < 1e-3, "an overlap pushed a jointed body: {:?}", b.velocity);
+        }
     }
 
     /// A moving cube hitting a still one of equal mass gives its motion away:
@@ -718,7 +925,7 @@ mod tests {
         run(&mut bodies, &world, &field, &materials(), GRAVITY, 8000);
         let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
         for _ in 0..1000 {
-            step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None);
+            step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []);
             low = low.min(bodies[0].position.y);
             high = high.max(bodies[0].position.y);
         }
@@ -853,7 +1060,7 @@ mod tests {
             let mut top: f32 = 0.0;
             let mut landed = false;
             for _ in 0..400 {
-                step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None);
+                step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut []);
                 let y = bodies[0].position.y;
                 landed |= y < 10.2;
                 if landed {
@@ -887,7 +1094,7 @@ mod tests {
         assert!((settled - 10.0).abs() < 0.1, "settled at {settled}, not on the floor");
         let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
         for _ in 0..1000 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None);
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut []);
             low = low.min(bodies[0].position.y);
             high = high.max(bodies[0].position.y);
         }
@@ -909,7 +1116,7 @@ mod tests {
         run(&mut bodies, &world, &field, &materials, GRAVITY, 3000);
         let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
         for _ in 0..500 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None);
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut []);
             low = low.min(bodies[0].position.y);
             high = high.max(bodies[0].position.y);
         }
@@ -949,7 +1156,7 @@ mod tests {
         assert!(bodies[0].velocity.y.abs() < 0.05, "not at rest before the edit");
         // Erasing leaves the field under-estimating, which is its safe direction.
         world.apply_sphere(Vec3::new(32.0, 6.0, 32.0), 6.0, MaterialId::EMPTY);
-        step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None);
+        step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []);
         assert!(bodies[0].velocity.y < -1.0, "still held up: {:?}", bodies[0].velocity);
     }
 
@@ -966,7 +1173,7 @@ mod tests {
             k
         };
         let before = keys(&bodies[0]);
-        step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None);
+        step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []);
         assert!(!before.is_empty());
         assert_eq!(keys(&bodies[0]), before);
     }
@@ -976,10 +1183,10 @@ mod tests {
         let world = slab(64, 0..8);
         let field = DistanceField::build(&world);
         let mut bodies = vec![placed(cube(4, 4), Vec3::new(32.0, -60.0, 32.0), Quat::IDENTITY)];
-        assert!(step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None));
+        assert!(step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []));
         assert!(bodies.is_empty());
         let mut bodies = vec![placed(cube(4, 4), Vec3::new(32.0, 40.0, 32.0), Quat::IDENTITY)];
-        assert!(!step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None));
+        assert!(!step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []));
         assert_eq!(bodies.len(), 1);
     }
 
@@ -1017,7 +1224,7 @@ mod tests {
             (0..ticks)
                 .map(|_| {
                     let start = std::time::Instant::now();
-                    step(bodies, &world, &field, &materials, GRAVITY, DT, None);
+                    step(bodies, &world, &field, &materials, GRAVITY, DT, None, &mut []);
                     start.elapsed().as_secs_f64() * 1000.0
                 })
                 .collect()

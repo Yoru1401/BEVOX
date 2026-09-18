@@ -153,9 +153,14 @@ impl Body {
     }
 
     /// The inverse inertia tensor in world axes.
-    fn world_inverse_inertia(&self) -> glam::Mat3 {
+    pub(crate) fn world_inverse_inertia(&self) -> glam::Mat3 {
         let r = glam::Mat3::from_quat(self.orientation);
         r * self.mass.inverse_inertia * r.transpose()
+    }
+
+    /// How fast a point fixed to the body, `r` from its centre of mass, moves.
+    pub(crate) fn point_velocity(&self, r: Vec3) -> Vec3 {
+        self.velocity + self.angular_velocity().cross(r)
     }
 
     /// How fast the body turns, in world axes.

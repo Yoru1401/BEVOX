@@ -149,6 +149,7 @@ fn physics_system(time: Res<Time>, grab: Res<GrabState>, mut scene: ResMut<Voxel
         GRAVITY,
         time.delta_secs(),
         grab.held.as_ref(),
+        &mut [],
     );
     if changed {
         // A body left the world. The body list is packed into the scene
