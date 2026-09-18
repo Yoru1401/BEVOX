@@ -1344,6 +1344,9 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
     // not a body's. Checking only body pixels would let extra GPU hits through.
     let mut stats = MarchStats::default();
     let mut body_pixels = 0usize;
+    // Body pixels whose implicit normal is not their face normal: its edges,
+    // where a flat-shaded body and this one differ.
+    let mut blended = 0usize;
     // Pixels where the body is on the ray but the static world is nearer, and
     // how many of those the GPU got wrong.
     let mut occluded = 0usize;
@@ -1374,13 +1377,18 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
                     }
                     Some((hit, true)) => {
                         body_pixels += 1;
-                        // The CPU hit's face normal is in the body's frame.
-                        let n = orientation * hit.face_normal;
+                        // The body's implicit normal, from its own volume, and
+                        // the face normal, both in the body's frame: the first
+                        // shades, the second places the shadow ray.
+                        let face = orientation * hit.face_normal;
+                        let n = orientation
+                            * bevox_core::normal::implicit_normal(&body.volume, hit.voxel, hit.face_normal);
                         // From the hit voxel's centre, 0.75 along its face, as the
                         // shader starts it, toward the static world and the body
                         // itself: a face turned from the sun is shadowed by its
                         // own body.
-                        let origin = body_shadow_origin(&body, &hit, n);
+                        blended += usize::from((n - face).length() > 0.1);
+                        let origin = body_shadow_origin(&body, &hit, face);
                         let cpu_shadowed = cpu_shadowed(&world, std::slice::from_ref(&body), origin, sun, &mut stats);
                         (Some(n), cpu_shadowed, shadows[i] > 127)
                     }
@@ -1417,6 +1425,7 @@ fn a_rotated_body_is_shaded_with_its_rotated_normal() {
          ({occluded_bad} wrong), {mismatches} mismatches in all"
     );
     assert!(body_pixels > 200, "only {body_pixels} pixels hit the body; the test is vacuous");
+    assert!(blended > 20, "only {blended} body pixels have a blended normal, so flat shading would pass");
     assert!(
         occluded > 200,
         "only {occluded} pixels have the static world in front of the body, so nothing tests \

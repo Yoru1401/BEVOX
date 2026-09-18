@@ -68,6 +68,10 @@ themselves.
   rectangle, because a body just off screen can shadow what is on it.
 - Each caster carries its world bounding sphere, so a ray that passes nowhere
   near a body skips it before any transform.
+- Bodies shade like terrain: with the implicit normal, which blends the
+  directions a voxel is open to, probed in the body's own volume and rotated
+  into the world. So a body's edges and corners shade apart from its faces
+  rather than every face being one colour.
 - Shadows fall in voxels on bodies, as on terrain. A body hit's shadow ray
   starts from the centre of the voxel that was hit, in the body's frame, 0.75
   along its face, so a whole voxel face is lit or shadowed together.

@@ -688,20 +688,28 @@ fn compose_bodies(origin: vec3<f32>, dir: vec3<f32>, world_hit: Hit, max_dist: f
     return best;
 }
 
-/// Material at a voxel coordinate, or 0 outside the volume.
+/// Material at a voxel coordinate of the static world, or 0 outside it.
+fn material_at(p: vec3<i32>) -> u32 {
+    return material_in(p, 0u, 0u, view.volume_params.x, view.volume_params.y);
+}
+
+/// Material at a voxel coordinate of the volume rooted at `node_base`, with its
+/// voxel bytes from `voxel_base`: the static world, or a body. 0 outside it.
 ///
 /// This is the tree descent from Contree::get: at each level pick the child
 /// containing the coordinate, stopping early at an unsubdivided node. An empty
 /// node's material is 0 and a uniform solid's is its own, so the single early
-/// return covers both without conflating them.
-fn material_at(p: vec3<i32>) -> u32 {
-    let extent = i32(view.volume_params.y);
+/// return covers both without conflating them. One descent for the world and
+/// every body, laid out as `traverse_at` reads them: arena slot `n` at
+/// `node_base + 1 + n`.
+fn material_in(p: vec3<i32>, node_base: u32, voxel_base: u32, depth: u32, volume_extent: u32) -> u32 {
+    let extent = i32(volume_extent);
     if p.x < 0 || p.y < 0 || p.z < 0 || p.x >= extent || p.y >= extent || p.z >= extent {
         return 0u;
     }
 
-    var node = nodes[0];
-    var level = view.volume_params.x - 1u;
+    var node = nodes[node_base];
+    var level = depth - 1u;
     var local = vec3<u32>(p);
 
     // Bounded by tree depth; a volume is never deeper than MAX_DEPTH.
@@ -715,7 +723,7 @@ fn material_at(p: vec3<i32>) -> u32 {
             if !has_child(node, i) {
                 return 0u;
             }
-            return voxel_byte(child_slot(node, i));
+            return voxel_byte_at(voxel_base, child_slot(node, i));
         }
 
         let step_size = level_extent(level - 1u);
@@ -724,7 +732,7 @@ fn material_at(p: vec3<i32>) -> u32 {
         if !has_child(node, i) {
             return 0u;
         }
-        node = nodes[child_slot(node, i) + 1u];
+        node = nodes[node_base + child_slot(node, i) + 1u];
         local = local - cell * step_size;
         level = level - 1u;
     }
@@ -732,17 +740,29 @@ fn material_at(p: vec3<i32>) -> u32 {
 }
 
 /// Sums the directions in which a voxel is exposed, falling back to the entry
-/// face when that carries no information. Mirrors bevox_core::normal.
+/// face when that carries no information. Mirrors bevox_core::normal. The
+/// static world's; `implicit_normal_in` takes any volume.
 fn implicit_normal(voxel: vec3<u32>, face_normal: vec3<f32>) -> vec3<f32> {
+    return implicit_normal_in(voxel, face_normal, 0u, 0u, view.volume_params.x, view.volume_params.y);
+}
+
+fn implicit_normal_in(
+    voxel: vec3<u32>,
+    face_normal: vec3<f32>,
+    node_base: u32,
+    voxel_base: u32,
+    depth: u32,
+    extent: u32,
+) -> vec3<f32> {
     let base = vec3<i32>(voxel);
     var sum = vec3<f32>(0.0);
 
-    if material_at(base + vec3<i32>(1, 0, 0)) == 0u { sum += vec3<f32>(1.0, 0.0, 0.0); }
-    if material_at(base + vec3<i32>(-1, 0, 0)) == 0u { sum += vec3<f32>(-1.0, 0.0, 0.0); }
-    if material_at(base + vec3<i32>(0, 1, 0)) == 0u { sum += vec3<f32>(0.0, 1.0, 0.0); }
-    if material_at(base + vec3<i32>(0, -1, 0)) == 0u { sum += vec3<f32>(0.0, -1.0, 0.0); }
-    if material_at(base + vec3<i32>(0, 0, 1)) == 0u { sum += vec3<f32>(0.0, 0.0, 1.0); }
-    if material_at(base + vec3<i32>(0, 0, -1)) == 0u { sum += vec3<f32>(0.0, 0.0, -1.0); }
+    if material_in(base + vec3<i32>(1, 0, 0), node_base, voxel_base, depth, extent) == 0u { sum += vec3<f32>(1.0, 0.0, 0.0); }
+    if material_in(base + vec3<i32>(-1, 0, 0), node_base, voxel_base, depth, extent) == 0u { sum += vec3<f32>(-1.0, 0.0, 0.0); }
+    if material_in(base + vec3<i32>(0, 1, 0), node_base, voxel_base, depth, extent) == 0u { sum += vec3<f32>(0.0, 1.0, 0.0); }
+    if material_in(base + vec3<i32>(0, -1, 0), node_base, voxel_base, depth, extent) == 0u { sum += vec3<f32>(0.0, -1.0, 0.0); }
+    if material_in(base + vec3<i32>(0, 0, 1), node_base, voxel_base, depth, extent) == 0u { sum += vec3<f32>(0.0, 0.0, 1.0); }
+    if material_in(base + vec3<i32>(0, 0, -1), node_base, voxel_base, depth, extent) == 0u { sum += vec3<f32>(0.0, 0.0, -1.0); }
 
     if dot(sum, sum) < 1e-6 {
         return face_normal;
@@ -977,15 +997,21 @@ fn primary_hit(id: vec3<u32>, size: vec2<u32>) -> Hit {
     return hit;
 }
 
-/// The shading normal for a hit.
+/// The shading normal for a hit: the implicit normal, which blends the
+/// directions a voxel is open to, so edges and corners shade apart from the
+/// faces around them. For bodies as for the static world.
 ///
-/// `implicit_normal` probes neighbours in the static tree. A body hit's voxel
-/// is a coordinate in the body's own volume, so probing the static tree there
-/// reads an unrelated place; a body shades flat from its face normal, which
-/// `compose_bodies` has already rotated into world space.
+/// A body hit's voxel is a coordinate in the body's own volume, so it is
+/// probed there, not in the static tree, from the face normal carried back into
+/// the body's frame, and the result is rotated into the world. The face normal
+/// comes back rounded: the rotation there and back leaves it a hair off its
+/// axis, and it is the fallback the CPU gives exactly.
 fn shading_normal(hit: Hit) -> vec3<f32> {
     if hit.from_body {
-        return hit.face_normal;
+        let b = bodies[hit_body];
+        let local_face = round((transpose(b.rotation) * vec4<f32>(hit.face_normal, 0.0)).xyz);
+        let n = implicit_normal_in(hit.voxel, local_face, b.node_base, b.voxel_base, b.depth, b.extent);
+        return (b.rotation * vec4<f32>(n, 0.0)).xyz;
     }
     return implicit_normal(hit.voxel, hit.face_normal);
 }
