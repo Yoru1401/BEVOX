@@ -11,7 +11,7 @@
 //! over its one to three rows at once. The bias, a fraction of the drift put
 //! right each substep, is this project's; he shows none.
 
-use super::BIAS;
+use super::{BIAS, GRAB_MAX_FORCE, GRAB_MAX_TORQUE};
 use super::classify::solid_at;
 use crate::body::{Body, BodyId};
 use glam::{Mat3, Quat, Vec3};
@@ -101,6 +101,10 @@ pub struct Joint {
     pub rest: Quat,
     pub friction: Friction,
     pub motor: Option<Motor>,
+    /// The most the linear part pulls with, and the angular part turns with.
+    /// Unlimited unless set.
+    pub max_force: f32,
+    pub max_torque: f32,
     pub carried: Carried,
 }
 
@@ -135,7 +139,20 @@ impl Joint {
             rest: orientation(b).inverse() * a.orientation,
             friction: Friction::default(),
             motor: None,
+            max_force: f32::INFINITY,
+            max_torque: f32::INFINITY,
             carried: Carried::default(),
+        }
+    }
+
+    /// The mouse grab: `body` held at the world point `at`, in the orientation
+    /// it has now, by a joint to the world whose force and torque are capped.
+    /// The target is `anchor_b`; move it to move the body.
+    pub fn grab(body: &Body, at: Vec3) -> Self {
+        Self {
+            max_force: GRAB_MAX_FORCE,
+            max_torque: GRAB_MAX_TORQUE,
+            ..Self::new(body, None, Linear::Point, Angular::Locked, at, at, Vec3::Y)
         }
     }
 
@@ -351,12 +368,15 @@ fn solve_linear(a: &mut Body, b: Option<&mut Body>, joint: &mut Joint, inv_h: f3
     let v = relative_velocity(a, b.as_deref(), ra, rb);
     let d = pa - pb;
     let before = joint.carried.linear;
+    let limit = joint.max_force / inv_h;
     joint.carried.linear = match joint.linear {
         Linear::Free => return,
-        Linear::Point => before + block(k, Mat3::IDENTITY, v + d * bias_rate(use_bias, inv_h)),
+        Linear::Point => (before + block(k, Mat3::IDENTITY, v + d * bias_rate(use_bias, inv_h)))
+            .clamp_length_max(limit),
         Linear::Line => {
             let n = joint.axes(a, b.as_deref()).1;
-            before + block(k, Mat3::IDENTITY - outer(n), v + d * bias_rate(use_bias, inv_h))
+            (before + block(k, Mat3::IDENTITY - outer(n), v + d * bias_rate(use_bias, inv_h)))
+                .clamp_length_max(limit)
         }
         Linear::Distance(max) => {
             let length = d.length();
@@ -367,7 +387,7 @@ fn solve_linear(a: &mut Body, b: Option<&mut Body>, joint: &mut Joint, inv_h: f3
             let lambda =
                 block(k, outer(n), v + n * one_sided_bias(length - max, inv_h, use_bias)).dot(n);
             // A rope pulls, never pushes.
-            n * (before.dot(n) + lambda).min(0.0)
+            n * (before.dot(n) + lambda).clamp(-limit, 0.0)
         }
     };
     apply(a, b, ra, rb, joint.carried.linear - before, Vec3::ZERO);
@@ -380,6 +400,7 @@ fn solve_angular(a: &mut Body, b: Option<&mut Body>, joint: &mut Joint, inv_h: f
     let spin = relative_spin(a, b.as_deref());
     let (wa, wb) = joint.axes(a, b.as_deref());
     let before = joint.carried.angular;
+    let limit = joint.max_torque / inv_h;
     joint.carried.angular = match joint.angular {
         Angular::Free => return,
         Angular::Locked => {
@@ -387,12 +408,13 @@ fn solve_angular(a: &mut Body, b: Option<&mut Body>, joint: &mut Joint, inv_h: f
             // vector.
             let off = a.orientation * (orientation(b.as_deref()) * joint.rest).inverse();
             let off = if off.w < 0.0 { -off } else { off };
-            before + block(k, Mat3::IDENTITY, spin + off.xyz() * (2.0 * bias_rate(use_bias, inv_h)))
+            (before + block(k, Mat3::IDENTITY, spin + off.xyz() * (2.0 * bias_rate(use_bias, inv_h))))
+                .clamp_length_max(limit)
         }
         Angular::Axis => {
             // Turning `a` about `wa × wb` brings its axis toward `b`'s.
             let error = spin + wb.cross(wa) * bias_rate(use_bias, inv_h);
-            before + block(k, Mat3::IDENTITY - outer(wa), error)
+            (before + block(k, Mat3::IDENTITY - outer(wa), error)).clamp_length_max(limit)
         }
         Angular::Cone(max) => {
             // Relative spin along `wb × wa` opens the angle between the axes.
@@ -406,7 +428,7 @@ fn solve_angular(a: &mut Body, b: Option<&mut Body>, joint: &mut Joint, inv_h: f
             let lambda =
                 block(k, outer(u), spin + u * one_sided_bias(apart - max, inv_h, use_bias)).dot(u);
             // A cone only ever pushes the axes back together.
-            u * (before.dot(u) + lambda).min(0.0)
+            u * (before.dot(u) + lambda).clamp(-limit, 0.0)
         }
     };
     apply(a, b, Vec3::ZERO, Vec3::ZERO, Vec3::ZERO, joint.carried.angular - before);
@@ -568,6 +590,10 @@ mod tests {
 
         fn step(&self, bodies: &mut Vec<Body>, joints: &mut [Joint], gravity: Vec3) {
             step(bodies, &self.world, &self.field, &self.materials, gravity, DT, None, joints);
+        }
+
+        fn step_holding(&self, bodies: &mut Vec<Body>, grab: &mut Joint, gravity: Vec3) {
+            step(bodies, &self.world, &self.field, &self.materials, gravity, DT, Some(grab), &mut []);
         }
     }
 
@@ -918,6 +944,99 @@ mod tests {
     fn a_motor_on_a_joint_without_one_free_motion_panics() {
         let body = placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY);
         let _ = ball(&body, None, body.position).with_motor(Motor { drive: Drive::Speed(1.0), max: 1.0 });
+    }
+
+    /// Grabbed by a corner and moved, a body follows with that corner and keeps
+    /// the pose it was grabbed in, rather than hanging from the corner.
+    #[test]
+    fn a_grab_holds_the_point_and_the_pose() {
+        use crate::physics::GRAB_MAX_FORCE;
+        let space = Space::new();
+        let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
+        let corner = bodies[0].world_from_local().transform_point3(Vec3::new(0.01, 3.99, 0.01));
+        let mut grab = Joint::grab(&bodies[0], corner);
+        assert_eq!(grab.max_force, GRAB_MAX_FORCE);
+        grab.anchor_b = corner + Vec3::new(2.0, 1.0, 0.0);
+        for _ in 0..600 {
+            space.step_holding(&mut bodies, &mut grab, GRAVITY);
+        }
+        let held = bodies[0].world_from_local().transform_point3(grab.anchor_a);
+        assert!((held - grab.anchor_b).length() < 0.05, "held at {held:?}, target {:?}", grab.anchor_b);
+        let turned = bodies[0].orientation.angle_between(Quat::IDENTITY);
+        assert!(turned < 0.02, "the body turned {turned} rad in the grab");
+    }
+
+    /// A light body is lifted to the target; one heavier than the grab's force
+    /// stays on the floor.
+    #[test]
+    fn a_grab_lifts_a_light_body_but_not_a_heavy_one() {
+        let materials = materials();
+        let world = crate::physics::fixtures::slab(64, 0..8);
+        let field = DistanceField::build(&world);
+        let lift = |volume: Contree, centre: Vec3| -> f32 {
+            let mut bodies = vec![placed(volume, centre, Quat::IDENTITY)];
+            let mut grab = Joint::grab(&bodies[0], centre);
+            grab.anchor_b = centre + Vec3::Y * 5.0;
+            for _ in 0..300 {
+                step(&mut bodies, &world, &field, &materials, GRAVITY, DT, Some(&mut grab), &mut []);
+            }
+            bodies[0].position.y - centre.y
+        };
+        // 64 voxels at 1000 weigh 64,000; the grab lifts 2,000,000.
+        let light = lift(cube(4, 4), Vec3::new(20.0, 10.0, 32.0));
+        assert!((light - 5.0).abs() < 0.1, "a light body rose {light}, not 5");
+        // 1000 voxels at 3000 weigh 3,000,000.
+        let heavy = lift(cube_of(10, 16, MaterialId(2)), Vec3::new(40.0, 13.0, 32.0));
+        assert!(heavy.abs() < 0.5, "a heavy body rose {heavy}");
+    }
+
+    /// A target across the world pulls with the grab's force and no more: one
+    /// tick reaches at most `F dt / m`.
+    #[test]
+    fn a_far_target_pulls_with_the_capped_force() {
+        use crate::physics::GRAB_MAX_FORCE;
+        let space = Space::new();
+        let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
+        let mut grab = Joint::grab(&bodies[0], bodies[0].position);
+        grab.anchor_b = Vec3::new(3000.0, 30.0, 30.0);
+        space.step_holding(&mut bodies, &mut grab, Vec3::ZERO);
+        let speed = bodies[0].velocity.length();
+        let most = GRAB_MAX_FORCE * DT / bodies[0].mass.mass;
+        assert!(speed <= most * 1.001, "one tick reached {speed}, the cap allows {most}");
+        assert!(speed > 0.5 * most, "the grab barely pulled: {speed}");
+    }
+
+    /// Letting go keeps the momentum the grab gave: a body carried sideways and
+    /// released keeps going, as a flick would throw it.
+    #[test]
+    fn letting_go_keeps_the_momentum() {
+        let space = Space::new();
+        let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
+        let mut grab = Joint::grab(&bodies[0], bodies[0].position);
+        for tick in 0..128 {
+            grab.anchor_b = Vec3::new(30.0 + tick as f32 * 0.1, 30.0, 30.0);
+            space.step_holding(&mut bodies, &mut grab, Vec3::ZERO);
+        }
+        // The target moved 0.1 a tick: 6.4 voxels a second. The body ends a
+        // tick slower than that: the target jumps once a tick and the four
+        // substeps close 20% of the gap each, so the last one moves at
+        // `0.2 · 0.8³ · L / h`, with `L = 0.1 / (1 − 0.8⁴)`: 4.44, as measured.
+        // Relaxing the grab would leave nearly nothing.
+        let carried = bodies[0].velocity.x;
+        assert!(carried > 0.5 * 6.4 && carried < 6.4, "carried at {carried}, the target at 6.4");
+        space.step(&mut bodies, &mut [], Vec3::ZERO);
+        assert_eq!(bodies[0].velocity.x, carried, "letting go changed the velocity");
+    }
+
+    /// A grab on a body that is gone does nothing, rather than panicking.
+    #[test]
+    fn a_grab_on_a_missing_body_does_nothing() {
+        let space = Space::new();
+        let gone = placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY);
+        let mut grab = Joint::grab(&gone, gone.position);
+        let mut bodies = vec![placed(cube(4, 4), Vec3::new(40.0, 30.0, 30.0), Quat::IDENTITY)];
+        space.step_holding(&mut bodies, &mut grab, Vec3::ZERO);
+        assert_eq!(bodies[0].velocity, Vec3::ZERO);
     }
 
     /// Cut a bar in two, and a joint pinned to its far end follows the piece

@@ -8,7 +8,7 @@ use bevox_core::physics::GRAVITY;
 use bevox_core::physics::detach::detach;
 use bevox_core::physics::joint::{Joint, follow};
 use bevox_core::physics::sculpt::sculpt;
-use bevox_core::physics::solver::{Grab, step};
+use bevox_core::physics::solver::step;
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system, start_camera};
 use bevox_render::pick::{Target, cursor_ray, pick};
@@ -143,7 +143,7 @@ fn demo_body(centre: Vec3, orientation: Quat) -> Body {
 /// One physics tick for every body.
 fn physics_system(
     time: Res<Time>,
-    grab: Res<GrabState>,
+    mut grab: ResMut<GrabState>,
     mut joints: ResMut<Joints>,
     mut scene: ResMut<VoxelScene>,
 ) {
@@ -155,7 +155,7 @@ fn physics_system(
         &scene.materials,
         GRAVITY,
         time.delta_secs(),
-        grab.held.as_ref(),
+        grab.held.as_mut(),
         &mut joints.0,
     );
     // Edits since the last tick may have split or removed a jointed body.
@@ -195,7 +195,7 @@ fn drop_body_input(
 #[derive(Resource, Default)]
 struct GrabState {
     enabled: bool,
-    held: Option<Grab>,
+    held: Option<Joint>,
     distance: f32,
 }
 
@@ -225,10 +225,10 @@ fn title(grab: &GrabState) -> String {
 #[derive(Resource, Default)]
 struct Joints(Vec<Joint>);
 
-/// In grab mode, holding the left mouse on a body picks it up: a spring pulls
-/// the clicked point toward a point on the cursor's ray, as far away as it was
-/// when clicked. The wheel moves it nearer or farther; letting go drops it,
-/// with whatever momentum it has.
+/// In grab mode, holding the left mouse on a body picks it up: a joint holds
+/// the clicked point at a point on the cursor's ray, as far away as it was when
+/// clicked, and keeps the body's orientation. The wheel moves it nearer or
+/// farther; letting go drops it, with whatever momentum it has.
 fn grab_input(
     buttons: Res<ButtonInput<MouseButton>>,
     mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
@@ -247,7 +247,7 @@ fn grab_input(
     }
     // A held body that was erased away, or removed, is no longer held.
     if let Some(held) = state.held
-        && !scene.bodies.iter().any(|b| b.id == held.body)
+        && !scene.bodies.iter().any(|b| b.id == held.a)
     {
         state.held = None;
     }
@@ -269,7 +269,7 @@ fn grab_input(
         if let Some(hit) = pick(&scene.tree, &scene.bodies, world_from_clip, eye, ndc)
             && let Target::Body(i) = hit.target
         {
-            state.held = Some(Grab::new(&scene.bodies[i], hit.position));
+            state.held = Some(Joint::grab(&scene.bodies[i], hit.position));
             state.distance = (hit.position - eye).length();
         }
         return;
@@ -279,7 +279,7 @@ fn grab_input(
         state.distance = (state.distance + notches).clamp(2.0, 200.0);
         let target = eye + cursor_ray(world_from_clip, eye, ndc) * state.distance;
         if let Some(held) = state.held.as_mut() {
-            held.target = target;
+            held.anchor_b = target;
         }
     }
 }
@@ -552,11 +552,9 @@ mod tests {
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyG);
         world.insert_resource(keys);
-        world.resource_mut::<GrabState>().held = Some(Grab {
-            body: bevox_core::body::BodyId(7),
-            anchor: Vec3::ZERO,
-            target: Vec3::ZERO,
-        });
+        let mut body = demo_body(Vec3::ZERO, Quat::IDENTITY);
+        assert!(body.recompute(&demo_scene().1));
+        world.resource_mut::<GrabState>().held = Some(Joint::grab(&body, Vec3::ZERO));
         world.run_system(toggle).unwrap();
         let state = world.resource::<GrabState>();
         assert!(!state.enabled);
@@ -574,8 +572,8 @@ mod tests {
         let field = DistanceField::build(&tree);
         let mut body = demo_body(Vec3::new(20.0, 40.0, 20.0), Quat::IDENTITY);
         assert!(body.recompute(&materials));
-        let mut grab = Grab::new(&body, body.position);
-        grab.target = body.position + Vec3::new(10.0, 0.0, 0.0);
+        let mut grab = Joint::grab(&body, body.position);
+        grab.anchor_b = body.position + Vec3::new(10.0, 0.0, 0.0);
         world.insert_resource(GrabState { enabled: true, held: Some(grab), distance: 10.0 });
         world.init_resource::<Joints>();
         world.insert_resource(VoxelScene {

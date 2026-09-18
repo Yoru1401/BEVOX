@@ -325,6 +325,9 @@ had when it was grabbed.
   after it.
 - Letting go removes the joint, and the body keeps its momentum, so a flick
   throws it.
+- It is left out of the relax pass. Its target moves, and the bias is how that
+  motion reaches the body; relaxing it would stop the body dead every substep,
+  and letting go would throw nothing.
 - `G` toggles grab mode, and the wheel moves the held point nearer or farther.
 
 This replaces milestone 5's grab, a damped spring at the clicked point that was

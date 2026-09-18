@@ -56,23 +56,14 @@ pub const RESTITUTION_SWEEPS: u32 = 4;
 /// than becoming a body that could not be afforded anyway.
 pub const BUDGET: usize = 20_000;
 
-/// How fast a held body springs toward the cursor, in hertz. The spring is a
-/// frequency rather than a stiffness so that every body, heavy or light, is
-/// held the same way.
-pub const GRAB_FREQUENCY: f32 = 4.0;
+/// The most force the mouse grab pulls with: the weight of 2,000 voxels of
+/// density 1000. A body heavier than that sags and drags rather than lifts.
+pub const GRAB_MAX_FORCE: f32 = 2_000.0 * 1000.0 * 9.81 / VOXEL_METRES;
 
-/// The grab spring's damping ratio. Below 1 it overshoots a little, which is
-/// the swing that makes a held body feel held rather than attached.
-pub const GRAB_DAMPING: f32 = 0.7;
-
-/// How fast a held body's spin dies away, per second. The spring pins one point
-/// and does nothing about rotation around it, so without this a body held by
-/// its corner would swing forever.
-pub const GRAB_SPIN_DAMPING: f32 = 4.0;
-
-/// The most acceleration the grab may apply, in voxels per second squared, so
-/// a target far across the world pulls hard rather than instantly.
-pub const GRAB_MAX_ACCEL: f32 = 600.0;
+/// The most torque the grab turns a body with: its force at two voxels.
+/// Enough to hold the demo cube level by a corner, and weak enough that a grab
+/// more than two voxels from a hinge swings the door rather than locking it.
+pub const GRAB_MAX_TORQUE: f32 = GRAB_MAX_FORCE * 2.0;
 
 /// Speculative margin every body gets even at rest, in voxels.
 pub const BASE_MARGIN: f32 = 0.1;

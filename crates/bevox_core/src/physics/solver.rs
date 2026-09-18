@@ -13,10 +13,7 @@
 
 use super::contact::{Contact, RADIUS, detect, detect_pair, world_box};
 use super::joint::{self, Joint};
-use super::{
-    BASE_MARGIN, BIAS, GRAB_DAMPING, GRAB_FREQUENCY, GRAB_MAX_ACCEL, GRAB_SPIN_DAMPING, MAX_PUSH,
-    MAX_TRAVEL, RESTITUTION_SWEEPS, SLOP, SUBSTEPS,
-};
+use super::{BASE_MARGIN, BIAS, MAX_PUSH, MAX_TRAVEL, RESTITUTION_SWEEPS, SLOP, SUBSTEPS};
 use crate::body::{Body, BodyId, occupied_bounds};
 use crate::contree::Contree;
 use crate::distance_field::DistanceField;
@@ -32,26 +29,6 @@ pub struct ContactImpulse {
     pub tangent: Vec2,
 }
 
-/// A body held by the mouse: a damped spring from `target` to the point
-/// `anchor` of the body with id `body`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Grab {
-    pub body: BodyId,
-    /// The grabbed point, in the body's volume coordinates, so that recomputing
-    /// the body's centre of mass after an edit does not move it.
-    pub anchor: Vec3,
-    /// Where the spring pulls the grabbed point, in the world.
-    pub target: Vec3,
-}
-
-impl Grab {
-    /// Grabs `body` at the world point `at`, which is also where it is held
-    /// until the target moves.
-    pub fn new(body: &Body, at: Vec3) -> Self {
-        Self { body: body.id, anchor: body.local_from_world().transform_point3(at), target: at }
-    }
-}
-
 /// A contact and the bodies it joins: the one it belongs to, and the one it is
 /// against, unless that is the world.
 struct Joined {
@@ -65,7 +42,8 @@ struct Joined {
 ///
 /// Bodies entirely below the world are removed first. Returns whether any were:
 /// the body list changed, so the caller must rebuild what is packed from it. A
-/// body with no mass is not simulated.
+/// body with no mass is not simulated. `grab`, the mouse's joint to the world,
+/// is solved with the other joints.
 #[allow(clippy::too_many_arguments)]
 pub fn step(
     bodies: &mut Vec<Body>,
@@ -74,7 +52,7 @@ pub fn step(
     materials: &MaterialTable,
     gravity: Vec3,
     dt: f32,
-    grab: Option<&Grab>,
+    grab: Option<&mut Joint>,
     joints: &mut [Joint],
 ) -> bool {
     let before = bodies.len();
@@ -93,6 +71,15 @@ pub fn step(
         })
         .collect();
 
+    // Jointed pairs do not collide: a hinge where a door meets its frame would
+    // otherwise have the contact pushing out while the joint pulls back.
+    let jointed: HashSet<(BodyId, BodyId)> =
+        joints.iter().filter_map(|j| j.b.map(|b| pair_key(j.a, b))).collect();
+    // The grab is one more joint, to the world, last in the list, so the relax
+    // pass can leave it out.
+    let scene_joints = joints.len();
+    let mut joints: Vec<&mut Joint> = joints.iter_mut().chain(grab).collect();
+
     // Which bodies each joint joins, by index, this tick. A joint whose body is
     // gone, or has no mass, sits the tick out; `follow` is what removes it.
     let index: HashMap<BodyId, usize> = bodies.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
@@ -107,10 +94,6 @@ pub fn step(
             }
         })
         .collect();
-    // Jointed pairs do not collide: a hinge where a door meets its frame would
-    // otherwise have the contact pushing out while the joint pulls back.
-    let jointed: HashSet<(BodyId, BodyId)> =
-        joints.iter().filter_map(|j| j.b.map(|b| pair_key(j.a, b))).collect();
 
     let joined = collect_contacts(bodies, tree, field, materials, &travel, &jointed);
     let mut impulses: Vec<ContactImpulse> = joined
@@ -130,9 +113,6 @@ pub fn step(
     for _ in 0..SUBSTEPS {
         for (b, &r) in bodies.iter_mut().zip(&radii).filter(|(b, _)| b.mass.mass > 0.0) {
             b.velocity += gravity * h;
-            if let Some(grab) = grab.filter(|g| g.body == b.id) {
-                pull(b, grab, h);
-            }
             cap_speed(b, world_inverse_inertia(b), r, dt);
         }
 
@@ -146,7 +126,7 @@ pub fn step(
                 joint::warm_start(a, b, joint);
             }
         }
-        solve_joints(bodies, joints, &links, inv_h, true);
+        solve_joints(bodies, &mut joints, &links, inv_h, true);
         for (j, impulse) in joined.iter().zip(impulses.iter_mut()) {
             let (a, mut b) = pair_mut(bodies, j.body, j.other);
             solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, true);
@@ -157,7 +137,10 @@ pub fn step(
             integrate(b, h);
         }
 
-        solve_joints(bodies, joints, &links, inv_h, false);
+        // The grab is not relaxed. Its target moves, and the bias is how that
+        // motion reaches the body: relaxing it would stop the body dead every
+        // substep, and letting go would throw nothing.
+        solve_joints(bodies, &mut joints[..scene_joints], &links[..scene_joints], inv_h, false);
         for (j, impulse) in joined.iter().zip(impulses.iter_mut()) {
             let (a, mut b) = pair_mut(bodies, j.body, j.other);
             solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, false);
@@ -259,24 +242,6 @@ fn apply_restitution(
     }
 }
 
-/// Pulls the grabbed point toward the target with a damped spring, applied at
-/// the point, so the body turns as well as moves; and damps the body's spin,
-/// which the spring alone does nothing about.
-///
-/// The spring is an acceleration scaled by the body's mass, so every body is
-/// held alike. It runs once per substep, which keeps `w h` small enough for an
-/// explicit spring to stay stable.
-fn pull(body: &mut Body, grab: &Grab, h: f32) {
-    let w = std::f32::consts::TAU * GRAB_FREQUENCY;
-    let point = body.world_from_local().transform_point3(grab.anchor);
-    let r = point - body.position;
-    let spring = w * w * (grab.target - point) - 2.0 * GRAB_DAMPING * w * point_velocity(body, r);
-    let impulse = spring.clamp_length_max(GRAB_MAX_ACCEL) * body.mass.mass * h;
-    body.velocity += impulse * body.mass.inverse_mass();
-    body.angular_momentum += r.cross(impulse);
-    body.angular_momentum *= (1.0 - GRAB_SPIN_DAMPING * h).max(0.0);
-}
-
 /// The same key for a pair whichever way round it is named.
 fn pair_key(a: BodyId, b: BodyId) -> (BodyId, BodyId) {
     (a.min(b), a.max(b))
@@ -285,7 +250,7 @@ fn pair_key(a: BodyId, b: BodyId) -> (BodyId, BodyId) {
 /// One iteration over every joint whose bodies are here.
 fn solve_joints(
     bodies: &mut [Body],
-    joints: &mut [Joint],
+    joints: &mut [&mut Joint],
     links: &[Option<(usize, Option<usize>)>],
     inv_h: f32,
     use_bias: bool,
@@ -598,73 +563,6 @@ mod tests {
         assert!(landed_at < started_at - 1.0, "it never fell: {started_at} to {landed_at}");
         assert!(bodies[0].velocity.length() < 0.5, "it never settled: {:?}", bodies[0].velocity);
         assert!(landed_at > 8.0, "it fell through the floor to {landed_at}");
-    }
-
-    /// Held at its centre and moved, a body springs to the target and settles
-    /// there, hanging the little gravity asks for.
-    #[test]
-    fn a_grabbed_body_settles_at_the_target() {
-        let materials = materials();
-        let world = Contree::empty(3);
-        let field = DistanceField::build(&world);
-        let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
-        let mut grab = Grab::new(&bodies[0], Vec3::new(30.0, 30.0, 30.0));
-        grab.target = Vec3::new(34.0, 32.0, 30.0);
-        for _ in 0..300 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, Some(&grab), &mut []);
-        }
-        let held = bodies[0].world_from_local().transform_point3(grab.anchor);
-        assert!((held - grab.target).length() < 0.3, "held at {held:?}, target {:?}", grab.target);
-        assert!(bodies[0].velocity.length() < 0.05, "still moving at {:?}", bodies[0].velocity);
-    }
-
-    /// Held by a corner, a body hangs straight down from it, and the swing dies
-    /// away rather than going on forever.
-    #[test]
-    fn a_body_held_by_its_corner_hangs_below_it() {
-        let materials = materials();
-        let world = Contree::empty(3);
-        let field = DistanceField::build(&world);
-        let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
-        let corner = bodies[0].world_from_local().transform_point3(Vec3::ZERO);
-        let grab = Grab::new(&bodies[0], corner);
-        for _ in 0..900 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, Some(&grab), &mut []);
-        }
-        let com = bodies[0].position;
-        let off = com - grab.target;
-        assert!(off.y < -2.0, "the body is not hanging below the grab: {off:?}");
-        assert!(Vec3::new(off.x, 0.0, off.z).length() < 0.2, "the body hangs askew: {off:?}");
-        assert!(bodies[0].angular_velocity().length() < 0.05, "still swinging");
-    }
-
-    /// A target across the world accelerates the body hard, but no harder than
-    /// the grab's cap: no yank to full speed in a single tick.
-    #[test]
-    fn a_far_target_cannot_yank_a_body() {
-        let materials = materials();
-        let world = Contree::empty(3);
-        let field = DistanceField::build(&world);
-        let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
-        let mut grab = Grab::new(&bodies[0], Vec3::new(30.0, 30.0, 30.0));
-        grab.target = Vec3::new(3000.0, 30.0, 30.0);
-        step(&mut bodies, &world, &field, &materials, Vec3::ZERO, DT, Some(&grab), &mut []);
-        let speed = bodies[0].velocity.length();
-        assert!(speed <= GRAB_MAX_ACCEL * DT * 1.001, "one tick reached {speed}");
-        assert!(speed > 0.5 * GRAB_MAX_ACCEL * DT, "the grab barely pulled: {speed}");
-    }
-
-    /// A grab on a body that is gone does nothing, rather than panicking.
-    #[test]
-    fn a_grab_on_a_missing_body_does_nothing() {
-        let materials = materials();
-        let world = Contree::empty(3);
-        let field = DistanceField::build(&world);
-        let gone = placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY);
-        let grab = Grab::new(&gone, Vec3::new(30.0, 30.0, 30.0));
-        let mut bodies = vec![placed(cube(4, 4), Vec3::new(40.0, 30.0, 30.0), Quat::IDENTITY)];
-        step(&mut bodies, &world, &field, &materials, Vec3::ZERO, DT, Some(&grab), &mut []);
-        assert_eq!(bodies[0].velocity, Vec3::ZERO);
     }
 
     /// How far apart a joint's two sides have come.
