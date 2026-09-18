@@ -6,7 +6,7 @@
 
 use super::BIAS;
 use crate::body::{Body, BodyId};
-use glam::{Mat3, Vec3};
+use glam::{Mat2, Mat3, Vec2, Vec3};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JointKind {
@@ -133,4 +133,39 @@ pub(crate) fn solve(a: &mut Body, mut b: Option<&mut Body>, joint: &mut Joint, i
     let lambda = -(k.inverse() * (va - vb + bias));
     joint.linear += lambda;
     apply(a, b.as_deref_mut(), ra, rb, lambda, Vec3::ZERO);
+
+    if joint.kind == JointKind::Hinge {
+        solve_hinge(a, b, joint, inv_h, use_bias);
+    }
+}
+
+/// A hinge's two angular rows: the bodies may turn relative to each other only
+/// about the axis, and a fraction of any misalignment is turned back.
+///
+/// The rows are the two directions across the axis, rebuilt from the axis every
+/// time, which is why the accumulated impulse is kept in world axes.
+fn solve_hinge(a: &mut Body, b: Option<&mut Body>, joint: &mut Joint, inv_h: f32, use_bias: bool) {
+    let wa = a.orientation * joint.axis_a;
+    let wb = b.as_deref().map_or(joint.axis_b, |b| b.orientation * joint.axis_b);
+    let (t1, t2) = wa.any_orthonormal_pair();
+    let inverse = a.world_inverse_inertia()
+        + b.as_deref().map_or(Mat3::ZERO, |b| b.world_inverse_inertia());
+    let spin = a.angular_velocity() - b.as_deref().map_or(Vec3::ZERO, |b| b.angular_velocity());
+    let cdot = Vec2::new(spin.dot(t1), spin.dot(t2));
+    // Turning `a` about `wa x wb` brings its axis toward `b`'s, so the bias asks
+    // for relative spin along it, in proportion to the misalignment.
+    let error = wa.cross(wb);
+    let bias = if use_bias {
+        -Vec2::new(error.dot(t1), error.dot(t2)) * (BIAS * inv_h)
+    } else {
+        Vec2::ZERO
+    };
+    let k = Mat2::from_cols(
+        Vec2::new(t1.dot(inverse * t1), t2.dot(inverse * t1)),
+        Vec2::new(t1.dot(inverse * t2), t2.dot(inverse * t2)),
+    );
+    let lambda = -(k.inverse() * (cdot + bias));
+    let impulse = t1 * lambda.x + t2 * lambda.y;
+    joint.angular += impulse;
+    apply(a, b, Vec3::ZERO, Vec3::ZERO, Vec3::ZERO, impulse);
 }

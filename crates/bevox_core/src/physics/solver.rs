@@ -813,6 +813,42 @@ mod tests {
         }
     }
 
+    /// A door hinged to the world about a vertical axis turns only about that
+    /// axis: pushed, it swings in the horizontal plane, its hinge stays put, and
+    /// gravity, pulling on the far edge, does not tip it.
+    #[test]
+    fn a_hinged_door_turns_only_about_its_axis() {
+        use crate::physics::joint::{Joint, JointKind};
+        let materials = materials();
+        let world = Contree::empty(3);
+        let field = DistanceField::build(&world);
+        // A door 8 wide, 12 tall, 1 thick, from x = 30 to 38.
+        let door: Vec<_> = (0..8)
+            .flat_map(|x| (0..12).map(move |y| (glam::UVec3::new(x, y, 0), MaterialId(1))))
+            .collect();
+        let mut bodies = vec![placed(
+            Contree::from_voxels(16, &door),
+            Vec3::new(34.0, 36.0, 30.5),
+            Quat::IDENTITY,
+        )];
+        let hinge = Vec3::new(30.01, 36.0, 30.5);
+        let mut joints = vec![Joint::new(JointKind::Hinge, &bodies[0], None, hinge, Vec3::Y)];
+        bodies[0].velocity = Vec3::new(0.0, 0.0, 8.0);
+        for _ in 0..300 {
+            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut joints);
+        }
+        let door = &bodies[0];
+        let up = door.orientation * Vec3::Y;
+        assert!(up.y > 0.999, "the door tipped: its up is {up:?}");
+        let spin = door.angular_velocity();
+        assert!(
+            Vec3::new(spin.x, 0.0, spin.z).length() < 0.02,
+            "the door turns about more than its axis: {spin:?}"
+        );
+        assert!(door.orientation.angle_between(Quat::IDENTITY) > 0.2, "the push never swung it");
+        assert!(opening(&bodies, &joints[0]) < 0.05, "the hinge moved");
+    }
+
     /// A moving cube hitting a still one of equal mass gives its motion away:
     /// momentum is conserved, and neither passes through the other.
     #[test]
