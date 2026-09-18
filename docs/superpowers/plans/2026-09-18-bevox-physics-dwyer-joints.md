@@ -1954,8 +1954,35 @@ git commit -m "docs: Dwyer's joints done"
 
 ## Measurements
 
-(Filled in during execution.)
+- **A tick of the joint scene** (12 bodies, 13 joints, release build): median 0.290, 0.286 and 0.288 ms over three runs of 1000 ticks each, after 200 ticks of warm-up. This is a single figure, not a comparison, so no A/B/A was needed.
+- **The workspace:** 327 tests pass and 9 are ignored, with no warnings.
 
 ## What changed during execution
 
-(Filled in during execution.)
+1. **`block` pads at `k`'s own scale, not with the identity.**
+   - The cause: a body's `k` is about 1e-5. A matrix mixing 1e-5 with 1 loses its small eigenvalues in f32.
+   - What it looked like: `padded · padded⁻¹` came out nowhere near the identity (entries up to 14), and a Free + Axis joint between two bodies grew its carried impulse about fivefold per tick until the bodies were stopped by the speed cap.
+   - Padding with `trace(k)/3` leaves the answer unchanged and brought the residual to 7e-8. The momentum gate caught it.
+2. **`no_joint_gains_energy` is blind to three breaks and catches two.**
+   - Blind: the relax pass run with bias, warm starting applied twice, and the bias ×10.
+   - Caught: λ ×3, and the effective mass's angular term with its sign flipped.
+   - It is kept as a guard against over-correction and a wrong effective mass, and nothing more.
+3. **The line-lever break is caught through a blow-up.** Pushing `b` at its own anchor makes the pair diverge, and the momentum gate fails on linear momentum, not on the torque the plan predicted.
+4. **The momentum gate was made able to see a misplaced friction lever.**
+   - At the plan's friction of 1e5, the lever break cost 5e-5 of the angular momentum, inside the 1e-3 tolerance.
+   - The fix: friction 1e7; anchors set apart for Free and Distance; `b` kicked across the line between them.
+   - Even then, breaking the lever in the friction solve alone stays blind (4.5e-5). Warm starting reapplies most of the impulse every substep at the correct lever, so the break that fails the gate moves both.
+5. **The target-motor knock:**
+   - A servo of 1e8 stopped a knock within two substeps, and a spin about the centre is mostly taken out by the hinge.
+   - The test now uses a servo of 1e7, still over three times the load, and knocks the bar about its hinge, as the door test does.
+6. **The release speed is 4.44, not the target's 6.4.**
+   - The target jumps once a tick, and the four substeps close 20% of the gap each, so the last substep moves at `0.2 · 0.8³ · L / h`, with `L = 0.1 / (1 − 0.8⁴)`: exactly 4.44.
+   - The gate now asks for more than half the target's speed, and for letting go to leave the speed unchanged.
+   - Relaxing the grab leaves 0, which is the break.
+7. **The joint scene gate was blind to a dead crank motor.** Gravity alone swings the linkage and moves the slider more than 5 voxels. The gate now also asks that the crank turn more than two full turns in ten seconds; with no motor, it turned −2.96 rad.
+8. **Breaks, all reverted.** Each one below fails its gate:
+   - Line with one row; Free solved as Locked; `apply` without `b`; Line pushing `b` at `pb`;
+   - door friction 0; friction unclamped; motor unclamped; no wrap; the friction lever at `pb` in both warm start and solve;
+   - grab Free; grab uncapped (two gates); grab relaxed;
+   - no generation bump; crank torque 0; servo target 0; block friction 0.
+9. **Unplanned, but needed:** moving the demo scene left five imports in `main.rs` unused, and they were removed.
