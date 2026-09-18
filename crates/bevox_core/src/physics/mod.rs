@@ -170,6 +170,18 @@ pub(crate) mod fixtures {
         Contree::from_voxels(extent, &voxels)
     }
 
+    /// Total mechanical energy: motion, spin, and height in gravity.
+    pub fn energy(bodies: &[Body]) -> f32 {
+        bodies
+            .iter()
+            .map(|b| {
+                0.5 * b.mass.mass * b.velocity.length_squared()
+                    + 0.5 * b.angular_velocity().dot(b.angular_momentum)
+                    + b.mass.mass * -crate::physics::GRAVITY.y * b.position.y
+            })
+            .sum()
+    }
+
     /// A body with its mass properties computed and its centre of mass at
     /// `centre` in the world.
     pub fn placed(volume: Contree, centre: Vec3, orientation: Quat) -> Body {
