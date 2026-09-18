@@ -43,6 +43,32 @@ pub enum Angular {
     Cone(f32),
 }
 
+/// The most a joint's friction resists the motion it leaves free: a force on
+/// the anchors, a torque on the turn. Zero is none.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Friction {
+    pub force: f32,
+    pub torque: f32,
+}
+
+/// What a motor asks of its motion: along a line in voxels, about an axis in
+/// radians.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Drive {
+    /// A relative speed.
+    Speed(f32),
+    /// A position, reached as a servo reaches it.
+    Target(f32),
+}
+
+/// A motor on a joint's one free motion, with the most force (or torque) it
+/// has.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Motor {
+    pub drive: Drive,
+    pub max: f32,
+}
+
 /// What a joint carried last substep, for warm starting. In world axes: a
 /// part's rows turn with the bodies, so a number per row would mean nothing by
 /// the next substep.
@@ -50,6 +76,10 @@ pub enum Angular {
 pub struct Carried {
     pub linear: Vec3,
     pub angular: Vec3,
+    pub linear_friction: Vec3,
+    pub angular_friction: Vec3,
+    /// Along the line or about the axis the motor drives.
+    pub motor: f32,
 }
 
 /// A joint between body `a` and body `b`, or the world when `b` is `None`.
@@ -69,6 +99,8 @@ pub struct Joint {
     pub axis_b: Vec3,
     /// `a`'s orientation relative to `b`'s when the joint was made.
     pub rest: Quat,
+    pub friction: Friction,
+    pub motor: Option<Motor>,
     pub carried: Carried,
 }
 
@@ -101,8 +133,34 @@ impl Joint {
             axis_a: a.orientation.inverse() * axis,
             axis_b: orientation(b).inverse() * axis,
             rest: orientation(b).inverse() * a.orientation,
+            friction: Friction::default(),
+            motor: None,
             carried: Carried::default(),
         }
+    }
+
+    /// The same joint, with friction on what it leaves free.
+    pub fn with_friction(mut self, friction: Friction) -> Self {
+        self.friction = friction;
+        self
+    }
+
+    /// The same joint, with a motor on its one free motion: along its line, or
+    /// about its axis.
+    ///
+    /// Panics unless it has exactly one of a Line part and an Axis part. On any
+    /// other joint a motor would have no single motion to drive, or two.
+    pub fn with_motor(mut self, motor: Motor) -> Self {
+        let line = self.linear == Linear::Line;
+        let axis = self.angular == Angular::Axis;
+        assert!(
+            line != axis,
+            "a motor needs exactly one of a Line part and an Axis part, not {:?} and {:?}",
+            self.linear,
+            self.angular
+        );
+        self.motor = Some(motor);
+        self
     }
 
     /// The two anchors in the world.
@@ -242,10 +300,21 @@ fn one_sided_bias(c: f32, inv_h: f32, use_bias: bool) -> f32 {
 }
 
 /// Re-applies what the joint carried before.
-pub(crate) fn warm_start(a: &mut Body, b: Option<&mut Body>, joint: &Joint) {
+pub(crate) fn warm_start(a: &mut Body, mut b: Option<&mut Body>, joint: &Joint) {
     let (pa, pb) = joint.pivots(a, b.as_deref());
+    let (wa, wb) = joint.axes(a, b.as_deref());
+    let c = &joint.carried;
+    let ra = pa - a.position;
+    let (motor_linear, motor_angular) = match joint.motor {
+        Some(_) if joint.linear == Linear::Line => (wb * c.motor, Vec3::ZERO),
+        Some(_) => (Vec3::ZERO, wa * c.motor),
+        None => (Vec3::ZERO, Vec3::ZERO),
+    };
     let rb = lever(b.as_deref(), b_point(joint, pa, pb));
-    apply(a, b, pa - a.position, rb, joint.carried.linear, joint.carried.angular);
+    apply(a, b.as_deref_mut(), ra, rb, c.linear, c.angular + c.angular_friction + motor_angular);
+    // Friction and a line's motor act on `b` at `a`'s anchor.
+    let rb = lever(b.as_deref(), pa);
+    apply(a, b, ra, rb, c.linear_friction + motor_linear, Vec3::ZERO);
 }
 
 /// One iteration on one joint. With `use_bias`, a fraction of the drift is
@@ -258,6 +327,10 @@ pub(crate) fn solve(
     inv_h: f32,
     use_bias: bool,
 ) {
+    // Velocity goals first, as in Box2D v3: they run in the relax pass too,
+    // because they are not drift corrections.
+    solve_motor(a, b.as_deref_mut(), joint, inv_h);
+    solve_friction(a, b.as_deref_mut(), joint, inv_h);
     // One-sided rows before equalities, so the hard constraints have the last
     // word: a cone before a point, a rope before a lock.
     if matches!(joint.angular, Angular::Cone(_)) && !matches!(joint.linear, Linear::Distance(_)) {
@@ -337,6 +410,88 @@ fn solve_angular(a: &mut Body, b: Option<&mut Body>, joint: &mut Joint, inv_h: f
         }
     };
     apply(a, b, Vec3::ZERO, Vec3::ZERO, Vec3::ZERO, joint.carried.angular - before);
+}
+
+/// Adds `delta` to an accumulated impulse, keeps the total within `limit` as a
+/// vector, and returns what was added in the end.
+fn clamp_add(total: &mut Vec3, delta: Vec3, limit: f32) -> Vec3 {
+    let before = *total;
+    *total = (before + delta).clamp_length_max(limit);
+    *total - before
+}
+
+/// The same, for one row.
+fn clamp_scalar(total: &mut f32, delta: f32, limit: f32) -> f32 {
+    let before = *total;
+    *total = (before + delta).clamp(-limit, limit);
+    *total - before
+}
+
+/// The motor, on the joint's one free motion: toward a speed, or toward a
+/// target as a servo. The target's error is wrapped on a hinge, so it takes
+/// the short way round. The accumulated impulse is held within `max` times
+/// the substep, so a motor stalls against a load beyond `max`.
+fn solve_motor(a: &mut Body, b: Option<&mut Body>, joint: &mut Joint, inv_h: f32) {
+    let Some(motor) = joint.motor else {
+        return;
+    };
+    let limit = motor.max / inv_h;
+    let (wa, wb) = joint.axes(a, b.as_deref());
+    if joint.linear == Linear::Line {
+        let pa = joint.pivots(a, b.as_deref()).0;
+        let (ra, rb) = (pa - a.position, lever(b.as_deref(), pa));
+        let want = match motor.drive {
+            Drive::Speed(v) => v,
+            Drive::Target(x) => (x - joint.slide(a, b.as_deref())) * BIAS * inv_h,
+        };
+        let speed = relative_velocity(a, b.as_deref(), ra, rb).dot(wb);
+        let k = linear_mass(a, b.as_deref(), ra, rb);
+        let lambda = block(k, outer(wb), wb * (speed - want)).dot(wb);
+        let applied = clamp_scalar(&mut joint.carried.motor, lambda, limit);
+        apply(a, b, ra, rb, wb * applied, Vec3::ZERO);
+    } else {
+        let want = match motor.drive {
+            Drive::Speed(v) => v,
+            Drive::Target(x) => wrap(x - joint.twist(a, b.as_deref())) * BIAS * inv_h,
+        };
+        let speed = relative_spin(a, b.as_deref()).dot(wa);
+        let lambda = block(angular_mass(a, b.as_deref()), outer(wa), wa * (speed - want)).dot(wa);
+        let applied = clamp_scalar(&mut joint.carried.motor, lambda, limit);
+        apply(a, b, Vec3::ZERO, Vec3::ZERO, Vec3::ZERO, wa * applied);
+    }
+}
+
+/// Friction on what the joint leaves free: a relative velocity of zero asked
+/// for, the accumulated impulse held within the force (or torque) times the
+/// substep, as a vector, as contact friction is. A motor replaces friction on
+/// the motion it drives.
+fn solve_friction(a: &mut Body, mut b: Option<&mut Body>, joint: &mut Joint, inv_h: f32) {
+    let Friction { force, torque } = joint.friction;
+    let driven = joint.motor.is_some();
+    let (wa, wb) = joint.axes(a, b.as_deref());
+    let linear_rows = match joint.linear {
+        Linear::Free | Linear::Distance(_) => Some(Mat3::IDENTITY),
+        Linear::Line if !driven => Some(outer(wb)),
+        _ => None,
+    };
+    if let Some(rows) = linear_rows.filter(|_| force > 0.0) {
+        let pa = joint.pivots(a, b.as_deref()).0;
+        let (ra, rb) = (pa - a.position, lever(b.as_deref(), pa));
+        let v = relative_velocity(a, b.as_deref(), ra, rb);
+        let lambda = block(linear_mass(a, b.as_deref(), ra, rb), rows, v);
+        let applied = clamp_add(&mut joint.carried.linear_friction, lambda, force / inv_h);
+        apply(a, b.as_deref_mut(), ra, rb, applied, Vec3::ZERO);
+    }
+    let angular_rows = match joint.angular {
+        Angular::Free | Angular::Cone(_) => Some(Mat3::IDENTITY),
+        Angular::Axis if !driven => Some(outer(wa)),
+        _ => None,
+    };
+    if let Some(rows) = angular_rows.filter(|_| torque > 0.0) {
+        let lambda = block(angular_mass(a, b.as_deref()), rows, relative_spin(a, b.as_deref()));
+        let applied = clamp_add(&mut joint.carried.angular_friction, lambda, torque / inv_h);
+        apply(a, b, Vec3::ZERO, Vec3::ZERO, Vec3::ZERO, applied);
+    }
 }
 
 /// After an edit, moves each joint to whichever piece now holds its pivot, and
@@ -539,17 +694,27 @@ mod tests {
                     placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY),
                     placed(cube_of(4, 4, MaterialId(2)), Vec3::new(34.5, 30.0, 30.0), Quat::IDENTITY),
                 ];
+                // Anchors apart where the part allows it, and `b` kicked across
+                // the line between them: friction then pulls across that line,
+                // and pushing `b` at the wrong point would twist the pair.
                 let at_a = Vec3::new(31.5, 30.5, 30.5);
                 let at_b = match linear {
-                    Linear::Distance(_) => Vec3::new(33.0, 30.5, 30.5),
+                    Linear::Free | Linear::Distance(_) => Vec3::new(33.0, 30.5, 30.5),
                     _ => at_a,
                 };
                 let axis = Vec3::new(0.3, 1.0, 0.2);
-                let mut joints =
-                    vec![Joint::new(&bodies[0], Some(&bodies[1]), linear, angular, at_a, at_b, axis)];
+                let mut joint = Joint::new(&bodies[0], Some(&bodies[1]), linear, angular, at_a, at_b, axis)
+                    // Strong enough to matter: at 1e5 a misplaced friction
+                    // lever cost 5e-5 of the angular momentum, inside the
+                    // tolerance, and the gate could not see it.
+                    .with_friction(Friction { force: 1.0e7, torque: 1.0e7 });
+                if (linear == Linear::Line) != (angular == Angular::Axis) {
+                    joint = joint.with_motor(Motor { drive: Drive::Speed(1.0), max: 1.0e6 });
+                }
+                let mut joints = vec![joint];
                 bodies[0].velocity = Vec3::new(0.0, 6.0, -3.0);
                 bodies[0].set_angular_velocity(Vec3::new(1.0, 2.0, 0.0));
-                bodies[1].velocity = Vec3::new(-2.0, 0.0, 1.0);
+                bodies[1].velocity = Vec3::new(-2.0, 0.0, 5.0);
                 let (p0, l0) = momentum(&bodies);
                 for _ in 0..200 {
                     space.step(&mut bodies, &mut joints, Vec3::ZERO);
@@ -595,6 +760,164 @@ mod tests {
                 assert!(highest - start < 0.02 * scale, "{name}: gained energy, {start} rose to {highest}");
             }
         }
+    }
+
+    /// A door 8 wide, 12 tall and 1 thick, centred at `centre`.
+    fn door(centre: Vec3) -> Body {
+        let voxels: Vec<_> = (0..8)
+            .flat_map(|x| (0..12).map(move |y| (UVec3::new(x, y, 0), MaterialId(1))))
+            .collect();
+        placed(Contree::from_voxels(16, &voxels), centre, Quat::IDENTITY)
+    }
+
+    /// A bar 8 long, from x = 30 to 38, hinged at its left end about z.
+    fn hinged_bar() -> (Vec<Body>, Joint) {
+        let voxels: Vec<_> = (0..8).map(|x| (UVec3::new(x, 0, 0), MaterialId(1))).collect();
+        let bar = placed(Contree::from_voxels(16, &voxels), Vec3::new(34.0, 30.5, 30.5), Quat::IDENTITY);
+        let end = Vec3::new(30.5, 30.5, 30.5);
+        let joint = Joint::new(&bar, None, Linear::Point, Angular::Axis, end, end, Vec3::Z);
+        (vec![bar], joint)
+    }
+
+    /// A door swinging on a hinge with friction slows and stops; without it,
+    /// it would swing on.
+    #[test]
+    fn friction_stops_a_swinging_door() {
+        let space = Space::new();
+        let mut bodies = vec![door(Vec3::new(34.0, 36.0, 30.5))];
+        let hinge = Vec3::new(30.5, 36.0, 30.5);
+        let mut joints = vec![
+            Joint::new(&bodies[0], None, Linear::Point, Angular::Axis, hinge, hinge, Vec3::Y)
+                .with_friction(Friction { force: 0.0, torque: 1.0e7 }),
+        ];
+        // Swinging about the hinge: the centre of mass moves at
+        // `ω × (com − hinge)`. A spin about the centre alone would mostly be
+        // taken out by the hinge, leaving too little swing to see.
+        let spin = Vec3::Y * 2.0;
+        bodies[0].set_angular_velocity(spin);
+        bodies[0].velocity = spin.cross(bodies[0].position - hinge);
+        for _ in 0..300 {
+            space.step(&mut bodies, &mut joints, GRAVITY);
+        }
+        assert!(bodies[0].orientation.angle_between(Quat::IDENTITY) > 0.1, "it never swung");
+        let spin = bodies[0].angular_velocity().length();
+        assert!(spin < 1e-3, "still turning at {spin}");
+    }
+
+    /// Joint friction resists up to its force and no further. A block on a
+    /// friction joint to the world, with less friction than its weight, falls
+    /// at `g − F/m`; with more, it hangs where it is.
+    #[test]
+    fn joint_friction_holds_up_to_its_force() {
+        let space = Space::new();
+        let fall = |share: f32, ticks: u32| -> Body {
+            let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 60.0, 30.0), Quat::IDENTITY)];
+            let weight = bodies[0].mass.mass * -GRAVITY.y;
+            let at = bodies[0].position;
+            let mut joints = vec![
+                Joint::new(&bodies[0], None, Linear::Free, Angular::Free, at, at, Vec3::Y)
+                    .with_friction(Friction { force: share * weight, torque: 0.0 }),
+            ];
+            for _ in 0..ticks {
+                space.step(&mut bodies, &mut joints, GRAVITY);
+            }
+            bodies.remove(0)
+        };
+        let weak = fall(0.5, 64);
+        let want = 0.5 * GRAVITY.y;
+        assert!(
+            (weak.velocity.y - want).abs() < 0.02 * want.abs(),
+            "fell at {} voxels/s after a second, want {want}",
+            weak.velocity.y
+        );
+        let strong = fall(2.0, 300);
+        assert!((strong.position.y - 60.0).abs() < 0.01, "slid to {}", strong.position.y);
+    }
+
+    /// A speed motor drives its hinge at its speed when it is strong enough,
+    /// and stalls when the load is more than its torque.
+    #[test]
+    fn a_speed_motor_drives_and_stalls() {
+        let space = Space::new();
+        let run = |max: f32| -> (f32, f32) {
+            let (mut bodies, joint) = hinged_bar();
+            let mut joints = vec![joint.with_motor(Motor { drive: Drive::Speed(2.0), max })];
+            let mut highest = f32::NEG_INFINITY;
+            for _ in 0..300 {
+                space.step(&mut bodies, &mut joints, GRAVITY);
+                highest = highest.max(joints[0].twist(&bodies[0], None));
+            }
+            (bodies[0].angular_velocity().z, highest)
+        };
+        // The bar weighs 8000; held level, gravity turns it with 8000 · 98 · 4,
+        // about 3.1e6. 5%: the point rows, solved after the motor, move the
+        // spin a little each pass while gravity pulls on the bar.
+        let (spin, _) = run(1.0e8);
+        assert!((spin - 2.0).abs() < 0.1, "a strong motor turns at {spin}, not 2");
+        let (_, highest) = run(1.0e6);
+        assert!(highest < 0.5, "a weak motor lifted the bar to {highest} rad");
+    }
+
+    /// A target motor turns its hinge to the target and holds it there, and
+    /// brings it back when it is knocked away.
+    #[test]
+    fn a_target_motor_holds_its_angle() {
+        let space = Space::new();
+        let target = std::f32::consts::FRAC_PI_4;
+        let (mut bodies, joint) = hinged_bar();
+        // Over three times the bar's pull at 45 degrees, about 2.2e6, yet weak
+        // enough that a knock visibly moves it: 1e8 stops the knock within two
+        // substeps.
+        let mut joints = vec![joint.with_motor(Motor { drive: Drive::Target(target), max: 1.0e7 })];
+        for _ in 0..300 {
+            space.step(&mut bodies, &mut joints, GRAVITY);
+        }
+        let at = joints[0].twist(&bodies[0], None);
+        assert!((at - target).abs() < 0.02, "held at {at}, not {target}");
+
+        // Knocked about the hinge, as the door is pushed: a spin about the
+        // centre alone would mostly be taken out by the hinge.
+        let spin = Vec3::Z * -5.0;
+        let end = bodies[0].world_from_local().transform_point3(joints[0].anchor_a);
+        bodies[0].set_angular_velocity(spin);
+        bodies[0].velocity = spin.cross(bodies[0].position - end);
+        let mut lowest = f32::INFINITY;
+        for _ in 0..300 {
+            space.step(&mut bodies, &mut joints, GRAVITY);
+            lowest = lowest.min(joints[0].twist(&bodies[0], None));
+        }
+        assert!(lowest < target - 0.1, "the knock never moved it");
+        let at = joints[0].twist(&bodies[0], None);
+        assert!((at - target).abs() < 0.02, "came back to {at}, not {target}");
+    }
+
+    /// From 3 radians to −3, a target motor goes the short way, through π, not
+    /// six radians back through 0.
+    #[test]
+    fn a_target_motor_takes_the_short_way_round() {
+        let space = Space::new();
+        let (mut bodies, joint) = hinged_bar();
+        let mut joints = vec![joint.with_motor(Motor { drive: Drive::Target(3.0), max: 1.0e8 })];
+        for _ in 0..300 {
+            space.step(&mut bodies, &mut joints, Vec3::ZERO);
+        }
+        assert!((joints[0].twist(&bodies[0], None) - 3.0).abs() < 0.02, "never reached 3");
+        joints[0].motor = Some(Motor { drive: Drive::Target(-3.0), max: 1.0e8 });
+        let mut nearest_zero = f32::INFINITY;
+        for _ in 0..300 {
+            space.step(&mut bodies, &mut joints, Vec3::ZERO);
+            nearest_zero = nearest_zero.min(joints[0].twist(&bodies[0], None).abs());
+        }
+        assert!(nearest_zero > 2.5, "went the long way, through {nearest_zero}");
+        assert!((joints[0].twist(&bodies[0], None) + 3.0).abs() < 0.02, "never reached -3");
+    }
+
+    /// A motor needs exactly one motion to drive.
+    #[test]
+    #[should_panic(expected = "a motor needs")]
+    fn a_motor_on_a_joint_without_one_free_motion_panics() {
+        let body = placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY);
+        let _ = ball(&body, None, body.position).with_motor(Motor { drive: Drive::Speed(1.0), max: 1.0 });
     }
 
     /// Cut a bar in two, and a joint pinned to its far end follows the piece
