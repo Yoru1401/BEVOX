@@ -6,10 +6,11 @@ use bevox_core::distance_field::DistanceField;
 use bevox_core::material::{Material, MaterialId, MaterialTable};
 use bevox_core::physics::GRAVITY;
 use bevox_core::physics::detach::detach;
+use bevox_core::physics::sculpt::sculpt;
 use bevox_core::physics::solver::step;
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system, start_camera};
-use bevox_render::pick::pick_voxel;
+use bevox_render::pick::{Target, pick};
 use bevox_render::pipeline::MAX_BODIES;
 use bevox_render::upload::{VoxelScene, apply_brush, build_gpu_scene};
 
@@ -96,10 +97,8 @@ fn setup(mut commands: Commands) {
     ));
 
     // Fourteen voxels ahead, ten short of the surface the camera faces, so on
-    // screen at start whatever scene was loaded. Six to the right of the line
-    // of sight, more than the cube's half-diagonal of about five, so it never
-    // sits under the middle of the screen: picking does not see bodies yet,
-    // and a click on the body would paint or erase the world behind it.
+    // screen at start whatever scene was loaded, and six to the right of the
+    // line of sight, so it does not hide what the camera is looking at.
     let forward = (look_at - eye).normalize();
     let right = forward.cross(Vec3::Y).normalize_or_zero();
     let mut body = demo_body(eye + forward * 14.0 + right * 6.0, Quat::IDENTITY);
@@ -252,7 +251,9 @@ fn brush_input(
     let Some(ndc) = cursor_ndc(window) else {
         return;
     };
-    let Some(hit) = pick_voxel(&scene.tree, world_from_clip, eye, ndc) else {
+    // Bodies as well as the world: the stroke edits whatever is under the
+    // cursor, and only that.
+    let Some(hit) = pick(&scene.tree, &scene.bodies, world_from_clip, eye, ndc) else {
         return;
     };
 
@@ -264,13 +265,24 @@ fn brush_input(
     } else {
         hit.position + hit.normal * brush.radius
     };
-    if erase {
-        erase_and_detach(&mut scene, centre, brush.radius);
-    } else {
-        apply_brush(&mut scene, centre, brush.radius, material);
+    stroke(&mut scene, hit.target, centre, brush.radius, material);
+}
+
+/// One brush stroke on whatever the cursor was on.
+///
+/// On the world, an edit is uploaded by range and does not bump the
+/// generation, which is what asks for a full rebuild; an erase then detaches
+/// whatever it cut free. On a body, the edit changes geometry that is packed
+/// whole, so it does.
+fn stroke(scene: &mut VoxelScene, target: Target, centre: Vec3, radius: f32, material: MaterialId) {
+    match target {
+        Target::World if material.is_empty() => erase_and_detach(scene, centre, radius),
+        Target::World => apply_brush(scene, centre, radius, material),
+        Target::Body(i) => {
+            sculpt(&mut scene.bodies, i, centre, radius, material, &scene.materials, MAX_BODIES);
+            scene.generation += 1;
+        }
     }
-    // Deliberately not bumped for the edit itself: an edit is uploaded by range,
-    // and bumping the generation is what asks for a full rebuild.
 }
 
 /// Erases a sphere, then hands whatever it cut free to the physics as bodies.
@@ -385,6 +397,30 @@ mod tests {
                 && scene.tree.get(UVec3::new(29, 20, 29)).is_empty(),
             "the column is still in the world as well"
         );
+    }
+
+    /// A stroke on a body edits the body, not the world behind it, and asks for
+    /// a rebuild, because a body's geometry is packed whole.
+    #[test]
+    fn a_stroke_on_a_body_edits_the_body() {
+        let (tree, materials) = demo_scene();
+        let field = DistanceField::build(&tree);
+        let mut body = demo_body(Vec3::new(10.0, 40.0, 50.0), Quat::IDENTITY);
+        assert!(body.recompute(&materials));
+        let voxels = body.volume.voxels().len();
+        let world = tree.voxels().len();
+        let mut scene = VoxelScene {
+            tree,
+            materials,
+            generation: 1,
+            field,
+            field_dirty: None,
+            bodies: vec![body],
+        };
+        stroke(&mut scene, Target::Body(0), Vec3::new(10.0, 40.0, 50.0), 2.0, MaterialId::EMPTY);
+        assert!(scene.bodies[0].volume.voxels().len() < voxels, "the body was not edited");
+        assert_eq!(scene.tree.voxels().len(), world, "the world was edited too");
+        assert_eq!(scene.generation, 2, "a body edit did not ask for a rebuild");
     }
 
     /// The system steps the scene's bodies, and a body leaving the world bumps
