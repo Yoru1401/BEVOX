@@ -463,6 +463,37 @@ mod tests {
         assert!((angle - rate * DT).abs() < 0.01 * rate * DT, "turned {angle}, want {}", rate * DT);
     }
 
+    /// The milestone in one test: carve the support out and the piece falls,
+    /// then rests on the floor.
+    #[test]
+    fn a_cut_column_falls_and_lands() {
+        let materials = materials();
+        let mut voxels = slab(64, 0..8).voxels();
+        for y in 8..20 {
+            voxels.push((glam::UVec3::new(32, y, 32), MaterialId(2)));
+        }
+        let mut world = Contree::from_voxels(64, &voxels);
+        let field = DistanceField::build(&world);
+
+        // Cut the column's base.
+        world.clear_voxels(&[glam::UVec3::new(32, 8, 32), glam::UVec3::new(32, 9, 32)]);
+        let mut bodies = crate::physics::detach::detach(
+            &mut world,
+            &materials,
+            glam::IVec3::new(31, 7, 31),
+            glam::IVec3::new(33, 10, 33),
+            16,
+        );
+        assert_eq!(bodies.len(), 1, "the column did not come free");
+        let started_at = bodies[0].position.y;
+
+        run(&mut bodies, &world, &field, &materials, GRAVITY, 200);
+        let landed_at = bodies[0].position.y;
+        assert!(landed_at < started_at - 1.0, "it never fell: {started_at} to {landed_at}");
+        assert!(bodies[0].velocity.length() < 0.5, "it never settled: {:?}", bodies[0].velocity);
+        assert!(landed_at > 8.0, "it fell through the floor to {landed_at}");
+    }
+
     /// A moving cube hitting a still one of equal mass gives its motion away:
     /// momentum is conserved, and neither passes through the other.
     #[test]

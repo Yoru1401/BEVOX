@@ -6,9 +6,12 @@
 //! volume; this one walks voxels and gives up past a budget. The spec's
 //! Detachment section says why, and what it would take to change.
 
+use super::BUDGET;
+use crate::body::Body;
 use crate::contree::Contree;
+use crate::material::{MaterialId, MaterialTable};
 use crate::physics::classify::solid_at;
-use glam::{IVec3, UVec3};
+use glam::{IVec3, Quat, UVec3};
 use std::collections::HashMap;
 
 const NEIGHBOURS: [IVec3; 6] =
@@ -87,6 +90,55 @@ fn walk(
     }
     piece.sort_unstable_by_key(|p| (p.z, p.y, p.x));
     Some(piece)
+}
+
+/// Turns the pieces an edit cut free into bodies, removing them from the world.
+///
+/// `room` is how many more bodies the scene can draw. Past it, the largest
+/// pieces are taken and the rest stay in the world: a piece that vanished
+/// because the cap was full would look like a bug, not a budget.
+pub fn detach(
+    tree: &mut Contree,
+    materials: &MaterialTable,
+    lo: IVec3,
+    hi: IVec3,
+    room: usize,
+) -> Vec<Body> {
+    let mut pieces = loose_pieces(tree, lo, hi, BUDGET);
+    pieces.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    pieces.truncate(room);
+
+    let mut bodies = Vec::new();
+    for piece in pieces {
+        let voxels: Vec<_> = piece.iter().map(|&p| (p, tree.get(p))).collect();
+        tree.clear_voxels(&piece);
+        if let Some(body) = body_from(&voxels, materials) {
+            bodies.push(body);
+        }
+    }
+    bodies
+}
+
+/// Builds a body holding `voxels`, placed where they were.
+///
+/// The volume is the smallest power of four that fits the piece, because that
+/// is what a `Contree`'s extent must be, and the piece sits at its corner.
+fn body_from(voxels: &[(UVec3, MaterialId)], materials: &MaterialTable) -> Option<Body> {
+    let (first, _) = *voxels.first()?;
+    let mut lo = first;
+    let mut hi = first;
+    for (p, _) in voxels {
+        lo = lo.min(*p);
+        hi = hi.max(*p);
+    }
+    let span = (hi - lo + UVec3::ONE).max_element();
+    let mut extent = 4;
+    while extent < span {
+        extent *= 4;
+    }
+    let local: Vec<_> = voxels.iter().map(|(p, m)| (*p - lo, *m)).collect();
+    let mut body = Body::new(Contree::from_voxels(extent, &local), lo.as_vec3(), Quat::IDENTITY);
+    body.recompute(materials).then_some(body)
 }
 
 #[cfg(test)]
@@ -193,5 +245,72 @@ mod tests {
         let tree = Contree::from_voxels(16, &voxels);
         let pieces = loose_pieces(&tree, IVec3::new(3, 0, 0), IVec3::new(4, 1, 1), BUDGET);
         assert_eq!(pieces, vec![vec![UVec3::new(4, 1, 1)]]);
+    }
+
+    /// The freed column leaves the world and arrives as a body, with its voxels
+    /// in the same places and its mass computed.
+    #[test]
+    fn a_freed_piece_becomes_a_body_where_it_stood() {
+        let materials = crate::physics::fixtures::materials();
+        let mut tree = floor_and_column();
+        tree.clear_voxels(&[UVec3::new(8, 1, 8), UVec3::new(8, 2, 8)]);
+        let bodies = detach(&mut tree, &materials, IVec3::new(7, 0, 7), IVec3::new(9, 3, 9), 16);
+
+        assert_eq!(bodies.len(), 1);
+        let body = &bodies[0];
+        assert!(body.mass.mass > 0.0, "the body has no mass");
+        for y in 3..10 {
+            assert!(tree.get(UVec3::new(8, y, 8)).is_empty(), "voxel {y} is still in the world");
+        }
+        assert!(!tree.get(UVec3::new(8, 0, 8)).is_empty(), "the floor went with it");
+
+        let mut world: Vec<[i32; 3]> = body
+            .volume
+            .voxels()
+            .iter()
+            .map(|(p, _)| {
+                let at = body.world_from_local().transform_point3(p.as_vec3() + 0.5);
+                (at - 0.5).round().as_ivec3().to_array()
+            })
+            .collect();
+        world.sort_unstable();
+        let want: Vec<[i32; 3]> = (3..10).map(|y| [8, y, 8]).collect();
+        assert_eq!(world, want, "the piece moved when it became a body");
+    }
+
+    /// With no room for another body, the piece stays in the world: geometry
+    /// that cannot be drawn must not disappear.
+    #[test]
+    fn a_piece_stays_in_the_world_when_there_is_no_room() {
+        let materials = crate::physics::fixtures::materials();
+        let mut tree = floor_and_column();
+        tree.clear_voxels(&[UVec3::new(8, 1, 8), UVec3::new(8, 2, 8)]);
+        let bodies = detach(&mut tree, &materials, IVec3::new(7, 0, 7), IVec3::new(9, 3, 9), 0);
+        assert!(bodies.is_empty());
+        assert!(!tree.get(UVec3::new(8, 5, 8)).is_empty(), "the column vanished with nowhere to go");
+    }
+
+    /// The biggest pieces go first when there is not room for all of them.
+    #[test]
+    fn the_biggest_pieces_go_first() {
+        let mut voxels = Vec::new();
+        for z in 0..16 {
+            for x in 0..16 {
+                voxels.push((UVec3::new(x, 0, z), MaterialId(1)));
+            }
+        }
+        for y in 1..3 {
+            voxels.push((UVec3::new(4, y, 4), MaterialId(2)));
+        }
+        for y in 1..8 {
+            voxels.push((UVec3::new(12, y, 12), MaterialId(2)));
+        }
+        let mut tree = Contree::from_voxels(16, &voxels);
+        tree.clear_voxels(&[UVec3::new(4, 1, 4), UVec3::new(12, 1, 12)]);
+        let materials = crate::physics::fixtures::materials();
+        let bodies = detach(&mut tree, &materials, IVec3::new(3, 0, 3), IVec3::new(13, 2, 13), 1);
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].volume.voxels().len(), 6, "the shorter column was taken instead");
+        assert!(!tree.get(UVec3::new(4, 2, 4)).is_empty(), "the shorter column vanished");
     }
 }
