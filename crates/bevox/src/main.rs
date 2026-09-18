@@ -7,10 +7,10 @@ use bevox_core::material::{Material, MaterialId, MaterialTable};
 use bevox_core::physics::GRAVITY;
 use bevox_core::physics::detach::detach;
 use bevox_core::physics::sculpt::sculpt;
-use bevox_core::physics::solver::step;
+use bevox_core::physics::solver::{Grab, step};
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system, start_camera};
-use bevox_render::pick::{Target, pick};
+use bevox_render::pick::{Target, cursor_ray, pick};
 use bevox_render::pipeline::MAX_BODIES;
 use bevox_render::upload::{VoxelScene, apply_brush, build_gpu_scene};
 
@@ -45,13 +45,16 @@ fn main() {
         })
         .add_plugins(BevoxRenderPlugin)
         .init_resource::<BrushSettings>()
+        .init_resource::<GrabState>()
         .add_systems(Startup, setup)
         // Before the rebuild too, not merely before staging. On a frame that
         // rebuilds because the last stroke outgrew the world region, a stroke
         // landing between the rebuild and the staging is drained into an update
         // the render world discards in favour of the snapshot -- which was
         // taken before that stroke. It is then lost until the next rebuild.
+        .add_systems(Update, toggle_grab_mode.before(brush_input).before(grab_input))
         .add_systems(Update, brush_input.after(fly_camera_system).before(build_gpu_scene))
+        .add_systems(Update, grab_input.after(fly_camera_system))
         // Fixed timestep: physics must not depend on the frame rate. Bevy runs
         // `FixedUpdate` before `Update`, so a removal's generation bump lands
         // before `build_gpu_scene`.
@@ -136,7 +139,7 @@ fn demo_body(centre: Vec3, orientation: Quat) -> Body {
 }
 
 /// One physics tick for every body.
-fn physics_system(time: Res<Time>, mut scene: ResMut<VoxelScene>) {
+fn physics_system(time: Res<Time>, grab: Res<GrabState>, mut scene: ResMut<VoxelScene>) {
     let scene = &mut *scene;
     let changed = step(
         &mut scene.bodies,
@@ -145,7 +148,7 @@ fn physics_system(time: Res<Time>, mut scene: ResMut<VoxelScene>) {
         &scene.materials,
         GRAVITY,
         time.delta_secs(),
-        None,
+        grab.held.as_ref(),
     );
     if changed {
         // A body left the world. The body list is packed into the scene
@@ -174,6 +177,91 @@ fn drop_body_input(
         scene.bodies.push(body);
         // A new body adds geometry to the packed buffers.
         scene.generation += 1;
+    }
+}
+
+/// The mouse grab: whether the left mouse grabs instead of painting, what it
+/// holds, and how far in front of the camera the held point is kept.
+#[derive(Resource, Default)]
+struct GrabState {
+    enabled: bool,
+    held: Option<Grab>,
+    distance: f32,
+}
+
+/// `G` switches grab mode on and off. Switching it off lets go, and the window
+/// title says which mode is on.
+fn toggle_grab_mode(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut state: ResMut<GrabState>,
+    mut windows: Query<&mut Window>,
+) {
+    if !keys.just_pressed(KeyCode::KeyG) {
+        return;
+    }
+    state.enabled = !state.enabled;
+    state.held = None;
+    if let Ok(mut window) = windows.single_mut() {
+        window.title = if state.enabled { "BEVOX \u{2014} grab mode (G)" } else { "BEVOX" }.into();
+    }
+}
+
+/// In grab mode, holding the left mouse on a body picks it up: a spring pulls
+/// the clicked point toward a point on the cursor's ray, as far away as it was
+/// when clicked. The wheel moves it nearer or farther; letting go drops it,
+/// with whatever momentum it has.
+fn grab_input(
+    buttons: Res<ButtonInput<MouseButton>>,
+    mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
+    mut state: ResMut<GrabState>,
+    scene: Res<VoxelScene>,
+    camera: Query<(&GlobalTransform, &Projection), With<Camera3d>>,
+    windows: Query<&Window>,
+) {
+    let notches: f32 = wheel.read().map(|e| e.y).sum();
+    if !state.enabled {
+        return;
+    }
+    if buttons.just_released(MouseButton::Left) {
+        state.held = None;
+        return;
+    }
+    // A held body that was erased away, or removed, is no longer held.
+    if let Some(held) = state.held
+        && !scene.bodies.iter().any(|b| b.id == held.body)
+    {
+        state.held = None;
+    }
+
+    let Ok((transform, projection)) = camera.single() else {
+        return;
+    };
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Some(ndc) = cursor_ndc(window) else {
+        return;
+    };
+    let eye = transform.translation();
+    let world_from_clip =
+        (projection.get_clip_from_view() * transform.to_matrix().inverse()).inverse();
+
+    if buttons.just_pressed(MouseButton::Left) {
+        if let Some(hit) = pick(&scene.tree, &scene.bodies, world_from_clip, eye, ndc)
+            && let Target::Body(i) = hit.target
+        {
+            state.held = Some(Grab::new(&scene.bodies[i], hit.position));
+            state.distance = (hit.position - eye).length();
+        }
+        return;
+    }
+
+    if buttons.pressed(MouseButton::Left) && state.held.is_some() {
+        state.distance = (state.distance + notches).clamp(2.0, 200.0);
+        let target = eye + cursor_ray(world_from_clip, eye, ndc) * state.distance;
+        if let Some(held) = state.held.as_mut() {
+            held.target = target;
+        }
     }
 }
 
@@ -217,19 +305,25 @@ fn cursor_ndc(window: &Window) -> Option<Vec2> {
     Some(Vec2::new(p.x / w * 2.0 - 1.0, 1.0 - p.y / h * 2.0))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn brush_input(
     buttons: Res<ButtonInput<MouseButton>>,
     mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
     mut brush: ResMut<BrushSettings>,
+    grab: Res<GrabState>,
     mut scene: ResMut<VoxelScene>,
     camera: Query<(&GlobalTransform, &Projection), With<Camera3d>>,
     windows: Query<&Window>,
 ) {
+    // While a body is held the wheel moves it nearer or farther instead.
     for event in wheel.read() {
-        brush.radius = (brush.radius + event.y).clamp(1.0, 32.0);
+        if grab.held.is_none() {
+            brush.radius = (brush.radius + event.y).clamp(1.0, 32.0);
+        }
     }
 
-    let paint = buttons.just_pressed(MouseButton::Left);
+    // In grab mode the left mouse grabs; only the erase is left here.
+    let paint = buttons.just_pressed(MouseButton::Left) && !grab.enabled;
     let erase = buttons.just_pressed(MouseButton::Right);
     if !paint && !erase {
         return;
@@ -424,6 +518,60 @@ mod tests {
         assert_eq!(scene.generation, 2, "a body edit did not ask for a rebuild");
     }
 
+    /// `G` switches grab mode on and off, and switching it off lets go.
+    #[test]
+    fn g_toggles_grab_mode() {
+        let mut world = World::new();
+        world.init_resource::<GrabState>();
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::KeyG);
+        world.insert_resource(keys);
+        let toggle = world.register_system(toggle_grab_mode);
+        world.run_system(toggle).unwrap();
+        assert!(world.resource::<GrabState>().enabled);
+
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::KeyG);
+        world.insert_resource(keys);
+        world.resource_mut::<GrabState>().held = Some(Grab {
+            body: bevox_core::body::BodyId(7),
+            anchor: Vec3::ZERO,
+            target: Vec3::ZERO,
+        });
+        world.run_system(toggle).unwrap();
+        let state = world.resource::<GrabState>();
+        assert!(!state.enabled);
+        assert!(state.held.is_none(), "leaving grab mode did not let go");
+    }
+
+    /// A held body is pulled by the physics tick.
+    #[test]
+    fn the_physics_system_pulls_a_held_body() {
+        let mut world = World::new();
+        let mut time = Time::<()>::default();
+        time.advance_by(std::time::Duration::from_secs_f64(1.0 / 64.0));
+        world.insert_resource(time);
+        let (tree, materials) = demo_scene();
+        let field = DistanceField::build(&tree);
+        let mut body = demo_body(Vec3::new(20.0, 40.0, 20.0), Quat::IDENTITY);
+        assert!(body.recompute(&materials));
+        let mut grab = Grab::new(&body, body.position);
+        grab.target = body.position + Vec3::new(10.0, 0.0, 0.0);
+        world.insert_resource(GrabState { enabled: true, held: Some(grab), distance: 10.0 });
+        world.insert_resource(VoxelScene {
+            tree,
+            materials,
+            generation: 1,
+            field,
+            field_dirty: None,
+            bodies: vec![body],
+        });
+        let physics = world.register_system(physics_system);
+        world.run_system(physics).unwrap();
+        let v = world.resource::<VoxelScene>().bodies[0].velocity;
+        assert!(v.x > 0.5, "the grab did not pull: {v:?}");
+    }
+
     /// The system steps the scene's bodies, and a body leaving the world bumps
     /// the generation, because the packed buffers hold the body list.
     #[test]
@@ -447,6 +595,7 @@ mod tests {
             bodies: vec![falling, gone],
         });
 
+        world.init_resource::<GrabState>();
         let physics = world.register_system(physics_system);
         world.run_system(physics).unwrap();
 

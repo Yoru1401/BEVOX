@@ -23,7 +23,7 @@ pub struct Pick {
 ///
 /// `ndc` is -1 to 1 on each axis, y up, matching what the shader's `primary_ray`
 /// builds from a pixel, so a pick agrees with what was drawn there.
-fn ray(world_from_clip: Mat4, eye: Vec3, ndc: Vec2) -> Vec3 {
+pub fn cursor_ray(world_from_clip: Mat4, eye: Vec3, ndc: Vec2) -> Vec3 {
     let far = world_from_clip * glam::Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
     (far.truncate() / far.w - eye).normalize()
 }
@@ -40,7 +40,7 @@ pub fn pick_voxel(
     eye: Vec3,
     ndc: Vec2,
 ) -> Option<Pick> {
-    let dir = ray(world_from_clip, eye, ndc);
+    let dir = cursor_ray(world_from_clip, eye, ndc);
     let mut stats = MarchStats::default();
     let hit = march(tree, Affine3A::IDENTITY, eye, dir, reach(tree), false, &mut stats)?;
 
@@ -81,7 +81,7 @@ pub fn pick(
     eye: Vec3,
     ndc: Vec2,
 ) -> Option<Hit> {
-    let dir = ray(world_from_clip, eye, ndc);
+    let dir = cursor_ray(world_from_clip, eye, ndc);
     let max = reach(tree);
     let mut stats = MarchStats::default();
     let mut best = march(tree, Affine3A::IDENTITY, eye, dir, max, false, &mut stats)
