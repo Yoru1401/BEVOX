@@ -14,8 +14,10 @@ use crate::physics::classify::solid_at;
 use glam::{IVec3, Quat, UVec3};
 use std::collections::HashMap;
 
+/// Face neighbours. Down is last, so it is popped first: the walk dives for the
+/// floor, and most cuts are into ground that reaches it within a few steps.
 const NEIGHBOURS: [IVec3; 6] =
-    [IVec3::X, IVec3::NEG_X, IVec3::Y, IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z];
+    [IVec3::Y, IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z, IVec3::NEG_Y];
 
 /// The pieces of `tree` around the box `lo..=hi` that no longer reach the
 /// ground, each sorted.
@@ -59,10 +61,13 @@ fn walk(
     let mut stack = vec![seed];
     let mut piece = Vec::new();
     seen.insert(seed, id);
-    let mut grounded = false;
     while let Some(p) = stack.pop() {
+        // Grounded: stop at once. The rest of this piece stays unwalked, and any
+        // later walk that reaches it runs into what this one claimed and stops
+        // too. Walking on would cost the whole budget for every cut into the
+        // ground, which is most cuts.
         if p.y == 0 {
-            grounded = true;
+            return None;
         }
         piece.push(p.as_uvec3());
         if piece.len() > budget {
@@ -78,15 +83,13 @@ fn walk(
                     seen.insert(n, id);
                     stack.push(n);
                 }
-                // Stopped short of the end by an earlier walk that gave up: this
-                // is that walk's piece, so it is not loose either.
-                Some(&other) if other != id => grounded = true,
+                // An earlier walk's voxel: this is that walk's piece, which was
+                // grounded or too big, or it would have been walked to the end
+                // and every voxel of it claimed.
+                Some(&other) if other != id => return None,
                 Some(_) => {}
             }
         }
-    }
-    if grounded {
-        return None;
     }
     piece.sort_unstable_by_key(|p| (p.z, p.y, p.x));
     Some(piece)
@@ -312,5 +315,159 @@ mod tests {
         assert_eq!(bodies.len(), 1);
         assert_eq!(bodies[0].volume.voxels().len(), 6, "the shorter column was taken instead");
         assert!(!tree.get(UVec3::new(4, 2, 4)).is_empty(), "the shorter column vanished");
+    }
+
+    /// The search against the plainest possible reference, over random scenes
+    /// and budgets small enough to cut walks short.
+    ///
+    /// The reference labels every component around the box completely, with no
+    /// budget and no early exit, then keeps the ones that never touch the floor
+    /// and fit the budget. Any walk that stops early and leaves a later walk
+    /// fenced in by its claims, and so reporting a scrap of a bigger piece as
+    /// loose, disagrees with it.
+    #[test]
+    fn the_search_agrees_with_labelling_every_piece_in_full() {
+        let mut rng = crate::testing::XorShift64::new(0xde7a_c4);
+        for case in 0..300 {
+            let mut voxels = Vec::new();
+            for z in 0..16 {
+                for y in 0..16 {
+                    for x in 0..16 {
+                        if rng.next_below(100) < 38 {
+                            voxels.push((UVec3::new(x, y, z), MaterialId(1)));
+                        }
+                    }
+                }
+            }
+            let tree = Contree::from_voxels(16, &voxels);
+            let lo = IVec3::new(
+                rng.next_below(12) as i32,
+                rng.next_below(12) as i32,
+                rng.next_below(12) as i32,
+            );
+            let hi = lo + IVec3::splat(3);
+            let budget = [3, 8, 25, 60, BUDGET][case % 5];
+
+            // Pieces are each sorted already; order the list of them by content.
+            let key = |piece: &Vec<UVec3>| piece.iter().map(|p| p.to_array()).collect::<Vec<_>>();
+            let mut got: Vec<_> = loose_pieces(&tree, lo, hi, budget).iter().map(key).collect();
+            got.sort();
+            let mut want: Vec<_> = reference(&tree, lo, hi, budget).iter().map(key).collect();
+            want.sort();
+            assert_eq!(got, want, "case {case}, budget {budget}, box {lo}..={hi}");
+        }
+    }
+
+    fn reference(tree: &Contree, lo: IVec3, hi: IVec3, budget: usize) -> Vec<Vec<UVec3>> {
+        let mut labelled: std::collections::HashSet<IVec3> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for z in lo.z..=hi.z {
+            for y in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    let seed = IVec3::new(x, y, z);
+                    if !solid_at(tree, seed) || labelled.contains(&seed) {
+                        continue;
+                    }
+                    let mut stack = vec![seed];
+                    let mut piece = vec![];
+                    labelled.insert(seed);
+                    while let Some(p) = stack.pop() {
+                        piece.push(p);
+                        for step in [IVec3::X, IVec3::NEG_X, IVec3::Y, IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z] {
+                            let n = p + step;
+                            if solid_at(tree, n) && labelled.insert(n) {
+                                stack.push(n);
+                            }
+                        }
+                    }
+                    if piece.iter().all(|p| p.y != 0) && piece.len() <= budget {
+                        let mut piece: Vec<UVec3> = piece.iter().map(|p| p.as_uvec3()).collect();
+                        piece.sort_unstable_by_key(|p| (p.z, p.y, p.x));
+                        out.push(piece);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// What a detachment costs. Not a gate; its numbers go in the plan's
+    /// Measurements section.
+    #[test]
+    #[ignore]
+    fn a_detach_is_timed() {
+        let materials = crate::physics::fixtures::materials();
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+
+        // A column 8 by 8 and 40 tall on a floor, cut at its foot: the piece
+        // is 2,560 voxels, all of which the walk visits and the body receives.
+        let column = || {
+            let mut voxels = Vec::new();
+            for z in 0..64 {
+                for x in 0..64 {
+                    voxels.push((UVec3::new(x, 0, z), MaterialId(1)));
+                }
+            }
+            for y in 1..42 {
+                for z in 28..36 {
+                    for x in 28..36 {
+                        voxels.push((UVec3::new(x, y, z), MaterialId(2)));
+                    }
+                }
+            }
+            let mut tree = Contree::from_voxels(64, &voxels);
+            let cut: Vec<UVec3> = (28..36)
+                .flat_map(|z| (28..36).map(move |x| UVec3::new(x, 1, z)))
+                .collect();
+            tree.clear_voxels(&cut);
+            tree
+        };
+        let freed = median(
+            (0..9)
+                .map(|_| {
+                    let mut tree = column();
+                    let start = std::time::Instant::now();
+                    let bodies = detach(
+                        &mut tree,
+                        &materials,
+                        IVec3::new(27, 0, 27),
+                        IVec3::new(36, 2, 36),
+                        16,
+                    );
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    assert_eq!(bodies.len(), 1);
+                    ms
+                })
+                .collect(),
+        );
+
+        // A hole dug into solid ground 32 deep: nothing comes free, and the
+        // question is what finding that out costs.
+        let mut voxels = Vec::new();
+        for z in 0..64 {
+            for y in 0..32 {
+                for x in 0..64 {
+                    voxels.push((UVec3::new(x, y, z), MaterialId(1)));
+                }
+            }
+        }
+        let mut ground = Contree::from_voxels(64, &voxels);
+        ground.apply_sphere(glam::Vec3::new(32.0, 31.0, 32.0), 5.0, MaterialId::EMPTY);
+        let grounded = median(
+            (0..9)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    let pieces =
+                        loose_pieces(&ground, IVec3::new(26, 25, 26), IVec3::new(38, 32, 38), BUDGET);
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    assert!(pieces.is_empty());
+                    ms
+                })
+                .collect(),
+        );
+        println!("detach, median ms: 2560-voxel column freed {freed:.3}, hole in ground {grounded:.3}");
     }
 }

@@ -5,10 +5,12 @@ use bevox_core::dense::DenseVolume;
 use bevox_core::distance_field::DistanceField;
 use bevox_core::material::{Material, MaterialId, MaterialTable};
 use bevox_core::physics::GRAVITY;
+use bevox_core::physics::detach::detach;
 use bevox_core::physics::solver::step;
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system, start_camera};
 use bevox_render::pick::pick_voxel;
+use bevox_render::pipeline::MAX_BODIES;
 use bevox_render::upload::{VoxelScene, apply_brush, build_gpu_scene};
 
 fn main() {
@@ -262,9 +264,32 @@ fn brush_input(
     } else {
         hit.position + hit.normal * brush.radius
     };
-    apply_brush(&mut scene, centre, brush.radius, material);
-    // Deliberately not bumped: an edit is uploaded by range, and bumping the
-    // generation is what asks for a full rebuild.
+    if erase {
+        erase_and_detach(&mut scene, centre, brush.radius);
+    } else {
+        apply_brush(&mut scene, centre, brush.radius, material);
+    }
+    // Deliberately not bumped for the edit itself: an edit is uploaded by range,
+    // and bumping the generation is what asks for a full rebuild.
+}
+
+/// Erases a sphere, then hands whatever it cut free to the physics as bodies.
+///
+/// The cap is the renderer's: past `MAX_BODIES` a body is uploaded but not
+/// marched, so a piece with nowhere to go stays in the world rather than
+/// disappearing.
+fn erase_and_detach(scene: &mut VoxelScene, centre: Vec3, radius: f32) {
+    apply_brush(scene, centre, radius, MaterialId::EMPTY);
+    let reach = radius.ceil() as i32 + 1;
+    let hit = centre.round().as_ivec3();
+    let room = MAX_BODIES.saturating_sub(scene.bodies.len());
+    let VoxelScene { tree, materials, bodies, generation, .. } = scene;
+    let freed = detach(tree, materials, hit - reach, hit + reach, room);
+    if !freed.is_empty() {
+        bodies.extend(freed);
+        // The body list changed, so the packed buffers must be rebuilt.
+        *generation += 1;
+    }
 }
 
 /// The same floor, column and carved sphere the parity test uses, so what is on
@@ -333,6 +358,33 @@ mod tests {
         assert!(has(MaterialId(4)), "no rubber on the floor");
         assert_eq!(materials.get(MaterialId(3)).friction, 4);
         assert_eq!(materials.get(MaterialId(4)).restitution, 80);
+    }
+
+    /// Erasing the base of the demo scene's column drops it: the erase runs
+    /// detachment, and the freed piece arrives as a body.
+    #[test]
+    fn erasing_a_support_spawns_a_body() {
+        let (tree, materials) = demo_scene();
+        let field = DistanceField::build(&tree);
+        let mut scene = VoxelScene {
+            tree,
+            materials,
+            generation: 1,
+            field,
+            field_dirty: None,
+            bodies: vec![],
+        };
+        // The demo column stands on the floor at x = 28..36, z = 28..36, from
+        // y = 6; a radius-5 sphere at its foot cuts the whole cross-section.
+        erase_and_detach(&mut scene, Vec3::new(32.0, 7.0, 32.0), 5.0);
+        assert_eq!(scene.bodies.len(), 1, "the column did not come free");
+        assert!(scene.bodies[0].mass.mass > 0.0);
+        assert_eq!(scene.generation, 2, "the body list changed without asking for a rebuild");
+        assert!(
+            scene.tree.get(UVec3::new(32, 20, 32)).is_empty()
+                && scene.tree.get(UVec3::new(29, 20, 29)).is_empty(),
+            "the column is still in the world as well"
+        );
     }
 
     /// The system steps the scene's bodies, and a body leaving the world bumps

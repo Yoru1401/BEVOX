@@ -203,12 +203,29 @@ tick.
 
 An edit that removes voxels can disconnect part of a structure, in the static
 world or in a body. Detachment finds the disconnected parts with a depth-first
-search using **6-connectivity** (face neighbours only), over the tree's
-**uniform nodes rather than individual voxels**: a uniform solid node is
-connected within itself, so a large solid region is one graph node, not
-thousands. Each part that no longer touches the main piece becomes its own
-body. Its voxels are removed from the source and its mass properties are
-computed.
+search using **6-connectivity** (face neighbours only), starting from the solid
+voxels around the edit.
+
+- **Grounded** means reaching the world's floor (`y == 0`). A walk stops the
+  moment it does, and dives downward first, so a cut into the ground costs a
+  few dozen steps rather than a full search.
+- **Too big** means outgrowing a budget. A walk that does gives up and calls the
+  piece grounded, so a cut into a mountainside never walks the mountain.
+- A later walk that runs into an earlier walk's voxels is on that earlier
+  walk's piece, and takes its verdict.
+
+Each part that neither reaches the floor nor outgrows the budget becomes its own
+body. Its voxels are removed from the source through the ordinary edit path, so
+the render world uploads a delta, and its mass properties are computed.
+
+The search walks **voxels**. Dwyer's devlog #12 walks the tree's **uniform
+nodes** instead, which is far faster on a large piece, because a uniform solid
+node is one graph node rather than thousands. That is the upgrade when a
+measurement asks for it; the budget and the early exit are what make the simple
+walk safe until then.
+
+A piece is never taken when the renderer has no room to draw it: past the body
+cap, the largest pieces go first and the rest stay in the world, still drawn.
 
 Body edits go through the same path:
 
@@ -321,6 +338,7 @@ this list is all that is known of it here:
 Filled in by this design, **not** shown in his devlogs:
 
 - the exact pair-test formulas and rounding radii;
+- the voxel-level detachment search, its budget and its early exit;
 - the lookup reach;
 - the ownership rules that report each touch once;
 - the unbiased relax solve after each substep's position update, after Erin

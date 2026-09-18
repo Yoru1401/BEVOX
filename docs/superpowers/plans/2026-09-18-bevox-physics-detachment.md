@@ -787,6 +787,41 @@ Tell Flori what to try: `cargo run -p bevox`, then right-click the base of the c
 
 ---
 
+## Measurements
+
+2026-09-18, Intel Core i5-10400, release build,
+`cargo test --release -p bevox_core a_detach_is_timed -- --ignored --nocapture --test-threads=1`.
+Median of nine runs each.
+
+First version, which walked on after reaching the floor:
+
+```
+detach, median ms: 2560-voxel column freed 2.949, hole in ground 18.086
+```
+
+After stopping a walk the moment it is grounded, with down tried first:
+
+```
+detach, median ms: 2560-voxel column freed 1.765, hole in ground 0.247
+```
+
+These are two runs of two builds, not an interleaved A/B/A. The gap on the
+hole, 73 times, is far outside any drift this machine has shown. The column's
+1.2 ms gain is plausible but not claimed.
+
+**What it says.** The common case, a cut into solid ground that frees nothing,
+went from a full budget walk to a few dozen steps, from over a frame's worth of
+work to a quarter of a millisecond. Freeing a 2,560-voxel piece costs under
+2 ms, most of it building the body's tree and computing its mass. Neither is a
+reason to walk uniform nodes yet.
+
+**One gate was found blind and replaced.** The budget test could no longer
+produce the fenced-in walk it guarded against once the search order changed, so
+breaking that rule went unnoticed. It is now guarded by
+`the_search_agrees_with_labelling_every_piece_in_full`, which compares the
+search against a plain full labelling over 300 random scenes with budgets down
+to 3. Any walk that stops early and fences a later one in disagrees with it.
+
 ## Milestone check
 
 Cutting a column's base leaves the column falling as a body, landing and settling on the floor. A cut that leaves everything grounded spawns nothing. A piece too large for the budget, or with no room under the body cap, stays in the world.
