@@ -10,6 +10,7 @@
 
 pub mod classify;
 pub mod contact;
+pub mod detach;
 pub mod mass;
 pub mod solver;
 
@@ -45,6 +46,13 @@ pub const MAX_TRAVEL: f32 = 1.25;
 /// Sweeps of the restitution pass. One is not enough: every contact of a flat
 /// landing would push the whole body to the bounce target by itself.
 pub const RESTITUTION_SWEEPS: u32 = 4;
+
+/// The most voxels a detachment search will walk before giving up.
+///
+/// A cut into a mountainside would otherwise walk the mountain. Giving up calls
+/// the piece grounded, so a piece larger than this stays in the world rather
+/// than becoming a body that could not be afforded anyway.
+pub const BUDGET: usize = 20_000;
 
 /// Speculative margin every body gets even at rest, in voxels.
 pub const BASE_MARGIN: f32 = 0.1;
