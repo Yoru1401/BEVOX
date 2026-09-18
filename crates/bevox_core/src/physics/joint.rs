@@ -5,6 +5,7 @@
 //! keeps two axes aligned, so the bodies turn only about it.
 
 use super::BIAS;
+use super::classify::solid_at;
 use crate::body::{Body, BodyId};
 use glam::{Mat2, Mat3, Vec2, Vec3};
 
@@ -168,4 +169,125 @@ fn solve_hinge(a: &mut Body, b: Option<&mut Body>, joint: &mut Joint, inv_h: f32
     let impulse = t1 * lambda.x + t2 * lambda.y;
     joint.angular += impulse;
     apply(a, b, Vec3::ZERO, Vec3::ZERO, Vec3::ZERO, impulse);
+}
+
+/// After an edit, moves each joint to whichever piece now holds its pivot, and
+/// removes a joint whose pivot, first body or second body is gone.
+///
+/// The first body's anchor sits inside the voxel that was clicked, so "the
+/// piece that holds the pivot" is the one holding that voxel. A split keeps
+/// volume coordinates, since every piece is built in the parent's frame, so the
+/// voxel has the same coordinates in the piece; checking that the piece also
+/// puts it at the same place in the world rules out an unrelated body that
+/// happens to have a voxel there. The second body was fastened wherever it was
+/// clicked, which need not be inside it, so it stays with whichever piece keeps
+/// its identity.
+pub fn follow(joints: &mut Vec<Joint>, bodies: &[Body]) {
+    let find = |id: BodyId| bodies.iter().find(|b| b.id == id);
+    joints.retain_mut(|joint| {
+        if let Some(b) = joint.b
+            && find(b).is_none()
+        {
+            return false;
+        }
+        let Some(a) = find(joint.a) else {
+            return false;
+        };
+        let voxel = joint.anchor_a.floor().as_ivec3();
+        if solid_at(&a.volume, voxel) {
+            return true;
+        }
+        let at = a.world_from_local().transform_point3(joint.anchor_a);
+        let holder = bodies.iter().find(|piece| {
+            piece.id != a.id
+                && solid_at(&piece.volume, voxel)
+                && (piece.world_from_local().transform_point3(joint.anchor_a) - at).length() < 1e-3
+        });
+        match holder {
+            Some(piece) => {
+                joint.a = piece.id;
+                true
+            }
+            None => false,
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::material::MaterialId;
+    use crate::physics::fixtures::{cube, materials, placed};
+    use crate::physics::sculpt::sculpt;
+    use glam::{Quat, UVec3};
+
+    /// Cut a bar in two, and a joint pinned to its far end follows the piece
+    /// that end is on.
+    #[test]
+    fn a_joint_follows_its_pivot_across_a_split() {
+        let materials = materials();
+        let bar: Vec<_> = (0..12).map(|x| (UVec3::new(x, 0, 0), MaterialId(1))).collect();
+        let mut bodies = vec![placed(
+            crate::contree::Contree::from_voxels(16, &bar),
+            Vec3::new(30.0, 30.0, 30.0),
+            Quat::IDENTITY,
+        )];
+        let end = bodies[0].world_from_local().transform_point3(Vec3::new(11.5, 0.5, 0.5));
+        let mut joints = vec![Joint::new(JointKind::Ball, &bodies[0], None, end, Vec3::Y)];
+        // Near the far end, so the joint's end is on the smaller piece, which
+        // leaves as a new body.
+        let cut = bodies[0].world_from_local().transform_point3(Vec3::new(8.5, 0.5, 0.5));
+        sculpt(&mut bodies, 0, cut, 1.2, MaterialId::EMPTY, &materials, 16);
+        assert_eq!(bodies.len(), 2, "the bar did not split");
+        follow(&mut joints, &bodies);
+        assert_eq!(joints.len(), 1);
+        assert_eq!(joints[0].a, bodies[1].id, "the joint stayed on the piece without its pivot");
+    }
+
+    /// Erase the pivot, or the body, and the joint goes.
+    #[test]
+    fn a_joint_without_its_pivot_is_removed() {
+        let materials = materials();
+        let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
+        let corner = bodies[0].world_from_local().transform_point3(Vec3::splat(0.01));
+        let mut joints = vec![Joint::new(JointKind::Ball, &bodies[0], None, corner, Vec3::Y)];
+        sculpt(&mut bodies, 0, corner, 0.9, MaterialId::EMPTY, &materials, 16);
+        assert!(!bodies.is_empty(), "the whole body went, so this tests the wrong thing");
+        follow(&mut joints, &bodies);
+        assert!(joints.is_empty(), "a joint outlived its pivot voxel");
+
+        let mut joints = vec![Joint::new(JointKind::Ball, &bodies[0], None, corner, Vec3::Y)];
+        bodies.clear();
+        follow(&mut joints, &bodies);
+        assert!(joints.is_empty(), "a joint outlived its body");
+    }
+
+    /// A joint whose pivot is untouched stays exactly as it was.
+    #[test]
+    fn an_untouched_joint_is_kept() {
+        let bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
+        let corner = bodies[0].world_from_local().transform_point3(Vec3::splat(0.01));
+        let mut joints = vec![Joint::new(JointKind::Ball, &bodies[0], None, corner, Vec3::Y)];
+        let before = joints.clone();
+        follow(&mut joints, &bodies);
+        assert_eq!(joints, before);
+    }
+
+    /// Another body with a voxel at the same coordinates, somewhere else in the
+    /// world, is not the piece that holds the pivot: its voxel is not where the
+    /// pivot was.
+    #[test]
+    fn a_joint_does_not_jump_to_an_unrelated_body() {
+        let materials = materials();
+        let mut bodies = vec![
+            placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY),
+            placed(cube(4, 4), Vec3::new(50.0, 30.0, 30.0), Quat::IDENTITY),
+        ];
+        let corner = bodies[0].world_from_local().transform_point3(Vec3::splat(0.01));
+        let mut joints = vec![Joint::new(JointKind::Ball, &bodies[0], None, corner, Vec3::Y)];
+        sculpt(&mut bodies, 0, corner, 0.9, MaterialId::EMPTY, &materials, 16);
+        assert!(solid_at(&bodies[1].volume, glam::IVec3::ZERO), "the other body lacks the voxel");
+        follow(&mut joints, &bodies);
+        assert!(joints.is_empty(), "the joint jumped to a body that never held its pivot");
+    }
 }
