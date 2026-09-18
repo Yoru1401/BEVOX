@@ -12,7 +12,7 @@ use crate::physics::classify::{Features, features};
 use crate::physics::contact::ContactKey;
 use crate::physics::solver::ContactImpulse;
 use crate::physics::mass::{MassProperties, mass_properties};
-use glam::{Affine3A, Quat, UVec3, Vec3};
+use glam::{Affine3A, IVec3, Quat, UVec3, Vec3};
 use std::collections::HashMap;
 
 /// Which body a contact is against. The static world is `WORLD`.
@@ -124,6 +124,32 @@ impl Body {
         stats: &mut MarchStats,
     ) -> Option<Hit> {
         march(&self.volume, self.world_from_local(), origin, dir, max_dist, false, stats)
+    }
+
+    /// Makes the volume cover the local box `lo..=hi`, rebuilding it larger and
+    /// shifting its contents by whole voxels where it has to, without moving any
+    /// voxel in the world.
+    ///
+    /// The centre of mass moves with the contents, and `world_from_local` is
+    /// written against it, so shifting both by the same amount changes nothing.
+    /// Mass properties and features are left as they were: the caller edits the
+    /// volume next and recomputes after.
+    pub fn grow_to_fit(&mut self, lo: IVec3, hi: IVec3) {
+        let extent = self.volume.extent() as i32;
+        if lo.cmpge(IVec3::ZERO).all() && hi.cmplt(IVec3::splat(extent)).all() {
+            return;
+        }
+        let shift = (-lo).max(IVec3::ZERO);
+        let need = (hi + shift + IVec3::ONE).max_element().max(extent) as u32;
+        let mut grown = self.volume.extent();
+        while grown < need {
+            grown *= 4;
+        }
+        let shift = shift.as_uvec3();
+        let voxels: Vec<_> =
+            self.volume.voxels().into_iter().map(|(p, m)| (p + shift, m)).collect();
+        self.volume = Contree::from_voxels(grown, &voxels);
+        self.com += shift.as_vec3();
     }
 
     /// The inverse inertia tensor in world axes.

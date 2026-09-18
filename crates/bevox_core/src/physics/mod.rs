@@ -12,6 +12,7 @@ pub mod classify;
 pub mod contact;
 pub mod detach;
 pub mod mass;
+pub mod sculpt;
 pub mod solver;
 
 use glam::Vec3;
