@@ -75,13 +75,25 @@ pub fn marched_body_count(bodies: usize) -> u32 {
     bodies.min(MAX_BODIES) as u32
 }
 
-/// The bodies a shadow ray tests: every placed body, up to `MAX_BODIES`.
+/// The bodies a shadow ray tests: every placed body with voxels, up to
+/// `MAX_BODIES`, each with its world bounding sphere filled in.
 ///
 /// Never the culled table. The cull keeps what the camera can see, and a body
 /// just off screen can shadow what is on it: taken from the table, its shadow
-/// would pop in as the body came into view.
-pub fn shadow_casters(placed: &[GpuBody]) -> &[GpuBody] {
-    &placed[..placed.len().min(MAX_BODIES)]
+/// would pop in as the body came into view. A body with no voxels has no bound
+/// and can shadow nothing, so it is left out.
+pub fn shadow_casters(placed: &[GpuBody], local_bounds: &[Option<(UVec3, UVec3)>]) -> Vec<GpuBody> {
+    placed
+        .iter()
+        .zip(local_bounds)
+        .filter_map(|(g, local)| {
+            local.map(|l| {
+                let b = crate::cull::world_bound(l, g);
+                GpuBody { bound: [b.centre.x, b.centre.y, b.centre.z, b.radius], ..*g }
+            })
+        })
+        .take(MAX_BODIES)
+        .collect()
 }
 
 /// Room for this many bodies in each half of the body buffer: the placed
@@ -225,7 +237,7 @@ pub fn frame_uniform(
 ) -> (MarchUniform, Vec<GpuBody>, Vec<GpuBodyRect>, Vec<GpuBody>) {
     let (table, rects) =
         crate::cull::bodies_to_march(placed, &scene.body_local_bounds, camera, flags, size);
-    let casters = shadow_casters(placed).to_vec();
+    let casters = shadow_casters(placed, &scene.body_local_bounds);
     let uniform = MarchUniform {
         offset_from_clip: camera.offset_from_clip.to_cols_array_2d(),
         camera_position: camera.position.extend(0.0).to_array(),
@@ -792,7 +804,12 @@ mod tests {
 
         let (uniform, table, _, casters) = frame_uniform(&scene, &camera, &[behind, ahead], cull, size);
         assert_eq!(table.len(), 1, "the cull no longer drops the body behind the camera");
-        assert_eq!(bytes(&casters), bytes(&[behind, ahead]), "a body the cull dropped casts no shadow");
+        let placements = |b: &[GpuBody]| b.iter().map(|g| g.local_from_world).collect::<Vec<_>>();
+        assert_eq!(placements(&casters), placements(&[behind, ahead]), "a body the cull dropped casts no shadow");
+        for (c, g) in casters.iter().zip([behind, ahead]) {
+            let b = crate::cull::world_bound(cube, &g);
+            assert_eq!(c.bound, [b.centre.x, b.centre.y, b.centre.z, b.radius], "a caster's sphere is not its bound");
+        }
         assert_eq!(uniform.field_params[2], 2);
         assert_eq!(uniform.field_params[3], 2, "the casters do not start past the table's room");
 
@@ -806,6 +823,12 @@ mod tests {
         assert_eq!(contents.len(), 2 * placed.len());
         assert_eq!(bytes(&contents[..1]), bytes(&table));
         assert_eq!(bytes(&contents[placed.len()..placed.len() + MAX_BODIES]), bytes(&casters));
+
+        // A body with no voxels has nothing to cast.
+        let empty = GpuSceneData { body_local_bounds: vec![None, Some(cube)], ..default() };
+        let (uniform, _, _, casters) = frame_uniform(&empty, &camera, &[behind, ahead], cull, size);
+        assert_eq!(placements(&casters), placements(&[ahead]));
+        assert_eq!(uniform.field_params[2], 1);
     }
 
     #[test]

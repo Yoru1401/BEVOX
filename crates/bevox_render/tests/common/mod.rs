@@ -301,7 +301,8 @@ impl Prepared {
         );
         // The shadow casters are every body, laid out after the table's room,
         // as the app lays them out.
-        let casters = bevox_render::pipeline::shadow_casters(&packed.bodies);
+        let casters =
+            bevox_render::pipeline::shadow_casters(&packed.bodies, &packed.body_local_bounds);
         let room = bevox_render::pipeline::body_room(packed.bodies.len());
         let uniform = TestUniform {
             offset_from_clip: offset_from_clip.to_cols_array_2d(),
@@ -390,7 +391,7 @@ impl Prepared {
         // GpuBody; the uniform's count, not the buffer length, is what the
         // shader loop actually reads.
         let body_bytes: Vec<u8> = bytemuck::cast_slice(
-            &bevox_render::pipeline::body_buffer_contents(&table, casters, room),
+            &bevox_render::pipeline::body_buffer_contents(&table, &casters, room),
         )
         .to_vec();
         let body_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

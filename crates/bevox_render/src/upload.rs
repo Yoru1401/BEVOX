@@ -36,7 +36,7 @@ pub struct VoxelScene {
     ///
     /// A body that only moves -- a new `position` or `orientation` -- needs
     /// nothing: its table entry is rebuilt and re-uploaded every frame, and
-    /// that table is a few 144-byte entries. A body whose *geometry* changes,
+    /// that table is a few 160-byte entries. A body whose *geometry* changes,
     /// or a body added or removed, needs `generation` bumped, because that
     /// moves bytes in the large node and voxel buffers. Do not bump the
     /// generation to move a body: that rebuilds the whole scene every frame.
@@ -152,6 +152,11 @@ pub struct GpuBody {
     pub voxel_base: u32,
     pub depth: u32,
     pub extent: u32,
+    /// The body's world bounding sphere, centre then radius, so a shadow ray
+    /// can pass a body it goes nowhere near before transforming anything.
+    /// Filled in only for the shadow casters (`pipeline::shadow_casters`); the
+    /// marched table leaves it zero.
+    pub bound: [f32; 4],
 }
 
 impl GpuBody {
@@ -1120,8 +1125,10 @@ mod tests {
 
     #[test]
     fn a_gpu_body_is_the_size_the_shader_expects() {
-        // Two mat4x4 (64 each) plus four u32 rounded to a 16-byte boundary.
-        assert_eq!(size_of::<GpuBody>(), 144);
+        // Two mat4x4 (64 each), four u32 (16), then the bounding sphere's vec4,
+        // which WGSL aligns to 16 and which lands at 144 without padding.
+        assert_eq!(size_of::<GpuBody>(), 160);
+        assert_eq!(std::mem::offset_of!(GpuBody, bound), 144);
         assert_eq!(align_of::<GpuBody>(), 4);
     }
 

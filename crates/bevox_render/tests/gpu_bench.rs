@@ -876,3 +876,59 @@ fn bodies_are_measured_against_none() {
         );
     }
 }
+
+/// What body shadows cost: `BODY_SHADOWS` A/B/A against the same flags without
+/// it, on the wall clock and the GPU's.
+///
+/// - No bodies: the caster loop runs zero times, so this reads what adding it
+///   to the shader costs by itself, which is where a driver codegen cliff would
+///   show. The image must not change.
+/// - Sixteen loose bodies in view, as `bodies_are_measured_against_none` times
+///   them: every lit pixel's shadow ray now tests them all.
+/// - The same sixteen behind the camera: culled from the primary march, but
+///   still shadow casters.
+///
+/// The total for sixteen in view with shadows is what `DEFAULT` is decided on,
+/// against a 16.7 ms frame.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench shadows --
+/// --ignored --nocapture`.
+#[test]
+#[ignore]
+fn body_shadows_are_measured() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    if !timestamps_supported(&device) {
+        eprintln!("adapter has no TIMESTAMP_QUERY, skipping");
+        return;
+    }
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let loose = body_cube();
+    let ahead = bench_bodies(eye, 120.0, &loose, 33.0);
+    let behind = bench_bodies(eye, -120.0, &loose, 33.0);
+    let without = march_flags::DEFAULT & !march_flags::BODY_SHADOWS;
+    let with = without | march_flags::BODY_SHADOWS;
+    let make = |flags: u32, bodies: &[bevox_core::body::Body]| {
+        Prepared::new(&device, &shader, "march", &tree, offset_from_clip, eye, 1280, 720, flags, bodies)
+    };
+    println!("scene: extent {extent}, 1280x720, bench camera; A = flags {without}, B = {with}");
+    for (label, bodies) in [("0 bodies", &ahead[..0]), ("16 in view", &ahead[..]), ("16 behind", &behind[..])] {
+        let (a, b) = (make(without, bodies), make(with, bodies));
+        let changed = a
+            .read_back(&device, &queue)
+            .chunks(4)
+            .zip(b.read_back(&device, &queue).chunks(4))
+            .filter(|(x, y)| x != y)
+            .count();
+        if bodies.is_empty() {
+            assert_eq!(changed, 0, "body shadows changed a scene with no bodies");
+        }
+        let r = aba_both(&device, &queue, &a, &b);
+        let (text, ..) = row_text(r);
+        println!("{label:>11}: {text} | {changed:>6} px shadowed by bodies | with shadows: wall {:.2} ms, gpu {:.2} ms", r[0].1, r[1].1);
+    }
+}

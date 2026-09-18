@@ -51,11 +51,13 @@ struct GpuBody {
     voxel_base: u32,
     depth: u32,
     extent: u32,
+    // World bounding sphere, centre and radius: shadow casters only.
+    bound: vec4<f32>,
 };
 @group(0) @binding(8) var<storage, read> bodies: array<GpuBody>;
 // Each body's screen footprint in pixels, inclusive, in the same order as
 // `bodies`. A separate 16-byte array rather than a field of GpuBody, so testing
-// it cannot load the whole 144-byte entry. The eighth storage buffer in the
+// it cannot load the whole 160-byte entry. The eighth storage buffer in the
 // compute stage, wgpu's default limit: no room for another without raising it.
 struct GpuBodyRect { min: vec2<u32>, max: vec2<u32> };
 @group(0) @binding(9) var<storage, read> body_rects: array<GpuBodyRect>;
@@ -866,6 +868,19 @@ fn shadowed(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
     let count = view.field_params.z;
     let start = view.field_params.w;
     for (var i = 0u; i < count; i = i + 1u) {
+        // The body's bounding sphere first, read on its own so a body the ray
+        // misses costs one field and no transform. Most shadow rays pass
+        // nowhere near most bodies: measured, sixteen bodies behind the camera
+        // cost 20 ms a frame of shadow rays without this. `dir` is the unit sun
+        // direction. The radius is widened a hair, so a ray grazing the box's
+        // corner, which lies on the sphere, is never rounded out.
+        let bound = bodies[start + i].bound;
+        let to = bound.xyz - origin;
+        let along = dot(to, dir);
+        let r = bound.w * 1.001 + 1e-3;
+        if along < -r || dot(to, to) - along * along > r * r {
+            continue;
+        }
         let b = bodies[start + i];
         let local_origin = (b.local_from_world * vec4<f32>(origin, 1.0)).xyz;
         let local_dir = (b.local_from_world * vec4<f32>(dir, 0.0)).xyz;
