@@ -144,3 +144,49 @@ fn painting_then_erasing_the_same_sphere_restores_the_tree() {
     assert_eq!(edited.to_dense(), before, "paint then erase did not round trip");
     edited.check_canonical().expect("the tree stopped being canonical");
 }
+
+/// Clearing takes exactly the voxels named and leaves the rest alone.
+#[test]
+fn clear_voxels_removes_only_what_it_is_given() {
+    let mut dense = DenseVolume::new(16).unwrap();
+    for z in 0..8 {
+        for y in 0..8 {
+            for x in 0..8 {
+                dense.set(UVec3::new(x, y, z), MaterialId(1));
+            }
+        }
+    }
+    let mut tree = dense.into_contree();
+    let gone: Vec<UVec3> = (0..8).map(|x| UVec3::new(x, 3, 3)).collect();
+    tree.clear_voxels(&gone);
+
+    for p in &gone {
+        assert!(tree.get(*p).is_empty(), "{p:?} survived");
+    }
+    assert_eq!(tree.voxels().len(), 8 * 8 * 8 - gone.len());
+    assert!(tree.check_canonical().is_ok(), "the tree is no longer canonical");
+}
+
+/// The edit goes through the arena, so the render world can upload a delta
+/// rather than rebuilding. A piece that vanished any other way would keep being
+/// drawn.
+#[test]
+fn clear_voxels_marks_the_arena_dirty() {
+    let mut dense = DenseVolume::new(16).unwrap();
+    for x in 0..8 {
+        dense.set(UVec3::new(x, 0, 0), MaterialId(1));
+    }
+    let mut tree = dense.into_contree();
+    tree.arena_mut().clear_dirty();
+    tree.clear_voxels(&[UVec3::new(3, 0, 0)]);
+    let dirty = tree.arena().dirty_nodes().len() + tree.arena().dirty_voxels().len();
+    assert!(dirty > 0, "nothing was marked dirty");
+}
+
+/// Clearing nothing changes nothing.
+#[test]
+fn clear_voxels_of_nothing_is_a_no_op() {
+    let mut tree = Contree::from_voxels(16, &[(UVec3::new(1, 2, 3), MaterialId(1))]);
+    tree.clear_voxels(&[]);
+    assert_eq!(tree.voxels().len(), 1);
+}

@@ -5,12 +5,56 @@ use crate::contree::{Contree, level_extent};
 use crate::material::MaterialId;
 use crate::node::{BRICK_EDGE, CHILDREN, Node, child_index};
 use glam::{UVec3, Vec3};
+use std::collections::HashSet;
+
+/// What an edit does to the voxels it covers.
+///
+/// One trait rather than a second copy of the tree rewrite: every edit has to
+/// free the nodes it replaces, leave the tree canonical, and mark the arena
+/// dirty, or the render world cannot upload a delta.
+pub(crate) trait EditOp {
+    /// Whether the edit touches the cube of `extent` voxels at `origin`. A node
+    /// it does not touch is returned as it was.
+    fn touches(&self, origin: UVec3, extent: u32) -> bool;
+
+    /// What the voxel at `p` becomes. `None` leaves it as it is.
+    fn material_at(&self, p: UVec3) -> Option<MaterialId>;
+}
 
 /// A sphere paint operation. `material` of `MaterialId::EMPTY` erases.
 pub(crate) struct SphereOp {
     center: Vec3,
     radius: f32,
     material: MaterialId,
+}
+
+impl EditOp for SphereOp {
+    fn touches(&self, origin: UVec3, extent: u32) -> bool {
+        self.intersects(origin, extent)
+    }
+
+    fn material_at(&self, p: UVec3) -> Option<MaterialId> {
+        self.covers_voxel(p).then_some(self.material)
+    }
+}
+
+/// Erases exactly the voxels it was given: what detachment takes out of the
+/// world when a piece becomes a body.
+struct ClearOp {
+    voxels: HashSet<UVec3>,
+    lo: UVec3,
+    hi: UVec3,
+}
+
+impl EditOp for ClearOp {
+    fn touches(&self, origin: UVec3, extent: u32) -> bool {
+        let hi = origin + UVec3::splat(extent - 1);
+        origin.cmple(self.hi).all() && hi.cmpge(self.lo).all()
+    }
+
+    fn material_at(&self, p: UVec3) -> Option<MaterialId> {
+        self.voxels.contains(&p).then_some(MaterialId::EMPTY)
+    }
 }
 
 impl SphereOp {
@@ -38,10 +82,28 @@ impl Contree {
         self.set_root(new_root);
     }
 
+    /// Erases exactly `voxels`. Detachment moves a piece of the world into a
+    /// body, and takes the same voxels out of the world with this.
+    pub fn clear_voxels(&mut self, voxels: &[UVec3]) {
+        let Some(&first) = voxels.first() else {
+            return;
+        };
+        let mut lo = first;
+        let mut hi = first;
+        for p in voxels {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        let op = ClearOp { voxels: voxels.iter().copied().collect(), lo, hi };
+        let root = self.root();
+        let new_root = self.rewrite(root, self.depth() - 1, UVec3::ZERO, &op);
+        self.set_root(new_root);
+    }
+
     /// Returns the replacement for `node`, freeing whatever it replaces.
-    fn rewrite(&mut self, node: Node, level: u32, origin: UVec3, op: &SphereOp) -> Node {
+    fn rewrite(&mut self, node: Node, level: u32, origin: UVec3, op: &dyn EditOp) -> Node {
         let extent = level_extent(level);
-        if !op.intersects(origin, extent) {
+        if !op.touches(origin, extent) {
             return node;
         }
 
@@ -95,7 +157,7 @@ impl Contree {
         Node::subdivided(mask, base)
     }
 
-    fn rewrite_leaf(&mut self, node: Node, origin: UVec3, op: &SphereOp) -> Node {
+    fn rewrite_leaf(&mut self, node: Node, origin: UVec3, op: &dyn EditOp) -> Node {
         let mut materials = [MaterialId::EMPTY; CHILDREN as usize];
         let mut mask = 0u64;
         for z in 0..BRICK_EDGE {
@@ -108,7 +170,7 @@ impl Contree {
                         None if node.is_uniform_solid() => node.material(),
                         None => MaterialId::EMPTY,
                     };
-                    let m = if op.covers_voxel(p) { op.material } else { existing };
+                    let m = op.material_at(p).unwrap_or(existing);
                     materials[i as usize] = m;
                     if !m.is_empty() {
                         mask |= 1u64 << i;
