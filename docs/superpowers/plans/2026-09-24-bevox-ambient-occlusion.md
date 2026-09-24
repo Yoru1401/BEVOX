@@ -30,8 +30,50 @@
 
 ## Measurements
 
-(Filled in during execution.)
+GTX 1650, 1280x720, bench camera, extent 1024, 2026-09-24. A/B/A interleaved in
+one session, `AO` against the same flags without it, wall / GPU:
+
+| Scene | A/B/A | Drift | Pixels darkened |
+|---|---|---|---|
+| 0 bodies | -0.15 / +0.08 ms | 0.12 / 0.37 | 13,871 |
+| 16 bodies in view | +0.28 / +0.34 ms | 0.16 / 0.32 | 8,495 |
+
+Both readings sit inside their own drift, so the honest claim is *under half a
+millisecond, not separable from noise* -- not "free". The frame with AO on is
+13.87 ms with no bodies and 24.57 ms with sixteen, the same as without.
+
+The codegen cliff was checked the way `bevox-gpu-driver-cliff` says to: the
+shader before this change against the shader after, both with `AO` off, in the
+same session. 0 bodies +0.08 / +0.10 ms, 16 bodies -0.69 / -0.04 ms, drift
+0.17 / 0.22 and 0.44 / 0.07. No cliff.
+
+`AO` joins `DEFAULT` on that.
 
 ## What changed during execution
 
-(Filled in during execution.)
+- **The fullness grid shares the distance field's buffer.** wgpu's default limit
+  is 8 storage buffers per compute stage and the shader was already at 8. The
+  fullness bytes are packed behind the field's words in one buffer and
+  `ao_params.x` says at which word, so nothing about the field's own indexing
+  changed.
+- **`voxel_centre` came out of `shadow_origin`.** Both need the hit voxel's
+  centre in the world, and for a body that means going through the world hit
+  point rather than the voxel index -- `shadow_origin`'s comment says why, and
+  that reason is a measured codegen cliff, so the route is not optional.
+- **Erasing now stages fullness cells.** An erase needs no distance-field update
+  (a stale field only under-estimates), but it does empty cubes, and AO left
+  stale would darken what is now open. `erasing_stages_fullness_but_no_field_cells`
+  holds both halves of that.
+- **The distance-field parity gate carries `AO` on both sides.** It compared
+  `DEFAULT` against `NONE`; with AO in `DEFAULT` that would have been an AO
+  comparison, not a skip comparison. The reference runs with `AO` now, which
+  also proves the skip reaches the same voxel centres the unskipped scan does.
+
+## Breaks that failed as required
+
+| Break | Gate that caught it |
+|---|---|
+| A uniform node counts as one voxel | `a_build_matches_a_brute_force_count` |
+| A recount misses the edit's far edge | `a_recount_matches_a_fresh_build` |
+| Sampled at the hit point, not the voxel centre | `ambient_occlusion_matches_the_cpu`, 4155 pixels |
+| Nearest cell, not blended | `ambient_occlusion_matches_the_cpu`, 3894 pixels |

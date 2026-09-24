@@ -111,12 +111,15 @@ fn setup(mut commands: Commands) {
     ));
 
     let field = DistanceField::build(&scene.tree);
+    let fullness = bevox_core::fullness::Fullness::build(&scene.tree);
     commands.insert_resource(VoxelScene {
         tree: scene.tree,
         materials: scene.materials,
         generation: 1,
         field,
         field_dirty: None,
+        fullness,
+        fullness_dirty: None,
         bodies: scene.bodies,
     });
     commands.insert_resource(Joints(scene.joints));
@@ -151,6 +154,7 @@ fn scene_keys(
         fly.pitch = facing.pitch;
     }
     let field = DistanceField::build(&built.tree);
+    let fullness = bevox_core::fullness::Fullness::build(&built.tree);
     let generation = scene.generation + 1;
     *scene = VoxelScene {
         tree: built.tree,
@@ -158,6 +162,8 @@ fn scene_keys(
         generation,
         field,
         field_dirty: None,
+        fullness,
+        fullness_dirty: None,
         bodies: built.bodies,
     };
     joints.0 = built.joints;
@@ -548,12 +554,15 @@ mod tests {
     fn erasing_a_support_spawns_a_body() {
         let (tree, materials) = demo_scene();
         let field = DistanceField::build(&tree);
+        let fullness = bevox_core::fullness::Fullness::build(&tree);
         let mut scene = VoxelScene {
             tree,
             materials,
             generation: 1,
             field,
             field_dirty: None,
+            fullness,
+            fullness_dirty: None,
             bodies: vec![],
         };
         // The demo column stands on the floor at x = 28..36, z = 28..36, from
@@ -575,6 +584,7 @@ mod tests {
     fn a_stroke_on_a_body_edits_the_body() {
         let (tree, materials) = demo_scene();
         let field = DistanceField::build(&tree);
+        let fullness = bevox_core::fullness::Fullness::build(&tree);
         let mut body = demo_body(Vec3::new(10.0, 40.0, 50.0), Quat::IDENTITY);
         assert!(body.recompute(&materials));
         let voxels = body.volume.voxels().len();
@@ -585,6 +595,8 @@ mod tests {
             generation: 1,
             field,
             field_dirty: None,
+            fullness,
+            fullness_dirty: None,
             bodies: vec![body],
         };
         stroke(&mut scene, Target::Body(0), Vec3::new(10.0, 40.0, 50.0), 2.0, MaterialId::EMPTY);
@@ -627,6 +639,7 @@ mod tests {
         world.insert_resource(time);
         let (tree, materials) = demo_scene();
         let field = DistanceField::build(&tree);
+        let fullness = bevox_core::fullness::Fullness::build(&tree);
         let mut body = demo_body(Vec3::new(20.0, 40.0, 20.0), Quat::IDENTITY);
         assert!(body.recompute(&materials));
         let mut grab = Joint::grab(&body, body.position);
@@ -639,6 +652,8 @@ mod tests {
             generation: 1,
             field,
             field_dirty: None,
+            fullness,
+            fullness_dirty: None,
             bodies: vec![body],
         });
         let physics = world.register_system(physics_system);
@@ -654,6 +669,7 @@ mod tests {
         let mut world = World::new();
         let demo = scenes::demo();
         let field = DistanceField::build(&demo.tree);
+        let fullness = bevox_core::fullness::Fullness::build(&demo.tree);
         let held = Joint::grab(&demo.bodies[0], demo.bodies[0].position);
         world.insert_resource(VoxelScene {
             tree: demo.tree,
@@ -661,6 +677,8 @@ mod tests {
             generation: 1,
             field,
             field_dirty: None,
+            fullness,
+            fullness_dirty: None,
             bodies: demo.bodies,
         });
         world.insert_resource(GrabState { enabled: true, held: Some(held), distance: 10.0 });
@@ -706,13 +724,16 @@ mod tests {
     fn settled_scene(centre: Vec3) -> VoxelScene {
         let (tree, materials) = demo_scene();
         let field = DistanceField::build(&tree);
+        let fullness = bevox_core::fullness::Fullness::build(&tree);
         let mut body = demo_body(centre, Quat::IDENTITY);
         assert!(body.recompute(&materials));
         // As if detachment had cut it out of the terrain.
         body.from_terrain = true;
         body.asleep = true;
         body.still_for = SLEEP_AFTER + MERGE_AFTER;
-        VoxelScene { tree, materials, generation: 1, field, field_dirty: None, bodies: vec![body] }
+        VoxelScene { tree, materials, generation: 1, field, field_dirty: None,
+ fullness,
+ fullness_dirty: None, bodies: vec![body] }
     }
 
     /// Where the settled body sleeps: in open air, where the distance field
@@ -783,8 +804,11 @@ mod tests {
 
         let (tree, materials) = demo_scene();
         let field = DistanceField::build(&tree);
+        let fullness = bevox_core::fullness::Fullness::build(&tree);
         let mut scene =
-            VoxelScene { tree, materials, generation: 1, field, field_dirty: None, bodies: vec![] };
+            VoxelScene { tree, materials, generation: 1, field, field_dirty: None,
+ fullness,
+ fullness_dirty: None, bodies: vec![] };
         // The demo column stands at x = 28..36, z = 28..36 from y = 6; cutting
         // its foot frees the whole thing.
         erase_and_detach(&mut scene, Vec3::new(32.0, 7.0, 32.0), 5.0);
@@ -811,6 +835,7 @@ mod tests {
         world.insert_resource(time);
         let (tree, materials) = demo_scene();
         let field = DistanceField::build(&tree);
+        let fullness = bevox_core::fullness::Fullness::build(&tree);
         let mut falling = demo_body(Vec3::new(20.0, 40.0, 20.0), Quat::IDENTITY);
         assert!(falling.recompute(&materials));
         let mut gone = demo_body(Vec3::new(20.0, -100.0, 20.0), Quat::IDENTITY);
@@ -821,6 +846,8 @@ mod tests {
             generation: 1,
             field,
             field_dirty: None,
+            fullness,
+            fullness_dirty: None,
             bodies: vec![falling, gone],
         });
 

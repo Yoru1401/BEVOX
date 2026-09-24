@@ -330,12 +330,15 @@ fn close_camera(tree: &bevox_core::contree::Contree, extent: u32) -> (Vec3, Mat4
 fn an_edit_uploads_a_fraction_of_the_scene() {
     let (tree, extent) = bench_scene();
     let field = bevox_core::distance_field::DistanceField::build(&tree);
+    let fullness = bevox_core::fullness::Fullness::build(&tree);
     let mut scene = bevox_render::upload::VoxelScene {
         tree,
         materials: bevox_core::material::MaterialTable::new(),
         generation: 1,
         field,
         field_dirty: None,
+            fullness,
+            fullness_dirty: None,
         bodies: Vec::new(),
     };
     scene.tree.arena_mut().clear_dirty();
@@ -472,7 +475,9 @@ fn the_scene_clone_is_measured_against_not_cloning() {
     let (tree, extent) = bench_scene();
     let volume = GpuVolume::from_contree(&tree);
     let field = bevox_core::distance_field::DistanceField::build(&tree);
+    let fullness = bevox_core::fullness::Fullness::build(&tree);
     let scene = GpuSceneData {
+        fullness_base: bevox_render::upload::field_words(&field),
         // First, while `volume.voxels` is still here to measure.
         world_region: WorldRegion::around(
             volume.buffer_nodes().len() as u32,
@@ -487,7 +492,7 @@ fn the_scene_clone_is_measured_against_not_cloning() {
         depth: tree.depth(),
         extent,
         field_edge: field.edge(),
-        distance_field: bevox_render::upload::pack_field(&field),
+        distance_field: bevox_render::upload::pack_grids(&field, &fullness),
         generation: 1,
     };
 
@@ -510,7 +515,9 @@ fn the_scene_clone_is_measured_against_not_cloning() {
             };
             let volume = GpuVolume::from_contree(&tree);
             let field = bevox_core::distance_field::DistanceField::build(&tree);
+            let fullness = bevox_core::fullness::Fullness::build(&tree);
             let real = GpuSceneData {
+                fullness_base: bevox_render::upload::field_words(&field),
                 world_region: WorldRegion::around(
                     volume.buffer_nodes().len() as u32,
                     volume.voxels.len() as u32,
@@ -524,7 +531,7 @@ fn the_scene_clone_is_measured_against_not_cloning() {
                 depth: tree.depth(),
                 extent: tree.extent(),
                 field_edge: field.edge(),
-                distance_field: bevox_render::upload::pack_field(&field),
+                distance_field: bevox_render::upload::pack_grids(&field, &fullness),
                 generation: 1,
             };
             measure_clone(&name, &real);
@@ -930,5 +937,50 @@ fn body_shadows_are_measured() {
         let r = aba_both(&device, &queue, &a, &b);
         let (text, ..) = row_text(r);
         println!("{label:>11}: {text} | {changed:>6} px shadowed by bodies | with shadows: wall {:.2} ms, gpu {:.2} ms", r[0].1, r[1].1);
+    }
+}
+
+/// What ambient occlusion costs: `AO` A/B/A against the same flags without it,
+/// on a body-free scene and on sixteen bodies in view.
+///
+/// The fullness grid is read once per hit pixel, eight cells trilinearly
+/// blended, so the cost should track the number of hit pixels and nothing else.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench ambient --
+/// --ignored --nocapture`.
+#[test]
+#[ignore]
+fn ambient_occlusion_is_measured() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    if !timestamps_supported(&device) {
+        eprintln!("adapter has no TIMESTAMP_QUERY, skipping");
+        return;
+    }
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let loose = body_cube();
+    let ahead = bench_bodies(eye, 120.0, &loose, 33.0);
+    let without = march_flags::DEFAULT & !march_flags::AO;
+    let with = without | march_flags::AO;
+    let make = |flags: u32, bodies: &[bevox_core::body::Body]| {
+        Prepared::new(&device, &shader, "march", &tree, offset_from_clip, eye, 1280, 720, flags, bodies)
+    };
+    println!("scene: extent {extent}, 1280x720, bench camera; A = flags {without}, B = {with}");
+    for (label, bodies) in [("0 bodies", &ahead[..0]), ("16 in view", &ahead[..])] {
+        let (a, b) = (make(without, bodies), make(with, bodies));
+        let changed = a
+            .read_back(&device, &queue)
+            .chunks(4)
+            .zip(b.read_back(&device, &queue).chunks(4))
+            .filter(|(x, y)| x != y)
+            .count();
+        assert!(changed > 1000, "{label}: ambient occlusion darkened only {changed} pixels");
+        let r = aba_both(&device, &queue, &a, &b);
+        let (text, ..) = row_text(r);
+        println!("{label:>11}: {text} | {changed:>6} px darkened | with AO: wall {:.2} ms, gpu {:.2} ms", r[0].1, r[1].1);
     }
 }

@@ -80,6 +80,24 @@ themselves.
   sixteen. The plan
   `docs/superpowers/plans/2026-09-18-bevox-body-shadows.md` has the numbers.
 
+**Ambient occlusion** (2026-09-24), Dwyer's method from his devlog #15: a grid
+of 16³ cubes over the world, each holding how full of solid it is. The fullness
+at a point is the trilinear blend of the eight cube centres around it; a flat
+surface sits at half, an inner corner near three quarters, and whatever lies
+past half darkens the ambient term. The sun's own light is untouched — the
+shadow ray already answers for it.
+
+- One sample, at the hit voxel's centre, so the shading stays per voxel as the
+  shadows do.
+- A body samples the world's grid at its voxel's world centre, so a body in a
+  crevice darkens. A body does not occlude itself; that needs a grid per body.
+- An edit recounts only the cubes it touched, and uploads that range, as the
+  distance field does. The grid shares the field's buffer because the shader was
+  already at wgpu's eight-storage-buffer limit.
+- Measured within drift on the bench scene, under half a millisecond either way,
+  so it is on by default. The numbers are in
+  `docs/superpowers/plans/2026-09-24-bevox-ambient-occlusion.md`.
+
 Each body owns its own `Contree`, packed into the shared node and voxel buffers
 behind a per-body base offset.
 
@@ -401,6 +419,7 @@ correctness are checked by deliberately breaking the code they guard.
 | 7 | Dwyer's joints: sixteen types, friction and motors; the grab as a joint; a joint scene | Doors, ropes and machines; bodies held steady |
 | 8 | Body shadows, from every body including those off screen | Bodies sit in the scene rather than on it |
 | 9 | Sleeping, and merging settled terrain debris back into the world | Debris stops costing anything, and gives its slot back |
+| 10 | Ambient occlusion from a fullness grid | Creases read as creases; a body reads as sitting on the floor |
 
 **Sleeping and merging** (milestone 9). A group of bodies touching or jointed
 together falls asleep once every one of them has been still for half a second,

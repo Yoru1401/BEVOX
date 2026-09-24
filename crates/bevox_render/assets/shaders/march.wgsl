@@ -13,6 +13,8 @@ struct MarchUniform {
     volume_params: vec4<u32>,  // [depth, extent, flags, 0]
     // [field_edge, field_cell_size, shadow caster count, where the casters start]
     field_params: vec4<u32>,
+    // [the word the fullness grid starts at inside `distance_field`, 0, 0, 0]
+    ao_params: vec4<u32>,
 };
 
 // Traversal optimisations, matching bevox_render::upload::march_flags. One
@@ -25,6 +27,7 @@ const FLAG_DISTANCE_FIELD: u32 = 8u;
 const FLAG_BODIES: u32 = 16u;
 const FLAG_BODY_RECT: u32 = 64u;
 const FLAG_BODY_SHADOWS: u32 = 128u;
+const FLAG_AO: u32 = 256u;
 
 @group(0) @binding(0) var<uniform> view: MarchUniform;
 @group(0) @binding(1) var<storage, read> nodes: array<vec4<u32>>;
@@ -1016,6 +1019,63 @@ fn shading_normal(hit: Hit) -> vec3<f32> {
     return implicit_normal(hit.voxel, hit.face_normal);
 }
 
+/// The centre of the voxel that was hit, in the world.
+///
+/// For a body the centre is found in its own frame and carried back through its
+/// placement, by way of the world hit point: `shadow_origin` says why that
+/// route and not straight from the voxel.
+fn voxel_centre(hit: Hit, id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
+    if hit.from_body {
+        let b = bodies[hit_body];
+        let a = mat3x3<f32>(b.local_from_world[0].xyz, b.local_from_world[1].xyz, b.local_from_world[2].xyz);
+        let point = view.camera_position.xyz + primary_ray(id, size) * hit.t;
+        let local_point = a * point + b.local_from_world[3].xyz;
+        return point + transpose(a) * (vec3<f32>(hit.voxel) + vec3<f32>(0.5) - local_point);
+    }
+    return vec3<f32>(hit.voxel) + vec3<f32>(0.5);
+}
+
+/// How full of solid one coarse cell is, 0 to 1. Outside the grid is empty:
+/// past the world there is nothing to shut the light out.
+fn fullness_cell(cell: vec3<i32>) -> f32 {
+    let edge = i32(view.field_params.x);
+    if cell.x < 0 || cell.y < 0 || cell.z < 0
+        || cell.x >= edge || cell.y >= edge || cell.z >= edge {
+        return 0.0;
+    }
+    let i = u32(cell.x + cell.y * edge + cell.z * edge * edge);
+    let word = distance_field[view.ao_params.x + i / 4u];
+    return f32((word >> ((i % 4u) * 8u)) & 0xFFu) / 255.0;
+}
+
+/// How full the world is around `p`, blended between the eight cell centres
+/// around it. Dwyer's devlog #15: a flat surface has half its surroundings
+/// full, an inner corner about three quarters.
+fn fullness_at(p: vec3<f32>) -> f32 {
+    let c = p / field_cell_size() - vec3<f32>(0.5);
+    let base = floor(c);
+    let f = c - base;
+    var total = 0.0;
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let step = vec3<f32>(f32(i & 1u), f32((i >> 1u) & 1u), f32((i >> 2u) & 1u));
+        let w = mix(vec3<f32>(1.0) - f, f, step);
+        total += w.x * w.y * w.z * fullness_cell(vec3<i32>(base + step));
+    }
+    return total;
+}
+
+/// How much of the ambient light is shut out at the hit voxel, 0 to 1.
+///
+/// Half full is a flat surface and shuts out nothing; what lies past half is
+/// the darkening, so an inner corner at three quarters loses half its ambient.
+/// One sample at the voxel's centre, so the shading stays per voxel.
+fn occlusion(hit: Hit, id: vec3<u32>, size: vec2<u32>) -> f32 {
+    if !flag_enabled(FLAG_AO) {
+        return 0.0;
+    }
+    return clamp((fullness_at(voxel_centre(hit, id, size)) - 0.5) * 2.0, 0.0, 1.0);
+}
+
 /// Where the shadow ray toward the sun starts for this hit.
 ///
 /// From the centre of the voxel that was hit, 0.75 along its face, for bodies
@@ -1034,12 +1094,7 @@ fn shadow_origin(hit: Hit, id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
         // this branch, which a body-free scene never runs, cost that scene
         // 0.58 ms of 11.8, a driver codegen cliff over the whole march. This
         // form costs +0.04 ms.
-        let b = bodies[hit_body];
-        let a = mat3x3<f32>(b.local_from_world[0].xyz, b.local_from_world[1].xyz, b.local_from_world[2].xyz);
-        let point = view.camera_position.xyz + primary_ray(id, size) * hit.t;
-        let local_point = a * point + b.local_from_world[3].xyz;
-        let centre = point + transpose(a) * (vec3<f32>(hit.voxel) + vec3<f32>(0.5) - local_point);
-        return centre + hit.face_normal * 0.75;
+        return voxel_centre(hit, id, size) + hit.face_normal * 0.75;
     }
     // Offset along the FACE normal, not the smoothed one. The implicit
     // normal is a blend of neighbouring empty faces, so at a three-way
@@ -1066,6 +1121,21 @@ fn march_shadow(@builtin(global_invocation_id) id: vec3<u32>) {
             flag = 1.0;
         }
         colour = vec4<f32>(flag, 0.0, 0.0, 1.0);
+    }
+    textureStore(output, vec2<i32>(id.xy), colour);
+}
+
+/// Ambient occlusion in red, 255 fully shut out. Parity test only.
+@compute @workgroup_size(8, 8, 1)
+fn march_ao(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(output);
+    if id.x >= size.x || id.y >= size.y { return; }
+
+    let hit = primary_hit(id, size);
+
+    var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if hit.hit {
+        colour = vec4<f32>(occlusion(hit, id, size), 0.0, 0.0, 1.0);
     }
     textureStore(output, vec2<i32>(id.xy), colour);
 }
@@ -1143,8 +1213,11 @@ fn march(@builtin(global_invocation_id) id: vec3<u32>) {
             diffuse = 0.0;
         }
 
+        // Ambient occlusion darkens the ambient light only: the sun's own is
+        // already answered by the shadow ray.
+        let ambient = 0.25 * (1.0 - occlusion(hit, id, size));
         let base = palette[hit.material].rgb;
-        colour = base * (0.25 + diffuse);
+        colour = base * (ambient + diffuse);
     }
     textureStore(output, vec2<i32>(id.xy), vec4<f32>(colour, 1.0));
 }

@@ -257,6 +257,7 @@ pub fn frame_uniform(
             casters.len() as u32,
             body_room(placed.len()) as u32,
         ],
+        ao_params: [scene.fullness_base, 0, 0, 0],
     };
     (uniform, table, rects, casters)
 }

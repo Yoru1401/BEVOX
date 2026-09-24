@@ -965,12 +965,16 @@ fn the_distance_field_leaves_output_bit_identical() {
         let offset_from_clip = (projection * view).inverse();
 
         for entry in ["march_identity", "march_voxel_id", "march_normal", "march"] {
+            // Ambient occlusion is in `DEFAULT` and shades every hit, so the
+            // reference carries it too: what is under test is the skip, and
+            // holding AO on both sides also proves the skip reaches the same
+            // voxel centres the unskipped scan does.
             let reference = run_march_flagged(
                 &device, &queue, &shader, entry, offset_from_clip, eye, &tree, width,
-                height, march_flags::NONE,
+                height, march_flags::AO,
             );
             for flags in [
-                march_flags::DISTANCE_FIELD,
+                march_flags::DISTANCE_FIELD | march_flags::AO,
                 march_flags::DEFAULT | march_flags::DISTANCE_FIELD,
             ] {
                 let got = run_march_flagged(
@@ -1090,24 +1094,30 @@ fn an_incrementally_uploaded_edit_renders_identically() {
     // no write.
     let tree = parity_scene();
     let field = bevox_core::distance_field::DistanceField::build(&tree);
+    let fullness = bevox_core::fullness::Fullness::build(&tree);
     let mut incremental = VoxelScene {
         tree,
         materials: parity_materials(),
         generation: 1,
         field,
         field_dirty: None,
+        fullness,
+        fullness_dirty: None,
         bodies: Vec::new(),
     };
     incremental.tree.arena_mut().clear_dirty();
 
     let whole_tree = parity_scene();
     let whole_field = bevox_core::distance_field::DistanceField::build(&whole_tree);
+    let whole_fullness = bevox_core::fullness::Fullness::build(&whole_tree);
     let mut whole = VoxelScene {
         tree: whole_tree,
         materials: parity_materials(),
         generation: 1,
         field: whole_field,
         field_dirty: None,
+        fullness: whole_fullness,
+fullness_dirty: None,
         bodies: Vec::new(),
     };
 
@@ -1685,6 +1695,102 @@ fn body_shadows_off_leave_the_image_as_with_no_caster() {
         let differing = without.chunks(4).zip(with.chunks(4)).filter(|(a, b)| a != b).count();
         assert_eq!(differing, 0, "{entry}: with body shadows off, a body changed {differing} pixels");
     }
+}
+
+/// What the shader computes for ambient occlusion, on the CPU: the fullness
+/// around the voxel's centre, blended between the eight cell centres about it,
+/// and whatever of it lies past half.
+fn cpu_occlusion(fullness: &bevox_core::fullness::Fullness, centre: Vec3) -> f32 {
+    let cell = bevox_core::distance_field::CELL_VOXELS as f32;
+    let c = centre / cell - Vec3::splat(0.5);
+    let base = c.floor();
+    let f = c - base;
+    let mut total = 0.0;
+    for i in 0..8u32 {
+        let step = Vec3::new((i & 1) as f32, ((i >> 1) & 1) as f32, ((i >> 2) & 1) as f32);
+        let w = (Vec3::ONE - f) * (Vec3::ONE - step) + f * step;
+        let at = base + step;
+        let value = if at.min_element() < 0.0 {
+            0.0
+        } else {
+            fullness.get(at.as_uvec3()) as f32 / 255.0
+        };
+        total += w.x * w.y * w.z * value;
+    }
+    ((total - 0.5) * 2.0).clamp(0.0, 1.0)
+}
+
+/// The GPU's ambient occlusion is the CPU's, per pixel, and it does what it is
+/// for: nothing on open floor, something in a corner.
+#[test]
+fn ambient_occlusion_matches_the_cpu() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (width, height) = (96u32, 96u32);
+    // A floor with a wall rising from it: open floor far from the wall, and the
+    // crease where the two meet.
+    let mut voxels = Vec::new();
+    for z in 0..64 {
+        for x in 0..64 {
+            for y in 0..8 {
+                voxels.push((UVec3::new(x, y, z), MaterialId(1)));
+            }
+        }
+    }
+    for z in 0..64 {
+        for y in 8..40 {
+            for x in 0..8 {
+                voxels.push((UVec3::new(x, y, z), MaterialId(2)));
+            }
+        }
+    }
+    let tree = Contree::from_voxels(64, &voxels);
+    let fullness = bevox_core::fullness::Fullness::build(&tree);
+    let eye = Vec3::new(40.0, 24.0, 40.0);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(6.0, 9.0, 6.0) - eye, Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+    let offset_from_clip = (projection * view).inverse();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    let pixels = run_march_flagged(
+        &device, &queue, &shader, "march_ao", offset_from_clip, eye, &tree, width, height,
+        march_flags::DEFAULT | march_flags::AO,
+    );
+
+    let mut stats = MarchStats::default();
+    let (mut mismatches, mut dark, mut lit) = (0usize, 0usize, 0usize);
+    let mut first = String::new();
+    for y in 0..height {
+        for x in 0..width {
+            let dir = ray_direction(offset_from_clip, x, y, width, height);
+            let i = ((y * width + x) * 4) as usize;
+            let Some(hit) = march(&tree, Affine3A::IDENTITY, eye, dir, 1000.0, false, &mut stats)
+            else {
+                continue;
+            };
+            let want = cpu_occlusion(&fullness, hit.voxel.as_vec3() + Vec3::splat(0.5));
+            let got = pixels[i] as f32 / 255.0;
+            if want > 0.25 {
+                dark += 1;
+            }
+            if want == 0.0 {
+                lit += 1;
+            }
+            // One byte of output, so half a step of rounding either way.
+            if (got - want).abs() > 0.5 / 255.0 + 1e-4 {
+                if mismatches == 0 {
+                    first = format!("at ({x},{y}) cpu={want} gpu={got}");
+                }
+                mismatches += 1;
+            }
+        }
+    }
+    eprintln!("{dark} pixels shut out by a quarter or more, {lit} fully open, {mismatches} mismatches");
+    assert!(dark > 200, "only {dark} pixels are occluded; the scene has no corner to speak of");
+    assert!(lit > 200, "only {lit} pixels are open; the scene is all corner");
+    assert_eq!(mismatches, 0, "{mismatches} pixels disagreed; first {first}");
 }
 
 /// A body whose content reaches its volume's max faces, seen from past them.

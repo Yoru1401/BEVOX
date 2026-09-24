@@ -31,6 +31,7 @@ pub struct TestUniform {
     pub volume_params: [u32; 4],
     /// `[field_edge, field_cell_size, 0, 0]`.
     pub field_params: [u32; 4],
+    pub ao_params: [u32; 4],
 }
 
 /// Colours for the parity scene's two materials. A zeroed palette would render
@@ -321,6 +322,7 @@ impl Prepared {
                 casters.len() as u32,
                 room as u32,
             ],
+            ao_params: [bevox_render::upload::field_words(&field), 0, 0, 0],
         };
 
         // Root first, arena shifted by one: the layout the shader indexes.
@@ -379,7 +381,8 @@ impl Prepared {
             contents: bytemuck::cast_slice(&palette),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let field_words = bevox_render::upload::pack_field(&field);
+        let fullness = bevox_core::fullness::Fullness::build(tree);
+        let field_words = bevox_render::upload::pack_grids(&field, &fullness);
         let field_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("field"),
             contents: bytemuck::cast_slice(&field_words),

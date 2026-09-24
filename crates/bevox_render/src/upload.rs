@@ -9,6 +9,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, T
 use bevox_core::body::{Body, occupied_bounds};
 use bevox_core::contree::Contree;
 use bevox_core::distance_field::DistanceField;
+use bevox_core::fullness::Fullness;
 use bevox_core::gpu::{GpuNode, GpuVolume};
 use bevox_core::mask_table::build_direction_masks;
 use bevox_core::material::{MaterialId, MaterialTable};
@@ -25,6 +26,12 @@ pub struct VoxelScene {
     pub generation: u32,
     /// Coarse distance-to-solid grid, kept in step with `tree` by the brush.
     pub field: DistanceField,
+    /// How full of solid each coarse cell is, for ambient occlusion. The same
+    /// cells as `field`, and uploaded in the same buffer behind it.
+    pub fullness: Fullness,
+    /// Cell range an edit made `fullness` recount, if any. Unlike the field,
+    /// fullness has no safe direction to be stale in.
+    pub fullness_dirty: Option<Range<u32>>,
     /// Cell range the brush lowered since the last `stage_scene_update`, if any.
     ///
     /// `None` after an erase: removing geometry only raises true distances, so
@@ -63,8 +70,12 @@ pub struct MarchUniform {
     pub sun_direction: [f32; 4],
     /// `[depth, extent, march_flags, 0]`.
     pub volume_params: [u32; 4],
-    /// `[field_edge, field_cell_size, 0, 0]`.
+    /// `[field_edge, field_cell_size, shadow casters, where they start]`.
     pub field_params: [u32; 4],
+    /// `[the word the fullness grid starts at, 0, 0, 0]`. It shares the
+    /// distance field's buffer: the compute stage is already at wgpu's default
+    /// of eight storage buffers.
+    pub ao_params: [u32; 4],
 }
 
 /// Traversal optimisations, carried in `volume_params.z`.
@@ -93,6 +104,9 @@ pub mod march_flags {
     /// shadows. Read by the shader. The bodies it tests are
     /// `pipeline::shadow_casters`, never the culled table.
     pub const BODY_SHADOWS: u32 = 128;
+    /// Darken the ambient light where the world is full around a voxel: Dwyer's
+    /// fullness grid, in devlog #15.
+    pub const AO: u32 = 256;
     /// What the app runs. Each optimisation joins this only once it has measured
     /// faster while staying bit-identical.
     ///
@@ -127,6 +141,16 @@ pub mod march_flags {
     /// sixteen in view, shadowing 88,171 pixels, +4.85 / +5.31 ms, for 22.6 ms
     /// in all against a 16.7 ms frame. That last is the bench's worst case, a
     /// wall of cubes across the view.
+    ///
+    /// `AO` is a feature too, and it measured free. In
+    /// `ambient_occlusion_is_measured` (GTX 1650, 1280x720, bench camera,
+    /// 2026-09-24, A/B/A against the same flags without it, wall / GPU): a
+    /// body-free scene -0.15 / +0.08 ms against 0.12 / 0.37 ms of drift, and
+    /// sixteen bodies in view +0.28 / +0.34 ms against 0.16 / 0.32 ms. Both
+    /// sit inside the drift, so the honest reading is under half a millisecond
+    /// and not separable from noise. The shader before it and the shader after
+    /// it, both with `AO` off, also measured within drift, so the grid's code
+    /// costs nothing where it does not run.
     pub const DEFAULT: u32 = DDA
         | MASK_FILTER
         | BEAM
@@ -134,7 +158,8 @@ pub mod march_flags {
         | BODIES
         | CULL_BODIES
         | BODY_RECT
-        | BODY_SHADOWS;
+        | BODY_SHADOWS
+        | AO;
 }
 
 /// The sun direction the renderer and the parity tests share.
@@ -306,6 +331,8 @@ pub struct GpuSceneData {
     /// Chebyshev distance to the nearest solid voxel per coarse cell, packed
     /// four to a word.
     pub distance_field: Vec<u32>,
+    /// Where the fullness grid starts inside `distance_field`.
+    pub fullness_base: u32,
     /// Cells per axis, so the shader can index the grid.
     pub field_edge: u32,
     pub generation: u32,
@@ -332,6 +359,7 @@ impl Default for GpuSceneData {
             // A single zero cell claims no empty space anywhere, the safe
             // value for an empty scene.
             distance_field: vec![0],
+            fullness_base: 0,
             field_edge: 1,
             generation: 0,
             world_region: WorldRegion::around(1, 0),
@@ -465,15 +493,30 @@ pub fn build_gpu_scene(
         depth: scene.tree.depth(),
         extent: scene.tree.extent(),
         field_edge: scene.field.edge(),
-        distance_field: pack_field(&scene.field),
+        distance_field: pack_grids(&scene.field, &scene.fullness),
+        fullness_base: field_words(&scene.field),
         generation: scene.generation,
         world_region: packed.world_region,
     });
 }
 
 /// The field packed four cells to a word, matching `pack_voxels`.
-pub fn pack_field(field: &bevox_core::distance_field::DistanceField) -> Vec<u32> {
+pub fn pack_field(field: &DistanceField) -> Vec<u32> {
     bevox_core::gpu::pack_voxels(field.cells())
+}
+
+/// Words the distance field occupies, which is where the fullness grid starts.
+pub fn field_words(field: &DistanceField) -> u32 {
+    field.cells().len().div_ceil(4) as u32
+}
+
+/// Both coarse grids in one buffer: the distance field, then fullness. One
+/// binding rather than two, because the compute stage is already at wgpu's
+/// default of eight storage buffers.
+pub fn pack_grids(field: &DistanceField, fullness: &Fullness) -> Vec<u32> {
+    let mut words = pack_field(field);
+    words.extend(bevox_core::gpu::pack_voxels(fullness.cells()));
+    words
 }
 
 /// Clip space to the world-space offset from the eye: the camera's rotation
@@ -560,6 +603,7 @@ pub fn march_uniform(
         // shader-side constant, which is exactly the duplication that let
         // `march.wgsl`'s copy silently disagree with this one.
         field_params: [field.edge(), bevox_core::distance_field::CELL_VOXELS, 0, 0],
+        ao_params: [field_words(field), 0, 0, 0],
     }
 }
 
@@ -636,6 +680,11 @@ pub fn apply_brush(scene: &mut VoxelScene, centre: Vec3, radius: f32, material: 
     if !material.is_empty() {
         scene.field_dirty = Some(scene.field.lower_around(centre, radius));
     }
+    // Either way for fullness: painting fills cells and erasing empties them,
+    // and neither direction is safe to leave stale.
+    let reach = glam::IVec3::splat(radius.ceil() as i32 + 1);
+    let at = centre.as_ivec3();
+    scene.fullness_dirty = Some(scene.fullness.recount(&scene.tree, at - reach, at + reach));
 }
 
 /// The world's high-water marks: arena node slots in use, and packed voxel
@@ -706,6 +755,21 @@ pub fn stage_scene_update(scene: &mut VoxelScene) -> SceneUpdate {
         })
         .into_iter()
         .collect();
+
+    // Fullness rides behind the distance field in the same buffer, so its
+    // writes are the same writes at an offset.
+    let mut field: Vec<FieldWrite> = field;
+    if let Some(r) = scene.fullness_dirty.take() {
+        let cells = scene.fullness.cells();
+        let first = r.start / 4;
+        let last = r.end.div_ceil(4);
+        let lo = (first * 4) as usize;
+        let hi = ((last * 4) as usize).min(cells.len());
+        field.push(FieldWrite {
+            start_word: field_words(&scene.field) + first,
+            words: bevox_core::gpu::pack_voxels(&cells[lo..hi]),
+        });
+    }
 
     let update = SceneUpdate {
         root: GpuNode::from(scene.tree.root()),
@@ -799,8 +863,9 @@ mod tests {
 
     #[test]
     fn the_uniform_is_the_size_the_shader_expects() {
-        // mat4x4 (64) + vec4 (16) + vec4 sun (16) + uvec4 (16) + uvec4 field (16)
-        assert_eq!(size_of::<MarchUniform>(), 128);
+        // mat4x4 (64) + vec4 (16) + vec4 sun (16) + uvec4 volume (16)
+        // + uvec4 field (16) + uvec4 ao (16)
+        assert_eq!(size_of::<MarchUniform>(), 144);
         assert_eq!(align_of::<MarchUniform>(), 4);
     }
 
@@ -895,12 +960,15 @@ mod tests {
         // the edit under test touched.
         tree.arena_mut().clear_dirty();
         let field = DistanceField::build(&tree);
+        let fullness = bevox_core::fullness::Fullness::build(&tree);
         VoxelScene {
             tree,
             materials: MaterialTable::new(),
             generation: 1,
             field,
             field_dirty: None,
+            fullness,
+            fullness_dirty: None,
             bodies: Vec::new(),
         }
     }
@@ -915,24 +983,46 @@ mod tests {
         let update = stage_scene_update(&mut scene);
         assert!(!update.field.is_empty(), "a paint staged no field cells");
 
-        let whole = pack_field(&scene.field);
+        let whole = pack_grids(&scene.field, &scene.fullness);
         for write in &update.field {
             for (i, word) in write.words.iter().enumerate() {
                 let w = write.start_word as usize + i;
-                assert_eq!(*word, whole[w], "staged field word {w} differs from a full pack");
+                assert_eq!(*word, whole[w], "staged word {w} differs from a full pack");
             }
         }
+        let base = field_words(&scene.field);
+        assert!(
+            update.field.iter().any(|w| w.start_word < base),
+            "a paint staged no distance-field cells"
+        );
+        assert!(
+            update.field.iter().any(|w| w.start_word >= base),
+            "a paint staged no fullness cells, so ambient occlusion would keep the old shape"
+        );
     }
 
-    /// Erasing needs no field update at all: removing geometry only increases
-    /// true distances, so a stale field under-estimates, which costs speed and
-    /// never correctness.
+    /// Erasing needs no distance-field update: removing geometry only
+    /// increases true distances, so a stale field under-estimates, which costs
+    /// speed and never correctness. Fullness is another matter: an erase empties
+    /// cells, and ambient occlusion left stale would darken what is now open.
     #[test]
-    fn erasing_stages_no_field_cells() {
+    fn erasing_stages_fullness_but_no_field_cells() {
         let mut scene = edit_scene();
         apply_brush(&mut scene, Vec3::splat(32.0), 6.0, MaterialId::EMPTY);
         let update = stage_scene_update(&mut scene);
-        assert!(update.field.is_empty(), "an erase staged field cells it did not need to");
+        let base = field_words(&scene.field);
+        assert!(
+            update.field.iter().all(|w| w.start_word >= base),
+            "an erase staged distance-field cells it did not need to"
+        );
+        assert!(!update.field.is_empty(), "an erase staged no fullness cells");
+        let whole = pack_grids(&scene.field, &scene.fullness);
+        for write in &update.field {
+            for (i, word) in write.words.iter().enumerate() {
+                let w = write.start_word as usize + i;
+                assert_eq!(*word, whole[w], "staged word {w} differs from a full pack");
+            }
+        }
     }
 
     #[test]
@@ -1031,12 +1121,15 @@ mod tests {
         tree.apply_sphere(Vec3::new(32.0, 32.0, 32.0), 10.0, MaterialId(1));
         tree.arena_mut().clear_dirty();
         let field = DistanceField::build(&tree);
+        let fullness = bevox_core::fullness::Fullness::build(&tree);
         app.insert_resource(VoxelScene {
             tree,
             materials: MaterialTable::new(),
             generation: 1,
             field,
             field_dirty: None,
+            fullness,
+            fullness_dirty: None,
             bodies: Vec::new(),
         });
         app.update();
@@ -1084,12 +1177,15 @@ mod tests {
         tree.apply_sphere(Vec3::new(32.0, 32.0, 32.0), 10.0, MaterialId(1));
         tree.arena_mut().clear_dirty();
         let field = DistanceField::build(&tree);
+        let fullness = bevox_core::fullness::Fullness::build(&tree);
         app.insert_resource(VoxelScene {
             tree,
             materials: MaterialTable::new(),
             generation: 1,
             field,
             field_dirty: None,
+            fullness,
+            fullness_dirty: None,
             bodies: Vec::new(),
         });
         app.update();
@@ -1220,6 +1316,7 @@ mod tests {
 
         let tree = Contree::empty(3);
         let field = DistanceField::build(&tree);
+        let fullness = bevox_core::fullness::Fullness::build(&tree);
         let body = bevox_core::body::Body::new(
             Contree::empty(2),
             Vec3::new(4.0, 5.0, 6.0),
@@ -1231,6 +1328,8 @@ mod tests {
             generation: 1,
             field,
             field_dirty: None,
+            fullness,
+            fullness_dirty: None,
             bodies: vec![body],
         });
         app.update();
@@ -1459,12 +1558,15 @@ mod tests {
         let mut tree = dense.into_contree();
         tree.arena_mut().clear_dirty();
         let field = DistanceField::build(&tree);
+        let fullness = bevox_core::fullness::Fullness::build(&tree);
         let scene = VoxelScene {
             tree,
             materials: MaterialTable::new(),
             generation: 1,
             field,
             field_dirty: None,
+            fullness,
+            fullness_dirty: None,
             bodies: Vec::new(),
         };
         let strokes = (0..16u32).flat_map(|bz| {
