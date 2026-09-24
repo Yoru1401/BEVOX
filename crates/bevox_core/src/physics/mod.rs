@@ -43,10 +43,79 @@ pub const BIAS: f32 = 0.2;
 /// buried by an edit floats out rather than being fired out.
 pub const MAX_PUSH: f32 = 20.0;
 
+/// What a body moves through when nothing is touching it.
+///
+/// Gravity was already a parameter of `step` rather than a constant, so a test
+/// can switch it off and watch one thing at a time. Drag is the same kind of
+/// thing and is passed the same way -- which is also what keeps
+/// `momentum_is_conserved_exactly_in_free_flight` exact: drag is an external
+/// force and would leak momentum out of a gate that exists to prove none
+/// leaks. The solver's invariants are tested in `Air::STILL` and `Air::VACUUM`;
+/// drag has its own gate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Air {
+    pub gravity: Vec3,
+    /// Quadratic, per voxel: the acceleration is `-drag * v * |v|`.
+    pub drag: f32,
+}
+
+impl Air {
+    /// What the game runs in.
+    pub const EARTH: Air = Air { gravity: GRAVITY, drag: DRAG };
+
+    /// Gravity with nothing to resist it, for anything whose closed form is
+    /// being checked.
+    pub const VACUUM: Air = Air { gravity: GRAVITY, drag: 0.0 };
+
+    /// Neither, for watching a collision on its own.
+    pub const STILL: Air = Air { gravity: Vec3::ZERO, drag: 0.0 };
+
+    /// A named gravity, still with no drag.
+    pub const fn vacuum(gravity: Vec3) -> Air {
+        Air { gravity, drag: 0.0 }
+    }
+}
+
+/// How fast a long fall settles at, in voxels a second: 20 metres a second.
+///
+/// Drag is what a body is limited by, not a clamp, so it eases into this
+/// rather than hitting it. It takes about two seconds and two hundred voxels
+/// to get near, which covers any drop worth building.
+pub const TERMINAL_SPEED: f32 = 200.0;
+
+/// Quadratic air resistance, per voxel: `a = -DRAG * v * |v|`.
+///
+/// Set so that drag balances gravity exactly at `TERMINAL_SPEED`. A falling
+/// body approaches that speed and never reaches it, which is what falling
+/// does; a hard clamp instead stops the acceleration dead in one tick, and
+/// that is visible.
+pub const DRAG: f32 = -GRAVITY.y / (TERMINAL_SPEED * TERMINAL_SPEED);
+
 /// The furthest a body may move in one tick, in voxels: linear travel plus the
 /// swing of its furthest voxel. Speeds are capped to it, which is what lets
 /// speculative contacts stand in for continuous collision detection.
-pub const MAX_TRAVEL: f32 = 1.25;
+///
+/// A safety net, not a speed limit. It sits above what drag allows -- 260
+/// voxels a second against a terminal 200 -- so a falling body never reaches
+/// it, and what does reach it is something thrown or blasted, where being
+/// clamped beats tunnelling through a wall. The detection margin is the body's
+/// *actual* travel, so a cap this high costs a slow body nothing.
+pub const MAX_TRAVEL: f32 = 4.0;
+
+/// How strongly a contact resists a body rolling on it, as a fraction of what
+/// it resists sliding with.
+///
+/// Sliding friction cannot stop a roll. A rolling sphere has almost no slip
+/// where it touches, so friction finds nothing to act against, and a lone
+/// voxel -- which classifies as a `Corner`, a sphere of radius 0.5 -- rolls
+/// across a flat floor for as long as you watch it and never falls asleep.
+/// Measured before this existed: nudged at 4 voxels a second, still moving at
+/// 3.3 after eight seconds.
+///
+/// Small, because it is a real force and not a cure: it must not stop a cube
+/// tipping onto its face, which is the same angular motion at the same kind of
+/// contact.
+pub const ROLLING: f32 = 0.08;
 
 /// Sweeps of the restitution pass. One is not enough: every contact of a flat
 /// landing would push the whole body to the bounce target by itself.

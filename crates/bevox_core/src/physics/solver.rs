@@ -15,7 +15,9 @@ use super::contact::{Contact, RADIUS, detect, detect_pair, world_box};
 use super::fracture::{self, Fracture};
 use super::joint::{self, Joint};
 use super::sleep;
-use super::{BASE_MARGIN, BIAS, MAX_PUSH, MAX_TRAVEL, RESTITUTION_SWEEPS, SLOP, SUBSTEPS};
+use super::{
+    Air, BASE_MARGIN, BIAS, MAX_PUSH, MAX_TRAVEL, RESTITUTION_SWEEPS, ROLLING, SLOP, SUBSTEPS,
+};
 use crate::body::{Body, BodyId, occupied_bounds};
 use crate::contree::Contree;
 use crate::distance_field::DistanceField;
@@ -62,7 +64,7 @@ pub fn step(
     tree: &Contree,
     field: &DistanceField,
     materials: &MaterialTable,
-    gravity: Vec3,
+    air: Air,
     dt: f32,
     grab: Option<&mut Joint>,
     joints: &mut [Joint],
@@ -131,7 +133,10 @@ pub fn step(
 
     for _ in 0..SUBSTEPS {
         for (b, &r) in bodies.iter_mut().zip(&radii).filter(|(b, _)| b.mass.mass > 0.0 && !b.asleep) {
-            b.velocity += gravity * h;
+            // Drag before the cap, and the cap almost never fires: what limits
+            // a fall is a force, so the body eases into its terminal speed
+            // instead of having its acceleration switched off in one tick.
+            b.velocity += (air.gravity - air.drag * b.velocity * b.velocity.length()) * h;
             cap_speed(b, world_inverse_inertia(b), r, dt);
         }
 
@@ -149,7 +154,8 @@ pub fn step(
         for (j, impulse) in joined.iter().zip(impulses.iter_mut()) {
             let (a, mut b) = pair_mut(bodies, j.body, j.other);
             solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, true);
-            solve_friction(a, b, &j.contact, impulse);
+            solve_friction(a, b.as_deref_mut(), &j.contact, impulse);
+            solve_rolling(a, b, &j.contact, *impulse);
         }
 
         for b in bodies.iter_mut().filter(|b| b.mass.mass > 0.0 && !b.asleep) {
@@ -163,7 +169,8 @@ pub fn step(
         for (j, impulse) in joined.iter().zip(impulses.iter_mut()) {
             let (a, mut b) = pair_mut(bodies, j.body, j.other);
             solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, false);
-            solve_friction(a, b, &j.contact, impulse);
+            solve_friction(a, b.as_deref_mut(), &j.contact, impulse);
+            solve_rolling(a, b, &j.contact, *impulse);
         }
     }
 
@@ -495,6 +502,38 @@ fn solve(
 /// clamping each axis alone would let the total reach sqrt(2) times the limit,
 /// and a body pushed diagonally would slide further than one pushed along an
 /// axis.
+/// Resistance to rolling, which sliding friction cannot provide.
+///
+/// A rolling contact barely slips, so `solve_friction` finds almost no relative
+/// velocity to oppose and a sphere rolls for ever. This opposes the spin
+/// itself, with an angular impulse limited by what the contact is pressing
+/// with -- `ROLLING * friction * normal impulse * RADIUS` -- and never more
+/// than the spin that is there, so it can slow a roll to a stop and never
+/// reverse one or add energy.
+fn solve_rolling(a: &mut Body, b: Option<&mut Body>, c: &Contact, impulse: ContactImpulse) {
+    if c.friction <= 0.0 || impulse.normal <= 0.0 {
+        return;
+    }
+    let relative = a.angular_velocity() - b.as_deref().map_or(Vec3::ZERO, |b| b.angular_velocity());
+    let Some(axis) = relative.try_normalize() else {
+        return;
+    };
+    // The lever a voxel contact turns on, so the limit is a torque.
+    let limit = ROLLING * c.friction * impulse.normal * RADIUS;
+    let resist = -axis * limit.min(relative.length() / inverse_inertia_about(a, b.as_deref(), axis));
+    a.angular_momentum += resist;
+    if let Some(b) = b {
+        b.angular_momentum -= resist;
+    }
+}
+
+/// How freely the pair turns about `axis`, which is what converts an angular
+/// impulse into a change in spin.
+fn inverse_inertia_about(a: &Body, b: Option<&Body>, axis: Vec3) -> f32 {
+    let of = |body: &Body| axis.dot(world_inverse_inertia(body) * axis);
+    (of(a) + b.map_or(0.0, of)).max(1e-12)
+}
+
 fn solve_friction(
     a: &mut Body,
     b: Option<&mut Body>,
@@ -537,6 +576,7 @@ mod tests {
     use super::*;
     use crate::material::MaterialId;
     use crate::physics::GRAVITY;
+    use crate::physics::TERMINAL_SPEED;
     use crate::physics::fixtures::{cube, cube_of, energy, materials, placed, slab, slab_of};
     use crate::physics::joint::{Angular, Joint, Linear};
     use glam::EulerRot;
@@ -557,7 +597,7 @@ mod tests {
         ticks: u32,
     ) {
         for _ in 0..ticks {
-            step(bodies, world, field, materials, gravity, DT, None, &mut []);
+            step(bodies, world, field, materials, Air::vacuum(gravity), DT, None, &mut []);
         }
     }
 
@@ -669,7 +709,7 @@ mod tests {
         let top = bodies[0].world_from_local().transform_point3(Vec3::new(2.0, 3.99, 2.0));
         let mut joints = vec![ball(&bodies[0], None, top)];
         for _ in 0..1000 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut joints);
+            step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut joints);
         }
         assert!(opening(&bodies, &joints[0]) < 0.05, "the joint gave way");
         assert!(bodies[0].velocity.length() < 0.01, "it moved: {:?}", bodies[0].velocity);
@@ -691,7 +731,7 @@ mod tests {
         let scale = bodies[0].mass.mass * -GRAVITY.y * 4.0;
         let (mut widest, mut fastest, mut highest) = (0.0f32, 0.0f32, f32::NEG_INFINITY);
         for _ in 0..3000 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut joints);
+            step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut joints);
             widest = widest.max(opening(&bodies, &joints[0]));
             fastest = fastest.max(bodies[0].velocity.length());
             highest = highest.max(energy(&bodies));
@@ -726,7 +766,7 @@ mod tests {
         let scale = bodies.iter().map(|b| b.mass.mass).sum::<f32>() * -GRAVITY.y * 4.0;
         let (mut widest, mut highest) = (0.0f32, f32::NEG_INFINITY);
         for _ in 0..5000 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut joints);
+            step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut joints);
             for j in &joints {
                 widest = widest.max(opening(&bodies, j));
             }
@@ -752,7 +792,7 @@ mod tests {
         let pivot = Vec3::new(31.85, 30.0, 30.0);
         let mut joints = vec![ball(&bodies[1], Some(&bodies[0]), pivot)];
         for _ in 0..30 {
-            step(&mut bodies, &world, &field, &materials, Vec3::ZERO, DT, None, &mut joints);
+            step(&mut bodies, &world, &field, &materials, Air::STILL, DT, None, &mut joints);
         }
         for b in &bodies {
             assert!(b.velocity.length() < 1e-3, "an overlap pushed a jointed body: {:?}", b.velocity);
@@ -780,7 +820,7 @@ mod tests {
         let mut joints = vec![Joint::new(&bodies[0], None, Linear::Point, Angular::Axis, hinge, hinge, Vec3::Y)];
         bodies[0].velocity = Vec3::new(0.0, 0.0, 8.0);
         for _ in 0..300 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut joints);
+            step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut joints);
         }
         let door = &bodies[0];
         let up = door.orientation * Vec3::Y;
@@ -910,7 +950,7 @@ mod tests {
         run(&mut bodies, &world, &field, &materials(), GRAVITY, 8000);
         let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
         for _ in 0..1000 {
-            step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []);
+            step(&mut bodies, &world, &field, &materials(), Air::VACUUM, DT, None, &mut []);
             low = low.min(bodies[0].position.y);
             high = high.max(bodies[0].position.y);
         }
@@ -1045,7 +1085,7 @@ mod tests {
             let mut top: f32 = 0.0;
             let mut landed = false;
             for _ in 0..400 {
-                step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut []);
+                step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut []);
                 let y = bodies[0].position.y;
                 landed |= y < 10.2;
                 if landed {
@@ -1079,7 +1119,7 @@ mod tests {
         assert!((settled - 10.0).abs() < 0.1, "settled at {settled}, not on the floor");
         let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
         for _ in 0..1000 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut []);
+            step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut []);
             low = low.min(bodies[0].position.y);
             high = high.max(bodies[0].position.y);
         }
@@ -1101,7 +1141,7 @@ mod tests {
         run(&mut bodies, &world, &field, &materials, GRAVITY, 3000);
         let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
         for _ in 0..500 {
-            step(&mut bodies, &world, &field, &materials, GRAVITY, DT, None, &mut []);
+            step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut []);
             low = low.min(bodies[0].position.y);
             high = high.max(bodies[0].position.y);
         }
@@ -1144,7 +1184,7 @@ mod tests {
         // At rest this long the body sleeps, and a sleeper is woken by an edit
         // only through `wake_near`, as the app's edits call it.
         crate::physics::sleep::wake_near(&mut bodies, Vec3::new(25.0, -1.0, 25.0), Vec3::new(39.0, 13.0, 39.0));
-        step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []);
+        step(&mut bodies, &world, &field, &materials(), Air::VACUUM, DT, None, &mut []);
         assert!(bodies[0].velocity.y < -1.0, "still held up: {:?}", bodies[0].velocity);
     }
 
@@ -1161,7 +1201,7 @@ mod tests {
             k
         };
         let before = keys(&bodies[0]);
-        step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []);
+        step(&mut bodies, &world, &field, &materials(), Air::VACUUM, DT, None, &mut []);
         assert!(!before.is_empty());
         assert_eq!(keys(&bodies[0]), before);
     }
@@ -1205,7 +1245,7 @@ mod tests {
             let mut bodies = scene();
             // Settle first, so the timing is a steady tick rather than a drop.
             for _ in 0..30 {
-                step(&mut bodies, &world, &field, materials, GRAVITY, DT, None, &mut []);
+                step(&mut bodies, &world, &field, materials, Air::VACUUM, DT, None, &mut []);
             }
             let mut ticks = Vec::new();
             let mut broke = 0;
@@ -1219,7 +1259,7 @@ mod tests {
                 }
                 let at = std::time::Instant::now();
                 let out =
-                    step(&mut bodies, &world, &field, materials, GRAVITY, DT, None, &mut []);
+                    step(&mut bodies, &world, &field, materials, Air::VACUUM, DT, None, &mut []);
                 ticks.push(at.elapsed().as_secs_f64() * 1000.0);
                 broke += out.fractures.len();
             }
@@ -1236,6 +1276,124 @@ mod tests {
         );
         assert_eq!(none, 0, "the materials that hold broke {none} times");
         assert!(raised > 0, "the materials that give way broke nothing");
+    }
+
+    /// A lone voxel nudged along the floor comes to rest, and then sleeps.
+    ///
+    /// A lone voxel classifies as a `Corner`, which is a sphere: it rolls, and
+    /// a rolling contact barely slips, so sliding friction never stops it.
+    /// Before `ROLLING` it was still moving at 3.3 voxels a second after eight
+    /// seconds and `still_for` never left zero, so it never slept and never
+    /// merged. The same goes for a tower one voxel wide, whose voxels are
+    /// cylinders standing on a sphere.
+    ///
+    /// The ice half is the discriminating one: the resistance comes from the
+    /// contact's friction, so a voxel spinning on frictionless ice must keep
+    /// spinning. A damper that ignored friction would stop that too and pass
+    /// every other assertion here.
+    ///
+    /// It has to be a *spin* on the ice rather than a roll: with no friction
+    /// the voxel slides without turning, and a test of sliding cannot tell a
+    /// contact force from a global one.
+    #[test]
+    fn a_lone_voxel_stops_rolling_and_sleeps() {
+        let world = slab(64, 0..8);
+        let ice = slab_of(64, 0..8, MaterialId(3));
+        let field = DistanceField::build(&world);
+        let materials = materials();
+        let tower = {
+            let voxels: Vec<_> = (0..6u32).map(|y| (UVec3::new(0, y, 0), MaterialId(1))).collect();
+            Contree::from_voxels(16, &voxels)
+        };
+
+        let roll = |floor: &Contree, volume: Contree, seconds: f32| {
+            let mut body = placed(volume, Vec3::new(32.0, 9.0, 32.0), Quat::IDENTITY);
+            assert!(body.recompute(&materials));
+            body.velocity = Vec3::new(4.0, 0.0, 0.0);
+            let mut bodies = vec![body];
+            for _ in 0..(seconds / DT) as usize {
+                step(&mut bodies, floor, &field, &materials, Air::EARTH, DT, None, &mut []);
+            }
+            (bodies[0].velocity.length(), bodies[0].asleep)
+        };
+
+        let (speed, asleep) = roll(&world, cube_of(1, 4, MaterialId(1)), 3.0);
+        assert!(asleep, "a lone voxel was still awake after three seconds, moving at {speed}");
+        let (speed, asleep) = roll(&world, tower, 5.0);
+        assert!(asleep, "a one-wide tower was still awake after five seconds, moving at {speed}");
+
+        let mut body = placed(cube_of(1, 4, MaterialId(1)), Vec3::new(32.0, 8.5, 32.0), Quat::IDENTITY);
+        assert!(body.recompute(&materials));
+        let spun = 6.0;
+        body.angular_momentum = (world_inverse_inertia(&body).inverse()) * Vec3::new(0.0, spun, 0.0);
+        let mut bodies = vec![body];
+        for _ in 0..(3.0 / DT) as usize {
+            step(&mut bodies, &ice, &field, &materials, Air::EARTH, DT, None, &mut []);
+        }
+        let left = bodies[0].angular_velocity().length();
+        assert!(
+            left > spun * 0.9,
+            "a voxel spinning on frictionless ice slowed from {spun} to {left}: the resistance              is not coming from the contact's friction"
+        );
+    }
+
+    /// A long fall eases into its terminal speed instead of having its
+    /// acceleration switched off.
+    ///
+    /// The old hard cap was visible from the ground: a body accelerated for
+    /// 0.82 seconds, reached 80 voxels a second exactly, and fell the rest of
+    /// the way at a flat rate. Drag gives the asymptote that falling actually
+    /// has -- always some acceleration left, never quite at the limit.
+    ///
+    /// Dropped where nothing can be hit, so this is the integrator alone.
+    #[test]
+    fn a_long_fall_eases_into_terminal_speed() {
+        let world = slab(64, 0..8);
+        let field = DistanceField::build(&world);
+        let materials = materials();
+        let mut body = placed(cube(4, 4), Vec3::new(32.0, 4000.0, 32.0), Quat::IDENTITY);
+        assert!(body.recompute(&materials));
+        let mut bodies = vec![body];
+
+        let (mut speeds, mut fastest_gain) = (Vec::new(), 0.0f32);
+        let mut last = 0.0f32;
+        for _ in 0..(3.0 / DT) as usize {
+            step(&mut bodies, &world, &field, &materials, Air::EARTH, DT, None, &mut []);
+            let speed = -bodies[0].velocity.y;
+            fastest_gain = fastest_gain.max(speed - last);
+            speeds.push(speed);
+            last = speed;
+        }
+
+        let terminal = *speeds.last().unwrap();
+        assert!(
+            terminal > TERMINAL_SPEED * 0.9 && terminal < TERMINAL_SPEED,
+            "after three seconds the fall is at {terminal}, not approaching {TERMINAL_SPEED} \
+             from below"
+        );
+        assert!(
+            speeds.windows(2).all(|w| w[1] > w[0]),
+            "the fall stopped accelerating somewhere: something is clamping it"
+        );
+        // A clamp shows up here: every gain equal until one is zero. Drag makes
+        // each gain smaller than the last.
+        let gains: Vec<f32> = speeds.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            gains.windows(2).all(|w| w[1] <= w[0] + 1e-4),
+            "the acceleration rose again partway down, which drag cannot do"
+        );
+        assert!(
+            *gains.last().unwrap() < fastest_gain * 0.25,
+            "the last tick gained {} against a first of {fastest_gain}: the fall is still in \
+             free flight after three seconds",
+            gains.last().unwrap()
+        );
+        assert!(
+            terminal < MAX_TRAVEL / DT,
+            "the fall reached {terminal} and the cap is {}: a falling body is being clamped, \
+             which is what drag is here to prevent",
+            MAX_TRAVEL / DT
+        );
     }
 
     /// One body of `material` driven straight down into a floor at `speed`,
@@ -1260,7 +1418,7 @@ mod tests {
         let mut fractures = Vec::new();
         let mut left = 0.0;
         for tick in 0..(1.0 / (6.0 * dt)).round() as usize {
-            let out = step(&mut bodies, &world, &field, &materials, Vec3::ZERO, dt, None, &mut []);
+            let out = step(&mut bodies, &world, &field, &materials, Air::STILL, dt, None, &mut []);
             fractures.extend(out.fractures);
             // The collision is the first tick, and what it left the body doing
             // is the question. Later ticks only settle it, and with no gravity
@@ -1345,10 +1503,10 @@ mod tests {
         let world = slab(64, 0..8);
         let field = DistanceField::build(&world);
         let mut bodies = vec![placed(cube(4, 4), Vec3::new(32.0, -60.0, 32.0), Quat::IDENTITY)];
-        assert!(step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []).rebuild);
+        assert!(step(&mut bodies, &world, &field, &materials(), Air::VACUUM, DT, None, &mut []).rebuild);
         assert!(bodies.is_empty());
         let mut bodies = vec![placed(cube(4, 4), Vec3::new(32.0, 40.0, 32.0), Quat::IDENTITY)];
-        assert!(!step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []).rebuild);
+        assert!(!step(&mut bodies, &world, &field, &materials(), Air::VACUUM, DT, None, &mut []).rebuild);
         assert_eq!(bodies.len(), 1);
     }
 
@@ -1386,7 +1544,7 @@ mod tests {
             (0..ticks)
                 .map(|_| {
                     let start = std::time::Instant::now();
-                    step(bodies, &world, &field, &materials, GRAVITY, DT, None, &mut []);
+                    step(bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut []);
                     start.elapsed().as_secs_f64() * 1000.0
                 })
                 .collect()

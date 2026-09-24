@@ -27,6 +27,7 @@ lifted out of the plan that produced it.
 * [The frame budget, and where it goes](concepts/frame-budget.md) - sixteen bodies with shadows take 22.6 ms against 16.7.
 * [Both coarse grids ride in one storage buffer](concepts/coarse-grids-share-one-buffer.md) - wgpu's eight-storage-buffer limit, and what it forces.
 * [Only terrain debris merges back](concepts/terrain-only-merging.md) - what may return to the world, and why it must be out of view.
+* [Sliding friction cannot stop a roll](concepts/rolling-needs-its-own-resistance.md) - a lone voxel is a sphere, and nothing was slowing it down.
 * [Padding a joint block at its own scale](concepts/joint-block-conditioning.md) - identity padding against a 1e-5 block destroys the inverse in f32.
 
 # Reference

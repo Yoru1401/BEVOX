@@ -167,10 +167,10 @@ pub fn wake_near(bodies: &mut [Body], lo: Vec3, hi: Vec3) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::physics::Air;
     use crate::contree::Contree;
     use crate::distance_field::DistanceField;
     use crate::material::{MaterialId, MaterialTable};
-    use crate::physics::GRAVITY;
     use crate::physics::fixtures::{cube, materials, placed, slab, slab_of};
     use crate::physics::joint::{Angular, Linear};
     use crate::physics::solver::step;
@@ -196,7 +196,7 @@ mod tests {
 
         fn run(&self, bodies: &mut Vec<Body>, joints: &mut [Joint], ticks: u32) {
             for _ in 0..ticks {
-                step(bodies, &self.world, &self.field, &self.materials, GRAVITY, DT, None, joints);
+                step(bodies, &self.world, &self.field, &self.materials, Air::VACUUM, DT, None, joints);
             }
         }
     }
@@ -351,7 +351,7 @@ mod tests {
         let mut grab = Joint::grab(&bodies[0], rest);
         grab.anchor_b = rest + Vec3::Y * 3.0;
         for _ in 0..120 {
-            step(&mut bodies, &scene.world, &scene.field, &scene.materials, GRAVITY, DT, Some(&mut grab), &mut []);
+            step(&mut bodies, &scene.world, &scene.field, &scene.materials, Air::VACUUM, DT, Some(&mut grab), &mut []);
         }
         assert!(bodies[0].position.y > rest.y + 2.0, "the grab did not wake and lift the body");
     }
@@ -411,7 +411,7 @@ mod tests {
         let mut spinning = vec![placed(cube(4, 4), Vec3::splat(500.0), Quat::IDENTITY)];
         spinning[0].set_angular_velocity(Vec3::Y * 0.1);
         for _ in 0..600 {
-            step(&mut spinning, &space.world, &space.field, &space.materials, Vec3::ZERO, DT, None, &mut []);
+            step(&mut spinning, &space.world, &space.field, &space.materials, Air::STILL, DT, None, &mut []);
             ever |= spinning[0].asleep;
         }
         assert!(!ever, "a body spinning in place fell asleep");

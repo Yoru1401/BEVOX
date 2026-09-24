@@ -561,6 +561,7 @@ pub fn follow(joints: &mut Vec<Joint>, bodies: &[Body]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::physics::Air;
     use crate::contree::Contree;
     use crate::distance_field::DistanceField;
     use crate::material::{MaterialId, MaterialTable};
@@ -589,11 +590,11 @@ mod tests {
         }
 
         fn step(&self, bodies: &mut Vec<Body>, joints: &mut [Joint], gravity: Vec3) {
-            step(bodies, &self.world, &self.field, &self.materials, gravity, DT, None, joints);
+            step(bodies, &self.world, &self.field, &self.materials, Air::vacuum(gravity), DT, None, joints);
         }
 
         fn step_holding(&self, bodies: &mut Vec<Body>, grab: &mut Joint, gravity: Vec3) {
-            step(bodies, &self.world, &self.field, &self.materials, gravity, DT, Some(grab), &mut []);
+            step(bodies, &self.world, &self.field, &self.materials, Air::vacuum(gravity), DT, Some(grab), &mut []);
         }
     }
 
@@ -978,7 +979,7 @@ mod tests {
             let mut grab = Joint::grab(&bodies[0], centre);
             grab.anchor_b = centre + Vec3::Y * 5.0;
             for _ in 0..300 {
-                step(&mut bodies, &world, &field, &materials, GRAVITY, DT, Some(&mut grab), &mut []);
+                step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, Some(&mut grab), &mut []);
             }
             bodies[0].position.y - centre.y
         };

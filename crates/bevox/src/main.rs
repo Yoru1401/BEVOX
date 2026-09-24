@@ -5,7 +5,7 @@ use bevox_core::distance_field::DistanceField;
 use bevox_core::material::MaterialId;
 use bevox_core::physics::merge::merge;
 use bevox_core::physics::sleep::wake_near;
-use bevox_core::physics::{GRAVITY, MERGE_AFTER, SLEEP_AFTER};
+use bevox_core::physics::{Air, MERGE_AFTER, SLEEP_AFTER};
 use bevox_core::physics::detach::detach;
 use bevox_core::physics::fracture::{Fracture, cracks};
 use bevox_core::physics::joint::{Joint, follow};
@@ -190,7 +190,7 @@ fn physics_system(
         &scene.tree,
         &scene.field,
         &scene.materials,
-        GRAVITY,
+        Air::EARTH,
         time.delta_secs(),
         grab.held.as_mut(),
         &mut joints.0,

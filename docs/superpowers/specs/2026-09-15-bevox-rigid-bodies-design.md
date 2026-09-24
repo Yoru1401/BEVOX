@@ -461,6 +461,29 @@ grid, which is why it must be out of view; the field is lowered as painting
 lowers it. A body spawned outright never merges, nor does one a joint names or
 the mouse holds.
 
+**What a body falls through** is passed to the solver as `Air`, the way gravity
+always was, so a test can take one force away and watch the rest. The game runs
+in `Air::EARTH`: gravity, and quadratic drag set to balance it at a terminal
+200 voxels a second.
+
+- **Drag, not a clamp.** `MAX_TRAVEL` used to be what limited a fall, and it was
+  visible from the ground: a body accelerated for 0.82 s, hit exactly 80 voxels
+  a second, and fell the rest of the way at a flat rate. The cap is still there
+  at 4 voxels a tick, but as a safety net for things thrown or blasted, where
+  being clamped beats tunnelling. A falling body never reaches it.
+- **The cap costs a slow body nothing**, because the detection margin is the
+  body's *actual* travel, not the cap.
+- **The solver's own invariants are tested in `Air::VACUUM`**, which is what
+  keeps `momentum_is_conserved_exactly_in_free_flight` exact. Drag is an
+  external force and would leak momentum out of a gate whose whole purpose is
+  to prove none leaks.
+
+**Rolling resistance.** A lone voxel classifies as a `Corner`, which is a
+sphere, and a rolling sphere barely slips, so sliding friction never slows it:
+lone voxels and one-wide towers rolled for ever and never slept. Contacts now
+oppose spin with an angular impulse limited by what they press with. See
+`docs/concepts/rolling-needs-its-own-resistance.md`.
+
 **Fracture** (milestone 11), after Dwyer's devlog 28. A contact whose blow
 passes the material's `strength` raises a fracture event; the event cuts cracks
 by **setting voxels empty**; and the code that already turns loose voxels into

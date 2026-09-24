@@ -22,4 +22,6 @@ the next one.
 
 # Post-mortems
 
+* [Sliding friction cannot stop a roll](rolling-needs-its-own-resistance.md) - a lone voxel is a sphere, and nothing was slowing it down.
+
 * [Padding a joint block at its own scale](joint-block-conditioning.md) - identity padding against a 1e-5 block destroys the inverse in f32.

@@ -1,6 +1,9 @@
 # Update Log
 
 ## 2026-09-24
+* **Update**: a falling body is limited by drag rather than a clamp, and
+  contacts resist rolling so a lone voxel settles -
+  [Sliding friction cannot stop a roll](concepts/rolling-needs-its-own-resistance.md).
 * **Creation**: fracture, for bodies and terrain, after Dwyer's devlog 28 -
   [Fracture](superpowers/plans/2026-09-24-bevox-fracture.md).
 * **Creation**: ten views on the function keys, and what they cost the lit

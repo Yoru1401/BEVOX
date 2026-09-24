@@ -324,6 +324,7 @@ fn brick(size: UVec3, corner: Vec3, materials: &MaterialTable) -> Body {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevox_core::physics::Air;
     use bevox_core::distance_field::DistanceField;
     use bevox_core::physics::joint::follow;
     use bevox_core::physics::solver::step;
@@ -356,7 +357,7 @@ mod tests {
         // turns it round and round.
         let (mut turned, mut last) = (0.0f32, 0.0f32);
         for _ in 0..640 {
-            step(&mut bodies, &tree, &field, &materials, GRAVITY, 1.0 / 64.0, None, &mut joints);
+            step(&mut bodies, &tree, &field, &materials, Air::VACUUM, 1.0 / 64.0, None, &mut joints);
             follow(&mut joints, &bodies);
             let x = bodies[index(&bodies, joints[slider].a)].position.x;
             (low, high) = (low.min(x), high.max(x));
@@ -392,7 +393,7 @@ mod tests {
         let field = DistanceField::build(&tree);
         let mut tick = || {
             let start = std::time::Instant::now();
-            step(&mut bodies, &tree, &field, &materials, GRAVITY, 1.0 / 64.0, None, &mut joints);
+            step(&mut bodies, &tree, &field, &materials, Air::VACUUM, 1.0 / 64.0, None, &mut joints);
             start.elapsed().as_secs_f64() * 1000.0
         };
         for _ in 0..200 {
