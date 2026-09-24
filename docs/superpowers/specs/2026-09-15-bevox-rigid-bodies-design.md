@@ -390,10 +390,23 @@ correctness are checked by deliberately breaking the code they guard.
 | 6 | Ball and hinge joints, made with a tool in the app (the tool removed in 7) | Hinges, chains, hanging things |
 | 7 | Dwyer's joints: sixteen types, friction and motors; the grab as a joint; a joint scene | Doors, ropes and machines; bodies held steady |
 | 8 | Body shadows, from every body including those off screen | Bodies sit in the scene rather than on it |
+| 9 | Sleeping, and merging settled terrain debris back into the world | Debris stops costing anything, and gives its slot back |
 
-Deferred until a measurement asks for them: sleeping, merging settled debris
-back into the terrain, fracture on hard impacts, and multithreading. Dwyer's
-engine has all four.
+**Sleeping and merging** (milestone 9). A group of bodies touching or jointed
+together falls asleep once every one of them has been still for half a second,
+and takes no part in a tick until something that could move it wakes it: an
+awake body, a joint, the grab, or an edit through `sleep::wake_near`. Measured:
+sixteen resting bodies cost 0.0039 ms a tick asleep against 0.93 ms awake.
+
+A sleeper that **came out of the terrain** — detachment cut it loose, or it
+split off something that did — merges back into the world once it has slept
+three seconds out of view, and frees its slot. Its voxels snap to the world
+grid, which is why it must be out of view; the field is lowered as painting
+lowers it. A body spawned outright never merges, nor does one a joint names or
+the mouse holds.
+
+Deferred until a measurement asks for them: fracture on hard impacts, and
+multithreading. Dwyer's engine has both.
 
 ## What this deliberately does not do
 

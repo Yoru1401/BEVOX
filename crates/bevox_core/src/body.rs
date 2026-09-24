@@ -66,6 +66,16 @@ pub struct Body {
     /// Each contact's accumulated impulse from the last tick, for warm
     /// starting. Cleared by `recompute`, whose voxels may have moved.
     pub warm: HashMap<ContactKey, ContactImpulse>,
+    /// At rest and out of the simulation until something could move it. See
+    /// `physics::sleep`.
+    pub asleep: bool,
+    /// Seconds this body has been still, asleep or not: what sends it to
+    /// sleep, and how long a sleeper has slept.
+    pub still_for: f32,
+    /// This body came out of the terrain: `detach` cut it loose, or it split
+    /// off something that did. Only such a body may merge back into the world,
+    /// where it came from. A body spawned outright never does.
+    pub from_terrain: bool,
 }
 
 impl Body {
@@ -87,6 +97,9 @@ impl Body {
             angular_momentum: Vec3::ZERO,
             features: Features::default(),
             warm: HashMap::new(),
+            asleep: false,
+            still_for: 0.0,
+            from_terrain: false,
         }
     }
 

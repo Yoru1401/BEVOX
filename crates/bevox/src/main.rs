@@ -3,16 +3,19 @@ mod scenes;
 use bevy::prelude::*;
 use bevox_core::distance_field::DistanceField;
 use bevox_core::material::MaterialId;
-use bevox_core::physics::GRAVITY;
+use bevox_core::physics::merge::merge;
+use bevox_core::physics::sleep::wake_near;
+use bevox_core::physics::{GRAVITY, MERGE_AFTER, SLEEP_AFTER};
 use bevox_core::physics::detach::detach;
 use bevox_core::physics::joint::{Joint, follow};
 use bevox_core::physics::sculpt::sculpt;
 use bevox_core::physics::solver::step;
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system};
+use bevox_render::cull::{Frustum, world_bound};
 use bevox_render::pick::{Target, cursor_ray, pick};
 use bevox_render::pipeline::MAX_BODIES;
-use bevox_render::upload::{VoxelScene, apply_brush, build_gpu_scene};
+use bevox_render::upload::{GpuBody, VoxelScene, apply_brush, build_gpu_scene, offset_from_clip};
 use scenes::{SceneKind, demo_body};
 
 fn main() {
@@ -67,6 +70,9 @@ fn main() {
         // before `build_gpu_scene`.
         .add_systems(FixedUpdate, physics_system)
         .add_systems(Update, drop_body_input.after(fly_camera_system).before(build_gpu_scene))
+        // After the physics tick, which runs in `FixedUpdate` ahead of this, and
+        // before the rebuild a merge asks for.
+        .add_systems(Update, merge_system.after(fly_camera_system).before(build_gpu_scene))
         .run();
 }
 
@@ -421,6 +427,81 @@ fn stroke(scene: &mut VoxelScene, target: Target, centre: Vec3, radius: f32, mat
             scene.generation += 1;
         }
     }
+    // Whatever the edit touched may move now: a sleeper whose support was
+    // erased, or one painted on or beside. A voxel past the sphere, for the
+    // bodies resting on what changed.
+    let reach = Vec3::splat(radius + 1.0);
+    wake_near(&mut scene.bodies, centre - reach, centre + reach);
+}
+
+/// Merges every body settled out of view back into the world, freeing its
+/// slot, and returns how many.
+///
+/// Only a body that came out of the terrain: merging puts it back where it
+/// came from. One spawned outright, like an `F` drop or a scene's own bodies,
+/// stays a body however long it sleeps.
+///
+/// Settled: asleep for `MERGE_AFTER` after the `SLEEP_AFTER` it took to fall
+/// asleep. Out of view: its bounding sphere wholly outside `frustum`, so its
+/// snap to the world's grid is never seen. Never a body a joint names, or the
+/// one the mouse holds. Each merge lowers the distance field over the body's
+/// sphere, as painting does: the world gained geometry, and a field left
+/// stale would let rays skip it. One rebuild covers them all.
+fn merge_settled(
+    scene: &mut VoxelScene,
+    joints: &[Joint],
+    held: Option<&Joint>,
+    frustum: &Frustum,
+) -> usize {
+    let named: Vec<bevox_core::body::BodyId> = joints
+        .iter()
+        .chain(held)
+        .flat_map(|j| std::iter::once(j.a).chain(j.b))
+        .collect();
+    let mut merged = 0;
+    let mut i = 0;
+    while i < scene.bodies.len() {
+        let body = &scene.bodies[i];
+        let settled =
+            body.from_terrain && body.asleep && body.still_for >= SLEEP_AFTER + MERGE_AFTER;
+        let bound = bevox_core::body::occupied_bounds(&body.volume)
+            .map(|local| world_bound(local, &GpuBody::default().placed(body)));
+        let out_of_view = bound.is_some_and(|b| !frustum.sees(b));
+        if !settled || !out_of_view || named.contains(&body.id) {
+            i += 1;
+            continue;
+        }
+        let body = scene.bodies.remove(i);
+        merge(&body, &mut scene.tree);
+        if let Some(b) = bound {
+            scene.field.lower_around(b.centre, b.radius);
+        }
+        merged += 1;
+    }
+    if merged > 0 {
+        // The body list and the world both changed: rebuild everything.
+        scene.generation += 1;
+    }
+    merged
+}
+
+/// Runs `merge_settled` against what the camera sees now.
+fn merge_system(
+    mut scene: ResMut<VoxelScene>,
+    joints: Res<Joints>,
+    grab: Res<GrabState>,
+    camera: Query<(&GlobalTransform, &Projection), With<Camera3d>>,
+) {
+    let Ok((transform, projection)) = camera.single() else {
+        return;
+    };
+    let offset = offset_from_clip(transform.rotation(), projection.get_clip_from_view());
+    let frustum = Frustum::from_camera(offset, offset.inverse(), transform.translation());
+    // Through a plain borrow, so a frame with nothing to merge does not mark
+    // the scene changed.
+    if scene.bodies.iter().any(|b| b.asleep && b.still_for >= SLEEP_AFTER + MERGE_AFTER) {
+        merge_settled(&mut scene, &joints.0, grab.held.as_ref(), &frustum);
+    }
 }
 
 /// Erases a sphere, then hands whatever it cut free to the physics as bodies.
@@ -610,6 +691,114 @@ mod tests {
         assert_eq!(world.resource::<VoxelScene>().bodies.len(), 1);
         assert!(world.resource::<Joints>().0.is_empty());
         assert_eq!(*world.resource::<SceneKind>(), SceneKind::Demo);
+    }
+
+    /// A frustum for a camera at `eye` looking at `target`.
+    fn frustum_looking(eye: Vec3, target: Vec3) -> Frustum {
+        let view = Mat4::look_at_rh(Vec3::ZERO, target - eye, Vec3::Y);
+        let projection = Mat4::perspective_rh(0.9, 16.0 / 9.0, 0.1, 500.0);
+        let offset = (projection * view).inverse();
+        Frustum::from_camera(offset, offset.inverse(), eye)
+    }
+
+    /// The demo scene with one brick cube centred at `centre`, asleep long
+    /// enough to merge.
+    fn settled_scene(centre: Vec3) -> VoxelScene {
+        let (tree, materials) = demo_scene();
+        let field = DistanceField::build(&tree);
+        let mut body = demo_body(centre, Quat::IDENTITY);
+        assert!(body.recompute(&materials));
+        // As if detachment had cut it out of the terrain.
+        body.from_terrain = true;
+        body.asleep = true;
+        body.still_for = SLEEP_AFTER + MERGE_AFTER;
+        VoxelScene { tree, materials, generation: 1, field, field_dirty: None, bodies: vec![body] }
+    }
+
+    /// Where the settled body sleeps: in open air, where the distance field
+    /// reads far from anything, so a field left stale by the merge would
+    /// over-estimate. On the floor it already reads zero, and would hide that.
+    const ALOFT: Vec3 = Vec3::new(50.0, 40.0, 12.0);
+
+    /// A settled body out of view merges: its slot is free, the world holds its
+    /// voxels, a rebuild is asked for, and the distance field is nowhere above
+    /// one built fresh from the new world.
+    #[test]
+    fn a_settled_body_out_of_view_merges_into_the_world() {
+        let mut scene = settled_scene(ALOFT);
+        let before = scene.tree.voxels().len();
+        let cells = scene.bodies[0].volume.voxels().len();
+        let away = frustum_looking(Vec3::new(50.0, 30.0, 40.0), Vec3::new(50.0, 30.0, 100.0));
+        assert_eq!(merge_settled(&mut scene, &[], None, &away), 1);
+        assert!(scene.bodies.is_empty(), "the body kept its slot");
+        assert_eq!(scene.generation, 2, "the merge did not ask for a rebuild");
+        assert_eq!(scene.tree.voxels().len(), before + cells, "the world did not gain the body's voxels");
+        assert_eq!(scene.tree.get(UVec3::new(50, 40, 12)), MaterialId(2), "the body's middle is not brick");
+        let fresh = DistanceField::build(&scene.tree);
+        let over = scene.field.cells().iter().zip(fresh.cells()).filter(|(have, want)| have > want).count();
+        assert_eq!(over, 0, "{over} field cells over-estimate the merged world, so rays would skip it");
+    }
+
+    /// No merge in view, while jointed, while grabbed, before its time, or awake.
+    #[test]
+    fn a_body_that_should_stay_does_not_merge() {
+        let away = frustum_looking(Vec3::new(50.0, 30.0, 40.0), Vec3::new(50.0, 30.0, 100.0));
+        let at = frustum_looking(Vec3::new(50.0, 30.0, 40.0), ALOFT);
+
+        let mut scene = settled_scene(ALOFT);
+        assert_eq!(merge_settled(&mut scene, &[], None, &at), 0, "a body in view merged");
+
+        let mut scene = settled_scene(ALOFT);
+        let pin = scene.bodies[0].position;
+        let joint = Joint::new(
+            &scene.bodies[0], None, bevox_core::physics::joint::Linear::Point,
+            bevox_core::physics::joint::Angular::Free, pin, pin, Vec3::Y,
+        );
+        assert_eq!(merge_settled(&mut scene, &[joint], None, &away), 0, "a jointed body merged");
+
+        let mut scene = settled_scene(ALOFT);
+        let held = Joint::grab(&scene.bodies[0], scene.bodies[0].position);
+        assert_eq!(merge_settled(&mut scene, &[], Some(&held), &away), 0, "a grabbed body merged");
+
+        let mut scene = settled_scene(ALOFT);
+        scene.bodies[0].still_for = SLEEP_AFTER + MERGE_AFTER - 0.1;
+        assert_eq!(merge_settled(&mut scene, &[], None, &away), 0, "a body merged before its time");
+
+        let mut scene = settled_scene(ALOFT);
+        scene.bodies[0].asleep = false;
+        assert_eq!(merge_settled(&mut scene, &[], None, &away), 0, "an awake body merged");
+
+        // Spawned, not cut out of the terrain: it stays a body forever.
+        let mut scene = settled_scene(ALOFT);
+        scene.bodies[0].from_terrain = false;
+        assert_eq!(merge_settled(&mut scene, &[], None, &away), 0, "a body that was never terrain merged");
+        assert_eq!(scene.generation, 1, "no merge, yet a rebuild was asked for");
+    }
+
+    /// What the app spawns is not terrain, so it never merges; what an erase
+    /// cuts loose is.
+    #[test]
+    fn only_bodies_cut_from_the_terrain_may_merge() {
+        assert!(!demo_body(Vec3::new(20.0, 40.0, 20.0), Quat::IDENTITY).from_terrain, "a spawned body claims to be terrain");
+
+        let (tree, materials) = demo_scene();
+        let field = DistanceField::build(&tree);
+        let mut scene =
+            VoxelScene { tree, materials, generation: 1, field, field_dirty: None, bodies: vec![] };
+        // The demo column stands at x = 28..36, z = 28..36 from y = 6; cutting
+        // its foot frees the whole thing.
+        erase_and_detach(&mut scene, Vec3::new(32.0, 7.0, 32.0), 5.0);
+        assert_eq!(scene.bodies.len(), 1, "the column did not come free");
+        assert!(scene.bodies[0].from_terrain, "a body cut out of the terrain does not know it");
+    }
+
+    /// An erase under a sleeping body wakes it.
+    #[test]
+    fn an_erase_under_a_sleeper_wakes_it() {
+        // On the floor, whose top is at 6.
+        let mut scene = settled_scene(Vec3::new(50.0, 9.0, 12.0));
+        stroke(&mut scene, Target::World, Vec3::new(50.0, 5.0, 12.0), 3.0, MaterialId::EMPTY);
+        assert!(!scene.bodies[0].asleep, "the sleeper slept through its support being erased");
     }
 
     /// The system steps the scene's bodies, and a body leaving the world bumps

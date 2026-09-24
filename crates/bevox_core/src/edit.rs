@@ -5,7 +5,7 @@ use crate::contree::{Contree, level_extent};
 use crate::material::MaterialId;
 use crate::node::{BRICK_EDGE, CHILDREN, Node, child_index};
 use glam::{UVec3, Vec3};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// What an edit does to the voxels it covers.
 ///
@@ -57,6 +57,31 @@ impl EditOp for ClearOp {
     }
 }
 
+/// Sets exactly the voxels it was given, each to its own material: what
+/// merging puts back into the world when a settled body joins it.
+struct FillOp {
+    voxels: HashMap<UVec3, MaterialId>,
+    lo: UVec3,
+    hi: UVec3,
+}
+
+impl EditOp for FillOp {
+    fn touches(&self, origin: UVec3, extent: u32) -> bool {
+        let hi = origin + UVec3::splat(extent - 1);
+        origin.cmple(self.hi).all() && hi.cmpge(self.lo).all()
+    }
+
+    fn material_at(&self, p: UVec3) -> Option<MaterialId> {
+        self.voxels.get(&p).copied()
+    }
+}
+
+/// The corners of the box around `points`, or `None` when there are none.
+fn bounds(mut points: impl Iterator<Item = UVec3>) -> Option<(UVec3, UVec3)> {
+    let first = points.next()?;
+    Some(points.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p))))
+}
+
 impl SphereOp {
     /// Whether the sphere touches the cube of `extent` voxels at `origin`.
     fn intersects(&self, origin: UVec3, extent: u32) -> bool {
@@ -85,16 +110,23 @@ impl Contree {
     /// Erases exactly `voxels`. Detachment moves a piece of the world into a
     /// body, and takes the same voxels out of the world with this.
     pub fn clear_voxels(&mut self, voxels: &[UVec3]) {
-        let Some(&first) = voxels.first() else {
+        let Some((lo, hi)) = bounds(voxels.iter().copied()) else {
             return;
         };
-        let mut lo = first;
-        let mut hi = first;
-        for p in voxels {
-            lo = lo.min(*p);
-            hi = hi.max(*p);
-        }
         let op = ClearOp { voxels: voxels.iter().copied().collect(), lo, hi };
+        let root = self.root();
+        let new_root = self.rewrite(root, self.depth() - 1, UVec3::ZERO, &op);
+        self.set_root(new_root);
+    }
+
+    /// Sets exactly `voxels`, each to its material. Merging puts a settled body
+    /// back into the world with this, through the arena like any edit, so the
+    /// render world can upload the change.
+    pub fn fill_voxels(&mut self, voxels: &[(UVec3, MaterialId)]) {
+        let Some((lo, hi)) = bounds(voxels.iter().map(|(p, _)| *p)) else {
+            return;
+        };
+        let op = FillOp { voxels: voxels.iter().copied().collect(), lo, hi };
         let root = self.root();
         let new_root = self.rewrite(root, self.depth() - 1, UVec3::ZERO, &op);
         self.set_root(new_root);

@@ -190,3 +190,38 @@ fn clear_voxels_of_nothing_is_a_no_op() {
     tree.clear_voxels(&[]);
     assert_eq!(tree.voxels().len(), 1);
 }
+
+/// Filling sets exactly the voxels named, each to its own material, leaves the
+/// rest alone, and keeps the tree canonical: a whole brick filled with one
+/// material collapses as a fresh build would.
+#[test]
+fn fill_voxels_sets_only_what_it_is_given() {
+    let mut tree = Contree::from_voxels(16, &[(UVec3::new(9, 9, 9), MaterialId(3))]);
+    let mut filled = Vec::new();
+    for z in 0..4 {
+        for y in 0..4 {
+            for x in 0..4 {
+                filled.push((UVec3::new(x, y, z), MaterialId(1)));
+            }
+        }
+    }
+    filled.push((UVec3::new(5, 0, 0), MaterialId(2)));
+    tree.fill_voxels(&filled);
+
+    for (p, m) in &filled {
+        assert_eq!(tree.get(*p), *m, "{p:?} is not what it was filled with");
+    }
+    assert_eq!(tree.get(UVec3::new(9, 9, 9)), MaterialId(3), "a voxel not named changed");
+    assert_eq!(tree.voxels().len(), filled.len() + 1);
+    assert!(tree.check_canonical().is_ok(), "the tree is no longer canonical");
+}
+
+/// Filling goes through the arena, so the render world can upload it.
+#[test]
+fn fill_voxels_marks_the_arena_dirty() {
+    let mut tree = Contree::from_voxels(16, &[(UVec3::new(1, 2, 3), MaterialId(1))]);
+    tree.arena_mut().clear_dirty();
+    tree.fill_voxels(&[(UVec3::new(3, 0, 0), MaterialId(2))]);
+    let dirty = tree.arena().dirty_nodes().len() + tree.arena().dirty_voxels().len();
+    assert!(dirty > 0, "nothing was marked dirty");
+}

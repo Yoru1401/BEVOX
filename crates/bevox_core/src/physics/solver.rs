@@ -13,6 +13,7 @@
 
 use super::contact::{Contact, RADIUS, detect, detect_pair, world_box};
 use super::joint::{self, Joint};
+use super::sleep;
 use super::{BASE_MARGIN, BIAS, MAX_PUSH, MAX_TRAVEL, RESTITUTION_SWEEPS, SLOP, SUBSTEPS};
 use crate::body::{Body, BodyId, occupied_bounds};
 use crate::contree::Contree;
@@ -71,6 +72,10 @@ pub fn step(
         })
         .collect();
 
+    // Before anything is detected, wake whatever something awake could move, so
+    // no contact or joint below is ever solved against a sleeper.
+    sleep::wake(bodies, joints, grab.as_ref().map(|g| g.a), &travel);
+
     // Jointed pairs do not collide: a hinge where a door meets its frame would
     // otherwise have the contact pushing out while the joint pulls back.
     let jointed: HashSet<(BodyId, BodyId)> =
@@ -81,9 +86,12 @@ pub fn step(
     let mut joints: Vec<&mut Joint> = joints.iter_mut().chain(grab).collect();
 
     // Which bodies each joint joins, by index, this tick. A joint whose body is
-    // gone, or has no mass, sits the tick out; `follow` is what removes it.
+    // gone, or has no mass, sits the tick out; `follow` is what removes it. So
+    // does one whose body sleeps, which after the wake pass means a joint to the
+    // world with nothing awake to move it.
     let index: HashMap<BodyId, usize> = bodies.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
-    let alive = |id: BodyId| index.get(&id).copied().filter(|&i| bodies[i].mass.mass > 0.0);
+    let alive =
+        |id: BodyId| index.get(&id).copied().filter(|&i| bodies[i].mass.mass > 0.0 && !bodies[i].asleep);
     let links: Vec<Option<(usize, Option<usize>)>> = joints
         .iter()
         .map(|j| {
@@ -111,7 +119,7 @@ pub fn step(
         .collect();
 
     for _ in 0..SUBSTEPS {
-        for (b, &r) in bodies.iter_mut().zip(&radii).filter(|(b, _)| b.mass.mass > 0.0) {
+        for (b, &r) in bodies.iter_mut().zip(&radii).filter(|(b, _)| b.mass.mass > 0.0 && !b.asleep) {
             b.velocity += gravity * h;
             cap_speed(b, world_inverse_inertia(b), r, dt);
         }
@@ -133,7 +141,7 @@ pub fn step(
             solve_friction(a, b, &j.contact, impulse);
         }
 
-        for b in bodies.iter_mut().filter(|b| b.mass.mass > 0.0) {
+        for b in bodies.iter_mut().filter(|b| b.mass.mass > 0.0 && !b.asleep) {
             integrate(b, h);
         }
 
@@ -152,7 +160,8 @@ pub fn step(
     // starting wants next tick. The bounce below is a one-off: feeding it back
     // would have the next tick's warm start kick the body again, and a body
     // would keep almost all its speed instead of `restitution` of it.
-    for b in bodies.iter_mut() {
+    // A sleeper keeps what it carried, for the tick it wakes.
+    for b in bodies.iter_mut().filter(|b| !b.asleep) {
         b.warm.clear();
     }
     for (j, &impulse) in joined.iter().zip(&impulses) {
@@ -160,6 +169,7 @@ pub fn step(
     }
 
     apply_restitution(bodies, &joined, &mut impulses, &approach);
+    sleep::settle(bodies, &joints, &radii, dt);
     bodies.len() != before
 }
 
@@ -175,7 +185,7 @@ fn collect_contacts(
 ) -> Vec<Joined> {
     let mut joined = Vec::new();
     for (i, body) in bodies.iter().enumerate() {
-        if body.mass.mass <= 0.0 {
+        if body.mass.mass <= 0.0 || body.asleep {
             continue;
         }
         for contact in detect(body, tree, field, materials, travel[i] + BASE_MARGIN) {
@@ -184,7 +194,7 @@ fn collect_contacts(
     }
     for i in 0..bodies.len() {
         for j in (i + 1)..bodies.len() {
-            if bodies[i].mass.mass <= 0.0 || bodies[j].mass.mass <= 0.0 {
+            if bodies[i].mass.mass <= 0.0 || bodies[j].mass.mass <= 0.0 || bodies[i].asleep || bodies[j].asleep {
                 continue;
             }
             if jointed.contains(&pair_key(bodies[i].id, bodies[j].id)) {
@@ -797,7 +807,11 @@ mod tests {
         let held_at = bodies[1].position.y;
         assert!(held_at > 13.0, "the upper body sank into the lower one: {held_at}");
 
+        // Taking a body away is an edit, and wakes what it held up, as the app
+        // does through `wake_near`.
+        let (lo, hi) = world_box(&bodies[0], 1.0).unwrap();
         bodies.remove(0);
+        crate::physics::sleep::wake_near(&mut bodies, lo, hi);
         run(&mut bodies, &world, &field, &materials, GRAVITY, 10);
         assert!(
             bodies[0].velocity.y < -1.0,
@@ -1052,6 +1066,9 @@ mod tests {
         assert!(bodies[0].velocity.y.abs() < 0.05, "not at rest before the edit");
         // Erasing leaves the field under-estimating, which is its safe direction.
         world.apply_sphere(Vec3::new(32.0, 6.0, 32.0), 6.0, MaterialId::EMPTY);
+        // At rest this long the body sleeps, and a sleeper is woken by an edit
+        // only through `wake_near`, as the app's edits call it.
+        crate::physics::sleep::wake_near(&mut bodies, Vec3::new(25.0, -1.0, 25.0), Vec3::new(39.0, 13.0, 39.0));
         step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []);
         assert!(bodies[0].velocity.y < -1.0, "still held up: {:?}", bodies[0].velocity);
     }

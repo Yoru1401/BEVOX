@@ -13,7 +13,9 @@ pub mod contact;
 pub mod detach;
 pub mod joint;
 pub mod mass;
+pub mod merge;
 pub mod sculpt;
+pub mod sleep;
 pub mod solver;
 
 use glam::Vec3;
@@ -64,6 +66,18 @@ pub const GRAB_MAX_FORCE: f32 = 2_000.0 * 1000.0 * 9.81 / VOXEL_METRES;
 /// Enough to hold the demo cube level by a corner, and weak enough that a grab
 /// more than two voxels from a hinge swings the door rather than locking it.
 pub const GRAB_MAX_TORQUE: f32 = GRAB_MAX_FORCE * 2.0;
+
+/// Below this speed, in voxels per second, a body counts as still: its centre
+/// of mass, and its farthest voxel as it turns.
+pub const SLEEP_SPEED: f32 = 0.05;
+
+/// How long, in seconds, a body must stay still before it falls asleep.
+pub const SLEEP_AFTER: f32 = 0.5;
+
+/// How long, in seconds, a body must sleep before it may merge back into the
+/// world, out of view. Long enough that a pile a body just landed on has
+/// settled, short enough that debris clears while the player looks elsewhere.
+pub const MERGE_AFTER: f32 = 3.0;
 
 /// Speculative margin every body gets even at rest, in voxels.
 pub const BASE_MARGIN: f32 = 0.1;

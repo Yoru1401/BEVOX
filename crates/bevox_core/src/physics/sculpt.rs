@@ -61,6 +61,9 @@ pub fn sculpt(
     for piece in &pieces[1..] {
         let voxels: Vec<_> = piece.iter().map(|&p| (p, parent.volume.get(p))).collect();
         let mut body = Body::new(Contree::from_voxels(extent, &voxels), corner, orientation);
+        // A piece of terrain cut in two is still terrain, and a piece of a
+        // spawned body is not.
+        body.from_terrain = parent.from_terrain;
         if body.recompute(materials) {
             carry_motion(&mut body, com, velocity, spin);
             split_off.push(body);
@@ -151,6 +154,28 @@ mod tests {
         assert!(after.len() > before.len(), "nothing was painted");
         for v in &before {
             assert!(after.contains(v), "painting moved or lost voxel {v:?}");
+        }
+    }
+
+    /// A split piece is terrain if its parent was, and is not if it was not:
+    /// what may go back into the world is what came out of it.
+    #[test]
+    fn a_split_piece_keeps_where_its_parent_came_from() {
+        let materials = materials();
+        let bar: Vec<_> = (0..12)
+            .flat_map(|x| (0..2).map(move |z| (UVec3::new(x, 0, z), MaterialId(1))))
+            .collect();
+        for from_terrain in [false, true] {
+            let mut body =
+                placed(Contree::from_voxels(16, &bar), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY);
+            body.from_terrain = from_terrain;
+            let middle = body.world_from_local().transform_point3(Vec3::new(6.0, 0.5, 1.0));
+            let mut bodies = vec![body];
+            sculpt(&mut bodies, 0, middle, 1.2, MaterialId::EMPTY, &materials, 16);
+            assert_eq!(bodies.len(), 2, "the bar did not split");
+            for b in &bodies {
+                assert_eq!(b.from_terrain, from_terrain, "a split piece forgot where it came from");
+            }
         }
     }
 

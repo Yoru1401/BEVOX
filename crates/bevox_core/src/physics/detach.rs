@@ -146,7 +146,10 @@ pub fn detach(
     for piece in pieces {
         let voxels: Vec<_> = piece.iter().map(|&p| (p, tree.get(p))).collect();
         tree.clear_voxels(&piece);
-        if let Some(body) = body_from(&voxels, materials) {
+        if let Some(mut body) = body_from(&voxels, materials) {
+            // It came out of the terrain, so it may go back into it once it
+            // settles out of sight. See `physics::merge`.
+            body.from_terrain = true;
             bodies.push(body);
         }
     }
@@ -194,6 +197,18 @@ mod tests {
             voxels.push((UVec3::new(8, y, 8), MaterialId(2)));
         }
         Contree::from_voxels(16, &voxels)
+    }
+
+    /// What detachment frees came out of the terrain, and says so: only such a
+    /// body may merge back into it.
+    #[test]
+    fn a_freed_piece_knows_it_came_from_the_terrain() {
+        let materials = crate::physics::fixtures::materials();
+        let mut tree = floor_and_column();
+        tree.clear_voxels(&[UVec3::new(8, 1, 8), UVec3::new(8, 2, 8)]);
+        let freed = detach(&mut tree, &materials, IVec3::new(7, 0, 7), IVec3::new(9, 3, 9), 16);
+        assert!(!freed.is_empty(), "nothing came free, so this proves nothing");
+        assert!(freed.iter().all(|b| b.from_terrain), "a freed piece does not know it was terrain");
     }
 
     #[test]
