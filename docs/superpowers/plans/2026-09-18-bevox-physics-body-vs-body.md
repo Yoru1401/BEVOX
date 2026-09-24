@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'Body Against Body'
+description: 'Bodies collide with each other as they do with the world: a thrown cube knocks another along, and a stack of cubes stands still instead of sinking into itself.'
+tags: [physics, collision, solver]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-17T00:00:00Z }
+---
+
 # Body Against Body Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Flori prefers inline execution for this project.**

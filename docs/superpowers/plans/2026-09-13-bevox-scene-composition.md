@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'BEVOX MagicaVoxel scene composition'
+description: 'Load a whole MagicaVoxel scene — every model, placed and rotated by its scene graph — instead of one model out of dozens.'
+tags: [vox, import, scene]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-14T00:00:00Z }
+---
+
 # BEVOX MagicaVoxel scene composition — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

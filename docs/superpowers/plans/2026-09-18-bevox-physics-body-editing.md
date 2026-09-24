@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'Body Editing'
+description: 'The brush edits bodies as it edits the world.'
+tags: [physics, rigid-bodies, editing]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-18T00:00:00Z }
+---
+
 # Body Editing Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Flori prefers inline execution for this project.**

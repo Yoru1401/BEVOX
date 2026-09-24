@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'BEVOX GPU traversal'
+description: 'Put the voxel scene on screen, ray marched by our own WGSL compute shader, and prove that shader agrees with the CPU reference marcher pixel for pixel.'
+tags: [gpu, wgsl, raymarching, parity]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-13T00:00:00Z }
+---
+
 # BEVOX GPU traversal — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

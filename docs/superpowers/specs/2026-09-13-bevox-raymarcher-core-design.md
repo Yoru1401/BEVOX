@@ -1,3 +1,11 @@
+---
+type: Design Spec
+title: 'BEVOX ray-marcher core'
+description: 'A sparse voxel world ray marched on the GPU, with a CPU reference the shader is held to pixel for pixel.'
+tags: [voxels, raymarching, gpu, architecture]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-13T00:00:00Z }
+---
+
 # BEVOX ray-marcher core — design
 
 **Date:** 2026-09-13

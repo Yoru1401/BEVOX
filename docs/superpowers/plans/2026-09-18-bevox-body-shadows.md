@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: 'Body Shadows'
+description: 'Rigid bodies cast shadows: on the static world, on each other, and on themselves.'
+tags: [rigid-bodies, shadows, gpu]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-18T00:00:00Z }
+verified: { by: human:Flori, at: 2026-09-24T00:00:00Z }
+---
+
 # Body Shadows Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. **Flori prefers inline execution for this project.**

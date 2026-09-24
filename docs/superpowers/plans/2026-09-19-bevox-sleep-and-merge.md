@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: 'Sleeping and Merging Debris'
+description: 'Bodies at rest stop costing physics time, and a body that came out of the terrain and settled out of view goes back into it and frees its slot, as in Dwyer''s devlog #13.'
+tags: [physics, sleeping, merging, dwyer]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-24T00:00:00Z }
+verified: { by: human:Flori, at: 2026-09-24T00:00:00Z }
+---
+
 # Sleeping and Merging Debris Implementation Plan
 
 > Executed inline on 2026-09-19 and rebuilt on 2026-09-24 after the work was deleted by accident. This is the record of what was built.

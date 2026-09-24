@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'Mouse Grab'
+description: 'Pick up a body with the mouse.'
+tags: [physics, input, joints]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-18T00:00:00Z }
+---
+
 # Mouse Grab Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Flori prefers inline execution for this project.**

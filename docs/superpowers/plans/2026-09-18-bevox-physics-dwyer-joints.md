@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: 'Dwyer''s Joints'
+description: 'Rebuild joints after Dwyer''s devlog #30: sixteen types, friction, motors, the mouse grab as a joint, and a key-swapped scene to try them all, with the J tool removed.'
+tags: [physics, joints, dwyer]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-18T00:00:00Z }
+verified: { by: human:Flori, at: 2026-09-24T00:00:00Z }
+---
+
 # Dwyer's Joints Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Flori prefers inline execution for this project.**

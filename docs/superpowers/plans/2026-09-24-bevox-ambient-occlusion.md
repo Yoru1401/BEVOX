@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'Ambient Occlusion'
+description: 'Creases and corners darken, so a body sitting on the floor reads as sitting on it, following Dwyer''s devlog #15.'
+tags: [shading, ambient-occlusion, gpu, dwyer]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-24T00:00:00Z }
+---
+
 # Ambient Occlusion Implementation Plan
 
 **Goal:** Creases and corners darken, so a body sitting on the floor reads as sitting on it, following Dwyer's devlog #15.

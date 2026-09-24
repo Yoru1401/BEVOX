@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'Empty-Space Distance Field'
+description: 'Skip empty space by advancing a ray''s start through a coarse distance field before it enters the tree, and keep that field correct under the sphere brush.'
+tags: [gpu, performance, distance-field]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-15T00:00:00Z }
+---
+
 # Empty-Space Distance Field Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

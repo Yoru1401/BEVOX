@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'Detachment Over Tree Nodes'
+description: 'The detachment search walks the tree''s uniform nodes instead of single voxels, as Dwyer''s devlog #12 does, so a cut into a large volume costs a few steps rather than thousands.'
+tags: [physics, detachment, performance]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-24T00:00:00Z }
+---
+
 # Detachment Over Tree Nodes Implementation Plan
 
 **Goal:** The detachment search walks the tree's uniform nodes instead of single voxels, as Dwyer's devlog #12 does, so a cut into a large volume costs a few steps rather than thousands.

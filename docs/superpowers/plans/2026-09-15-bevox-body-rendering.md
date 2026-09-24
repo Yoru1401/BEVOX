@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'Rigid Body Rendering'
+description: 'Render a voxel volume placed by a rigid transform, composed with the static world by nearest hit, so a body can be seen rotating before any physics exists.'
+tags: [rigid-bodies, gpu, raymarching]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-17T00:00:00Z }
+---
+
 # Rigid Body Rendering Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

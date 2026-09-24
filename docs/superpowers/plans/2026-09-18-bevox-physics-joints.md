@@ -1,3 +1,13 @@
+---
+type: Implementation Plan
+title: 'Joints'
+description: 'Join bodies to each other or to the world with ball and hinge joints, made by clicking in the app: a door hinged to a wall, a chain hanging from a beam.'
+tags: [physics, joints]
+status: deprecated
+generated: { by: claude-opus-5/claude-code, at: 2026-09-18T00:00:00Z }
+---
+
+> **Deprecated:** superseded by 2026-09-18-bevox-physics-dwyer-joints.
 # Joints Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Flori prefers inline execution for this project.**

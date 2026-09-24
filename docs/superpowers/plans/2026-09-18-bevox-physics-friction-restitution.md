@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'Friction and Restitution'
+description: 'A body slides to a stop on stone, keeps sliding on ice, and bounces on rubber, with friction and restitution taken per voxel from the materials that touch.'
+tags: [physics, materials, solver]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-17T00:00:00Z }
+---
+
 # Friction and Restitution Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Flori prefers inline execution for this project.**

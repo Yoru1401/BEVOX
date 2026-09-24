@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'Rigid-Body Physics Milestone 2'
+description: 'A voxel body dropped into the scene lands on the static voxel world, tumbles if it lands off balance, and comes to rest without jitter.'
+tags: [physics, solver, collision]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-17T00:00:00Z }
+---
+
 # Rigid-Body Physics Milestone 2 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Flori prefers inline execution for this project.**

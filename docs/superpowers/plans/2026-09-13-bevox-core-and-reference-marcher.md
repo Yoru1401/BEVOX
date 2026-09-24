@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'BEVOX core and reference marcher'
+description: 'Build `bevox_core` — the contree voxel data structure with editing — and a CPU reference ray marcher that renders a scene to a PNG, with no GPU and no Bevy involved.'
+tags: [voxels, contree, raymarching, cpu]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-13T00:00:00Z }
+---
+
 # BEVOX core and reference marcher — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

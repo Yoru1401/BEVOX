@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'Sphere Brush and Dirty-Range Upload'
+description: 'Edit the voxel scene at runtime with a sphere brush, uploading only the arena ranges the edit touched rather than the whole volume.'
+tags: [editing, upload, brush]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-14T00:00:00Z }
+---
+
 # Sphere Brush and Dirty-Range Upload Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

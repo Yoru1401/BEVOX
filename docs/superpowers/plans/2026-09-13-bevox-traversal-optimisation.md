@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'BEVOX traversal optimisation'
+description: 'Make the ray marcher fast enough to fly through a composed scene, without changing a single pixel it produces.'
+tags: [gpu, performance, raymarching]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-14T00:00:00Z }
+---
+
 # BEVOX traversal optimisation — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

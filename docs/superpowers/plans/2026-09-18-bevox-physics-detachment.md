@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'Terrain Detachment'
+description: 'Carve the support out from under a wall and the wall falls.'
+tags: [physics, detachment, voxels]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-18T00:00:00Z }
+---
+
 # Terrain Detachment Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Flori prefers inline execution for this project.**

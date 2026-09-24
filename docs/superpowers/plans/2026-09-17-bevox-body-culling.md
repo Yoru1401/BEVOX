@@ -1,3 +1,11 @@
+---
+type: Implementation Plan
+title: 'Body Culling'
+description: 'Stop paying for rigid bodies a pixel cannot see, so the body cap can rise above 1 before physics needs several bodies.'
+tags: [rigid-bodies, performance, culling]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-17T00:00:00Z }
+---
+
 # Body Culling Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

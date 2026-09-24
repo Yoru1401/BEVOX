@@ -1,3 +1,11 @@
+---
+type: Design Spec
+title: 'BEVOX Rigid Bodies'
+description: 'Voxel chunks that detach from the static world, fall, tumble and come to rest, rendered by the same ray marcher that draws everything else.'
+tags: [physics, rigid-bodies, voxels, architecture]
+generated: { by: claude-opus-5/claude-code, at: 2026-09-24T00:00:00Z }
+---
+
 # BEVOX Rigid Bodies — Design
 
 Voxel chunks that detach from the static world, fall, tumble and come to rest,
