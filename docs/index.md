@@ -29,6 +29,10 @@ lifted out of the plan that produced it.
 * [Only terrain debris merges back](concepts/terrain-only-merging.md) - what may return to the world, and why it must be out of view.
 * [Padding a joint block at its own scale](concepts/joint-block-conditioning.md) - identity padding against a 1e-5 block destroys the inverse in f32.
 
+# Reference
+
+* [Douglas Dwyer's voxel engine, devlog by devlog](reference/dwyer-devlogs.md) - what he built in each of his thirty Voxel Devlogs, dated, and what each changed from the ones before.
+
 # Design specs
 
 * [BEVOX ray-marcher core](superpowers/specs/2026-09-13-bevox-raymarcher-core-design.md) - A sparse voxel world ray marched on the GPU, with a CPU reference the shader is held to pixel for pixel.

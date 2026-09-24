@@ -1,6 +1,8 @@
 # Update Log
 
 ## 2026-09-24
+* **Creation**: a devlog-by-devlog record of Douglas Dwyer's engine, from all
+  thirty transcripts — [Dwyer's devlogs](reference/dwyer-devlogs.md).
 * **Creation**: eight [concepts](concepts/) — the rules, measured numbers,
   decisions and post-mortems that were buried in the plans.
 * **Creation**: `docs/` became an OKF v0.2 knowledge bundle — every spec and plan
