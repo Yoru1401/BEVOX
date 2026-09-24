@@ -11,6 +11,7 @@
 pub mod classify;
 pub mod contact;
 pub mod detach;
+pub mod fracture;
 pub mod joint;
 pub mod mass;
 pub mod merge;
@@ -93,7 +94,8 @@ pub(crate) mod fixtures {
     use glam::{Quat, UVec3, Vec3};
 
     /// Material 1 weighs 1000 and grips; 2 weighs 3000 and grips; 3 is
-    /// frictionless ice; 4 is bouncy; 5 is nearly elastic.
+    /// frictionless ice; 4 is bouncy; 5 is nearly elastic; 6 is brittle; 7
+    /// never breaks.
     pub fn materials() -> MaterialTable {
         let mut table = MaterialTable::new();
         table
@@ -102,6 +104,7 @@ pub(crate) mod fixtures {
                 density: 1000,
                 friction: 60,
                 restitution: 0,
+                strength: crate::material::DEFAULT_STRENGTH,
             })
             .unwrap();
         table
@@ -110,6 +113,7 @@ pub(crate) mod fixtures {
                 density: 3000,
                 friction: 60,
                 restitution: 0,
+                strength: crate::material::DEFAULT_STRENGTH,
             })
             .unwrap();
         table
@@ -118,6 +122,7 @@ pub(crate) mod fixtures {
                 density: 1000,
                 friction: 0,
                 restitution: 0,
+                strength: crate::material::DEFAULT_STRENGTH,
             })
             .unwrap();
         table
@@ -126,6 +131,7 @@ pub(crate) mod fixtures {
                 density: 1000,
                 friction: 60,
                 restitution: 80,
+                strength: crate::material::DEFAULT_STRENGTH,
             })
             .unwrap();
         table
@@ -134,6 +140,28 @@ pub(crate) mod fixtures {
                 density: 1000,
                 friction: 60,
                 restitution: 99,
+                strength: crate::material::DEFAULT_STRENGTH,
+            })
+            .unwrap();
+        // 6: glass. Breaks at a speed a body reaches falling a voxel or two.
+        table
+            .push(Material {
+                color: [200, 230, 255, 255],
+                density: 1000,
+                friction: 60,
+                restitution: 0,
+                strength: 5,
+            })
+            .unwrap();
+        // 7: the same in every way except that it never breaks, so a test can
+        // change one thing about a collision and nothing else.
+        table
+            .push(Material {
+                color: [200, 230, 255, 255],
+                density: 1000,
+                friction: 60,
+                restitution: 0,
+                strength: crate::material::UNBREAKABLE,
             })
             .unwrap();
         table

@@ -12,6 +12,7 @@
 //! bias added, so pushing a body out of the floor does not make it bounce.
 
 use super::contact::{Contact, RADIUS, detect, detect_pair, world_box};
+use super::fracture::{self, Fracture};
 use super::joint::{self, Joint};
 use super::sleep;
 use super::{BASE_MARGIN, BIAS, MAX_PUSH, MAX_TRAVEL, RESTITUTION_SWEEPS, SLOP, SUBSTEPS};
@@ -19,7 +20,7 @@ use crate::body::{Body, BodyId, occupied_bounds};
 use crate::contree::Contree;
 use crate::distance_field::DistanceField;
 use crate::material::MaterialTable;
-use glam::{Mat3, Quat, Vec2, Vec3};
+use glam::{Mat3, Quat, UVec3, Vec2, Vec3};
 use std::collections::{HashMap, HashSet};
 
 /// What a contact carried last tick, for warm starting.
@@ -28,6 +29,16 @@ pub struct ContactImpulse {
     pub normal: f32,
     /// Along the contact's two tangents, in their order.
     pub tangent: Vec2,
+}
+
+/// What a tick produced besides new positions.
+#[derive(Clone, Debug, Default)]
+pub struct StepOutcome {
+    /// A body left the world, so the packed buffers must be rebuilt.
+    pub rebuild: bool,
+    /// Contacts that carried more than their material could take. The caller
+    /// applies them: this crate knows nothing about the scene they belong to.
+    pub fractures: Vec<Fracture>,
 }
 
 /// A contact and the bodies it joins: the one it belongs to, and the one it is
@@ -55,7 +66,7 @@ pub fn step(
     dt: f32,
     grab: Option<&mut Joint>,
     joints: &mut [Joint],
-) -> bool {
+) -> StepOutcome {
     let before = bodies.len();
     bodies.retain(|b| world_box(b, 0.0).is_none_or(|(_, max)| max.y >= 0.0));
     let h = dt / SUBSTEPS as f32;
@@ -169,8 +180,72 @@ pub fn step(
     }
 
     apply_restitution(bodies, &joined, &mut impulses, &approach);
+    let fractures = break_what_gave_way(bodies, tree, materials, &joined, &impulses);
     sleep::settle(bodies, &joints, &radii, dt);
-    bodies.len() != before
+    StepOutcome { rebuild: bodies.len() != before, fractures }
+}
+
+/// Which contacts carried more than their material could take, and the impulse
+/// handed back to the bodies for the ones that did.
+///
+/// Both sides of a contact are tested: a crate dropped on ice can break the
+/// crate, the ice, or both. The impulse is the one the contact ended the tick
+/// with, restitution included, which is what the collision actually applied.
+fn break_what_gave_way(
+    bodies: &mut [Body],
+    tree: &Contree,
+    materials: &MaterialTable,
+    joined: &[Joined],
+    impulses: &[ContactImpulse],
+) -> Vec<Fracture> {
+    let mut fractures = Vec::new();
+    let mut give_back = Vec::new();
+    for (at, (j, impulse)) in joined.iter().zip(impulses).enumerate() {
+        let c = &j.contact;
+        let mut broke = false;
+        // The speed this contact took out of the striking body, which is what
+        // a material's strength is written in. Dividing by the mass is what
+        // keeps a big body from breaking under its own weight: its resting
+        // contacts carry a far larger impulse and take away the same speed.
+        let blow = impulse.normal * bodies[j.body].mass.inverse_mass();
+        let mut side = |voxel: [u32; 3], body: Option<BodyId>, strength: u16| {
+            if let Some(over) = fracture::over_strength(blow, strength) {
+                broke = true;
+                fractures.push(Fracture {
+                    at: c.world_point,
+                    voxel: UVec3::from(voxel),
+                    body,
+                    impulse: impulse.normal,
+                    blow,
+                    over,
+                });
+            }
+        };
+
+        let mine = &bodies[j.body];
+        side(c.key.mine, Some(mine.id), materials.get(mine.volume.get(UVec3::from(c.key.mine))).strength);
+        match j.other {
+            // The static world's own voxel, in world coordinates.
+            None => side(c.key.theirs, None, materials.get(tree.get(UVec3::from(c.key.theirs))).strength),
+            Some(o) => {
+                let other = &bodies[o];
+                let material = other.volume.get(UVec3::from(c.key.theirs));
+                side(c.key.theirs, Some(other.id), materials.get(material).strength);
+            }
+        }
+        if broke {
+            give_back.push(at);
+        }
+    }
+
+    // Separately, because the scan holds the bodies immutably. Breaking
+    // something costs less speed than bouncing off it: see `fracture::REBOUND`.
+    for at in give_back {
+        let j = &joined[at];
+        let (a, b) = pair_mut(bodies, j.body, j.other);
+        push(a, b, &j.contact, -j.contact.normal * impulses[at].normal * fracture::REBOUND);
+    }
+    fractures
 }
 
 /// Every contact in the scene: each body against the world, then each pair of
@@ -1091,15 +1166,189 @@ mod tests {
         assert_eq!(keys(&bodies[0]), before);
     }
 
+    /// What looking for fractures costs a tick that finds none, and what a tick
+    /// that finds one costs on top.
+    ///
+    /// A and B interleaved in one run, on the same sixteen resting bodies: the
+    /// first with materials that hold, the second with materials that give way
+    /// at any touch, so every contact in the scene raises an event and hands
+    /// impulse back. The second is far past anything a game would do -- it is
+    /// the ceiling, not a case.
+    ///
+    /// Run with `cargo test --release -p bevox_core --lib fracture_is_timed --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn fracture_is_timed() {
+        let world = slab(64, 0..8);
+        let field = DistanceField::build(&world);
+        let holds = materials();
+        let mut gives = MaterialTable::new();
+        for i in 1..=7u8 {
+            let mut m = holds.get(MaterialId(i));
+            m.strength = 0;
+            gives.push(m).unwrap();
+        }
+
+        let scene = || {
+            (0..16)
+                .map(|i| {
+                    let (x, z) = ((i % 4) as f32 * 6.0 + 20.0, (i / 4) as f32 * 6.0 + 20.0);
+                    let mut b = placed(cube(4, 4), Vec3::new(x, 10.0, z), Quat::IDENTITY);
+                    b.recompute(&holds);
+                    b
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let time = |materials: &MaterialTable| {
+            let mut bodies = scene();
+            // Settle first, so the timing is a steady tick rather than a drop.
+            for _ in 0..30 {
+                step(&mut bodies, &world, &field, materials, GRAVITY, DT, None, &mut []);
+            }
+            let mut ticks = Vec::new();
+            let mut broke = 0;
+            for _ in 0..200 {
+                // Awake on both sides of the comparison. Bodies that keep
+                // breaking never settle, so leaving the others asleep would
+                // time sleeping against solving and call the difference
+                // fracture.
+                for b in bodies.iter_mut() {
+                    b.asleep = false;
+                }
+                let at = std::time::Instant::now();
+                let out =
+                    step(&mut bodies, &world, &field, materials, GRAVITY, DT, None, &mut []);
+                ticks.push(at.elapsed().as_secs_f64() * 1000.0);
+                broke += out.fractures.len();
+            }
+            ticks.sort_by(f64::total_cmp);
+            (ticks[ticks.len() / 2], broke)
+        };
+
+        let (a1, none) = time(&holds);
+        let (b, raised) = time(&gives);
+        let (a2, _) = time(&holds);
+        println!(
+            "16 bodies resting but awake, median of 200 ticks: holds {a1:.4} / {a2:.4} ms ({none} \
+             fractures), gives way {b:.4} ms ({raised} fractures)"
+        );
+        assert_eq!(none, 0, "the materials that hold broke {none} times");
+        assert!(raised > 0, "the materials that give way broke nothing");
+    }
+
+    /// One body of `material` driven straight down into a floor at `speed`,
+    /// simulated for a sixth of a second at `dt` a tick. Returns every fracture
+    /// the collision raised and how fast the body was still falling at the end.
+    ///
+    /// No gravity: the approach speed is the one thing under test, and letting
+    /// gravity add to it would make the collision depend on how long the flight
+    /// took -- which is exactly what the tick-rate gate must not measure.
+    fn slam(material: MaterialId, speed: f32, dt: f32) -> (Vec<Fracture>, f32) {
+        let world = slab(64, 0..8);
+        let field = DistanceField::build(&world);
+        let materials = materials();
+        // Inside the contact margin already, so the collision lands in the
+        // first tick. Further out, the speculative contact appears a tick early
+        // and bleeds the approach speed away over two ticks, which halves the
+        // blow and is a property of the detector rather than of fracture.
+        let mut body = placed(cube_of(4, 4, material), Vec3::new(32.0, 11.0, 32.0), Quat::IDENTITY);
+        assert!(body.recompute(&materials));
+        body.velocity = Vec3::new(0.0, -speed, 0.0);
+        let mut bodies = vec![body];
+        let mut fractures = Vec::new();
+        let mut left = 0.0;
+        for tick in 0..(1.0 / (6.0 * dt)).round() as usize {
+            let out = step(&mut bodies, &world, &field, &materials, Vec3::ZERO, dt, None, &mut []);
+            fractures.extend(out.fractures);
+            // The collision is the first tick, and what it left the body doing
+            // is the question. Later ticks only settle it, and with no gravity
+            // they settle everything to the same near-zero.
+            if tick == 0 {
+                left = -bodies[0].velocity.y;
+            }
+        }
+        (fractures, left)
+    }
+
+    /// Hit something hard enough and it breaks; land gently and it does not.
+    #[test]
+    fn a_hard_landing_breaks_and_a_soft_one_does_not() {
+        let (hard, _) = slam(MaterialId(6), 120.0, DT);
+        assert!(!hard.is_empty(), "a body driven into the floor at 120 broke nothing");
+        assert!(
+            hard.iter().any(|f| f.body.is_some()),
+            "the floor broke but the thing that hit it did not"
+        );
+
+        let (soft, _) = slam(MaterialId(6), 1.0, DT);
+        assert!(soft.is_empty(), "a body arriving at 1 voxel a second broke {} things", soft.len());
+    }
+
+    /// The same collision, twice, differing only in what the body is made of.
+    #[test]
+    fn what_breaks_depends_on_the_material() {
+        let (brittle, _) = slam(MaterialId(6), 60.0, DT);
+        let (tough, _) = slam(MaterialId(7), 60.0, DT);
+        assert!(
+            brittle.iter().any(|f| f.body.is_some()),
+            "the brittle body survived a blow at 60"
+        );
+        assert!(
+            !tough.iter().any(|f| f.body.is_some()),
+            "the unbreakable body broke, so strength is not being read"
+        );
+    }
+
+    /// Dwyer's devlog 28, and the reason the threshold is on impulse: what
+    /// breaks must not depend on how often the physics ticks.
+    ///
+    /// The discriminating half is the second one. A blow **under** the
+    /// material's strength must leave it whole at every rate, and a threshold
+    /// read as a force cannot manage that: dividing by the tick makes the same
+    /// collision look sixty-four times worse at 64 Hz and a hundred and
+    /// twenty-eight times at 128, so it shatters everything at every rate.
+    ///
+    /// The peak per-tick blow itself is *not* rate-independent, and this gate
+    /// does not pretend it is: 16.4 at 64 Hz against 10.4 at 128 on this scene,
+    /// because a collision the detector sees coming is resolved over more ticks
+    /// at a finer rate. What must match is the outcome.
+    #[test]
+    fn the_same_collision_breaks_at_any_tick_rate() {
+        let broke = |speed: f32, dt: f32| !slam(MaterialId(6), speed, dt).0.is_empty();
+        assert!(broke(60.0, DT), "a blow well over strength did not break at 64 Hz");
+        assert!(broke(60.0, DT / 2.0), "the same blow did not break at 128 Hz");
+        assert!(!broke(8.0, DT), "a blow under strength broke something at 64 Hz");
+        assert!(
+            !broke(8.0, DT / 2.0),
+            "a blow under strength broke something at 128 Hz but not at 64: the threshold is \
+             reading a force, which is the one thing that changes with the tick"
+        );
+    }
+
+    /// Breaking through something costs less speed than bouncing off it.
+    #[test]
+    fn breaking_something_does_not_stop_you() {
+        let (_, through) = slam(MaterialId(6), 120.0, DT);
+        let (_, off) = slam(MaterialId(7), 120.0, DT);
+        assert!(
+            through > off + 1.0,
+            "a body that broke what it hit was still falling at {through} and one that did not at {off}: \
+             the impulse is not being handed back, so the pieces fall out of a hole nothing \
+             went through"
+        );
+    }
+
     #[test]
     fn a_body_below_the_world_is_removed() {
         let world = slab(64, 0..8);
         let field = DistanceField::build(&world);
         let mut bodies = vec![placed(cube(4, 4), Vec3::new(32.0, -60.0, 32.0), Quat::IDENTITY)];
-        assert!(step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []));
+        assert!(step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []).rebuild);
         assert!(bodies.is_empty());
         let mut bodies = vec![placed(cube(4, 4), Vec3::new(32.0, 40.0, 32.0), Quat::IDENTITY)];
-        assert!(!step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []));
+        assert!(!step(&mut bodies, &world, &field, &materials(), GRAVITY, DT, None, &mut []).rebuild);
         assert_eq!(bodies.len(), 1);
     }
 

@@ -124,16 +124,22 @@ pub(crate) fn demo_scene() -> (Contree, MaterialTable) {
 pub(crate) fn palette() -> MaterialTable {
     let mut materials = MaterialTable::new();
     materials
-        .push(Material { color: [140, 140, 150, 255], density: 2600, friction: 60, restitution: 5 })
+        .push(Material { color: [140, 140, 150, 255], density: 2600, friction: 60, restitution: 5, strength: 45 })
         .unwrap(); // 1: stone
     materials
-        .push(Material { color: [180, 90, 70, 255], density: 1900, friction: 70, restitution: 5 })
+        .push(Material { color: [180, 90, 70, 255], density: 1900, friction: 70, restitution: 5, strength: 25 })
         .unwrap(); // 2: brick
     materials
-        .push(Material { color: [170, 210, 235, 255], density: 900, friction: 4, restitution: 10 })
+        .push(Material { color: [170, 210, 235, 255], density: 900, friction: 4, restitution: 10, strength: 12 })
         .unwrap(); // 3: ice
     materials
-        .push(Material { color: [40, 40, 45, 255], density: 1100, friction: 80, restitution: 80 })
+        .push(Material {
+            color: [40, 40, 45, 255],
+            density: 1100,
+            friction: 80,
+            restitution: 80,
+            strength: bevox_core::material::UNBREAKABLE,
+        })
         .unwrap(); // 4: rubber
     materials
 }

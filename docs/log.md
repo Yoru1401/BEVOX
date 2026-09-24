@@ -1,6 +1,8 @@
 # Update Log
 
 ## 2026-09-24
+* **Creation**: fracture, for bodies and terrain, after Dwyer's devlog 28 -
+  [Fracture](superpowers/plans/2026-09-24-bevox-fracture.md).
 * **Creation**: ten views on the function keys, and what they cost the lit
   frame (nothing measurable) - [Debug Views](superpowers/plans/2026-09-24-bevox-debug-views.md).
 * **Creation**: a devlog-by-devlog record of Douglas Dwyer's engine, from all

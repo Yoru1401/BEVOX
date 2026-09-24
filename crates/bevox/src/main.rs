@@ -7,8 +7,9 @@ use bevox_core::physics::merge::merge;
 use bevox_core::physics::sleep::wake_near;
 use bevox_core::physics::{GRAVITY, MERGE_AFTER, SLEEP_AFTER};
 use bevox_core::physics::detach::detach;
+use bevox_core::physics::fracture::{Fracture, cracks};
 use bevox_core::physics::joint::{Joint, follow};
-use bevox_core::physics::sculpt::sculpt;
+use bevox_core::physics::sculpt::{sculpt, split};
 use bevox_core::physics::solver::step;
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system};
@@ -184,7 +185,7 @@ fn physics_system(
     mut scene: ResMut<VoxelScene>,
 ) {
     let scene = &mut *scene;
-    let changed = step(
+    let tick = step(
         &mut scene.bodies,
         &scene.tree,
         &scene.field,
@@ -196,7 +197,8 @@ fn physics_system(
     );
     // Edits since the last tick may have split or removed a jointed body.
     follow(&mut joints.0, &scene.bodies);
-    if changed {
+    let broke = apply_fractures(scene, &tick.fractures);
+    if tick.rebuild || broke {
         // A body left the world. The body list is packed into the scene
         // buffers, so they must be rebuilt.
         scene.generation += 1;
@@ -520,6 +522,79 @@ fn merge_system(
     }
 }
 
+/// Cuts the cracks a tick's collisions earned, and lets the code that already
+/// turns loose voxels into bodies make the pieces.
+///
+/// After Dwyer's devlog 28: fracture plans no pieces and copies no volumes. It
+/// deletes voxels. `split` answers for a body and `detach` for the world, which
+/// are the same two functions the brush uses.
+///
+/// Returns whether anything changed, which is a rebuild either way: both paths
+/// move voxels between the packed buffers.
+fn apply_fractures(scene: &mut VoxelScene, fractures: &[Fracture]) -> bool {
+    let mut changed = false;
+    // The world first. A body's index moves when another body splits, so those
+    // are looked up by id below; the world has no such problem.
+    for event in fractures.iter().filter(|f| f.body.is_none()) {
+        let at = event.voxel.as_ivec3();
+        let extent = scene.tree.extent() as i32;
+        let cut: Vec<UVec3> = cracks(at, event.over, seed_of(event))
+            .into_iter()
+            .filter(|p| p.min_element() >= 0 && p.max_element() < extent)
+            .map(|p| p.as_uvec3())
+            .collect();
+        if cut.is_empty() {
+            continue;
+        }
+        scene.tree.clear_voxels(&cut);
+        // Clearing only raises true distances, so the field may lag. Fullness
+        // may not: see `VoxelScene::world_changed`.
+        let reach = bevox_core::physics::fracture::reach_of(event.over) as i32;
+        scene.world_changed(at - reach, at + reach);
+        changed = true;
+
+        let room = MAX_BODIES.saturating_sub(scene.bodies.len());
+        let VoxelScene { tree, materials, .. } = &mut *scene;
+        let freed = detach(tree, materials, at - reach, at + reach, room);
+        for boxed in freed.iter().filter_map(world_box).collect::<Vec<_>>() {
+            scene.world_changed(boxed.0, boxed.1);
+        }
+        scene.bodies.extend(freed);
+    }
+
+    for event in fractures.iter().filter(|f| f.body.is_some()) {
+        let Some(index) = scene.bodies.iter().position(|b| Some(b.id) == event.body) else {
+            // Its body split apart earlier this tick and the piece that held
+            // this voxel became another body. One crack from the same impact is
+            // enough.
+            continue;
+        };
+        let extent = scene.bodies[index].volume.extent() as i32;
+        let cut: Vec<UVec3> = cracks(event.voxel.as_ivec3(), event.over, seed_of(event))
+            .into_iter()
+            .filter(|p| p.min_element() >= 0 && p.max_element() < extent)
+            .map(|p| p.as_uvec3())
+            .collect();
+        if cut.is_empty() {
+            continue;
+        }
+        scene.bodies[index].volume.clear_voxels(&cut);
+        let VoxelScene { bodies, materials, .. } = &mut *scene;
+        split(bodies, index, materials, MAX_BODIES);
+        changed = true;
+    }
+    changed
+}
+
+/// A seed for one impact's cracks: the voxel that gave way and how hard.
+///
+/// Deterministic, so a replayed tick cracks the same way, and different for
+/// two impacts in one tick, so a body hit twice does not break twice alike.
+fn seed_of(event: &Fracture) -> u64 {
+    let v = event.voxel;
+    (v.x as u64) << 40 ^ (v.y as u64) << 20 ^ v.z as u64 ^ (event.impulse.to_bits() as u64) << 3
+}
+
 /// The function-key row picks what the window draws: F1 the lit scene, then one
 /// buffer per key along the row.
 ///
@@ -591,6 +666,24 @@ mod tests {
         assert!(has(MaterialId(4)), "no rubber on the floor");
         assert_eq!(materials.get(MaterialId(3)).friction, 4);
         assert_eq!(materials.get(MaterialId(4)).restitution, 80);
+    }
+
+    /// The demo scene's materials break in the order they look like they should:
+    /// ice shatters first, brick before stone, and rubber never.
+    ///
+    /// Equal strengths would leave fracture looking like a property of the
+    /// impact alone, which is the thing per-material strength exists to avoid.
+    #[test]
+    fn the_demo_scene_breaks_in_the_right_order() {
+        let (_, materials) = demo_scene();
+        let strength = |m: u8| materials.get(MaterialId(m)).strength;
+        assert!(strength(3) < strength(2), "ice is not more brittle than brick");
+        assert!(strength(2) < strength(1), "brick is not more brittle than stone");
+        assert_eq!(
+            strength(4),
+            bevox_core::material::UNBREAKABLE,
+            "the bouncy patch is breakable, so a hard landing would shatter the floor"
+        );
     }
 
     /// Erasing the base of the demo scene's column drops it: the erase runs
@@ -905,6 +998,79 @@ mod tests {
         erase_and_detach(&mut scene, Vec3::new(32.0, 7.0, 32.0), 5.0);
         assert_eq!(scene.bodies.len(), 1, "the column did not come free");
         assert!(scene.bodies[0].from_terrain, "a body cut out of the terrain does not know it");
+    }
+
+    /// A fracture event on a body, as the solver would raise it for a hard
+    /// landing: `over` is how many times the material's strength the blow was.
+    fn blow_on(body: Option<bevox_core::body::BodyId>, voxel: UVec3, over: f32) -> Fracture {
+        Fracture {
+            at: voxel.as_vec3(),
+            voxel,
+            body,
+            impulse: 1000.0,
+            blow: 40.0 * over,
+            over,
+        }
+    }
+
+    /// The middle of what a body actually holds, which is where a landing
+    /// breaks it.
+    fn middle_of(body: &bevox_core::body::Body) -> UVec3 {
+        let (lo, hi) = bevox_core::body::occupied_bounds(&body.volume).expect("an empty body");
+        (lo + hi) / 2
+    }
+
+    /// Hit hard enough, a body comes apart into pieces that carry on as bodies.
+    #[test]
+    fn a_body_hit_hard_enough_comes_apart() {
+        let mut scene = settled_scene(ALOFT);
+        let (id, voxel) = (scene.bodies[0].id, middle_of(&scene.bodies[0]));
+        let before = scene.bodies[0].volume.voxels().len();
+
+        assert!(apply_fractures(&mut scene, &[blow_on(Some(id), voxel, 9.0)]), "nothing changed");
+        assert!(
+            scene.bodies.len() > 1,
+            "a blow nine times over strength left the body in one piece"
+        );
+        let after: usize = scene.bodies.iter().map(|b| b.volume.voxels().len()).sum();
+        assert!(after < before, "the cracks removed no voxels");
+        assert!(
+            after > before / 2,
+            "{after} voxels left of {before}: the cracks are erasing the body, not parting it"
+        );
+        assert!(
+            scene.bodies.iter().all(|b| b.mass.mass > 0.0),
+            "a piece came away with no mass, so the physics will not move it"
+        );
+    }
+
+    /// With no room under the cap, a body is left whole rather than
+    /// half-erased: a piece past the cap is not drawn, and a body may hold
+    /// disconnected voxels.
+    #[test]
+    fn a_full_scene_leaves_a_broken_body_whole() {
+        let mut scene = settled_scene(ALOFT);
+        while scene.bodies.len() < MAX_BODIES {
+            scene.bodies.push(demo_body(Vec3::new(20.0, 40.0, 20.0), Quat::IDENTITY));
+        }
+        let (id, voxel) = (scene.bodies[0].id, middle_of(&scene.bodies[0]));
+
+        apply_fractures(&mut scene, &[blow_on(Some(id), voxel, 9.0)]);
+        assert_eq!(scene.bodies.len(), MAX_BODIES, "the cap was exceeded");
+    }
+
+    /// Breaking the world cuts voxels out of it, and the coarse grids still
+    /// describe what is left -- the same check detachment and merging answer to.
+    #[test]
+    fn breaking_the_floor_keeps_the_grids_honest() {
+        let mut scene = settled_scene(ALOFT);
+        let voxel = UVec3::new(30, 4, 30);
+        assert!(!scene.tree.get(voxel).is_empty(), "the test is aimed at empty space");
+        let before = scene.tree.voxels().len();
+
+        assert!(apply_fractures(&mut scene, &[blow_on(None, voxel, 9.0)]), "nothing changed");
+        assert!(scene.tree.voxels().len() < before, "the world lost no voxels");
+        fullness_describes_the_world(&scene, "a fracture in the world");
     }
 
     /// An erase under a sleeping body wakes it.

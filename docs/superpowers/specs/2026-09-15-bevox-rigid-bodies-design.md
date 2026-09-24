@@ -446,6 +446,7 @@ correctness are checked by deliberately breaking the code they guard.
 | 8 | Body shadows, from every body including those off screen | Bodies sit in the scene rather than on it |
 | 9 | Sleeping, and merging settled terrain debris back into the world | Debris stops costing anything, and gives its slot back |
 | 10 | Ambient occlusion from a fullness grid | Creases read as creases; a body reads as sitting on the floor |
+| 11 | Fracture, for bodies and for terrain | A hard enough hit breaks what it lands on, and what lands |
 
 **Sleeping and merging** (milestone 9). A group of bodies touching or jointed
 together falls asleep once every one of them has been still for half a second,
@@ -460,8 +461,29 @@ grid, which is why it must be out of view; the field is lowered as painting
 lowers it. A body spawned outright never merges, nor does one a joint names or
 the mouse holds.
 
-Deferred until a measurement asks for them: fracture on hard impacts, and
-multithreading. Dwyer's engine has both.
+**Fracture** (milestone 11), after Dwyer's devlog 28. A contact whose blow
+passes the material's `strength` raises a fracture event; the event cuts cracks
+by **setting voxels empty**; and the code that already turns loose voxels into
+bodies makes the pieces -- `sculpt::split` for a body, `detach` for the world.
+Nothing plans a piece or copies a volume.
+
+- **The blow is a speed**, the impulse the contact carried divided by the mass
+  it acted on, in voxels a second. An impulse threshold would have a large body
+  shatter under its own weight, because a contact's impulse grows with the mass
+  resting on it. It is never a *force*: a collision resolves inside one tick, so
+  a force threshold breaks differently at 30 and 60 frames a second.
+- **Part of the impulse is handed back** to a contact that broke something, so a
+  body carries on through what it broke instead of stopping at a hole nothing
+  went through.
+- **Cracks are a few random planes** through the impact, seeded by the voxel and
+  the impulse, reaching further and cutting more finely the harder the hit.
+  Dwyer authors boolean pattern volumes per material instead; that is a data
+  format for a modding API this engine does not have.
+- Measured at +0.0035 ms a tick with 128 events a tick, against 0.0004 ms of
+  drift. `docs/superpowers/plans/2026-09-24-bevox-fracture.md` has the numbers.
+
+Deferred until a measurement asks for it: multithreading. Dwyer's engine has
+it.
 
 ## What this deliberately does not do
 

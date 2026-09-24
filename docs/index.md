@@ -59,6 +59,7 @@ lifted out of the plan that produced it.
 * [Rigid-Body Physics Milestone 2](superpowers/plans/2026-09-18-bevox-physics-milestone-2.md) - A voxel body dropped into the scene lands on the static voxel world, tumbles if it lands off balance, and comes to rest without jitter.
 * [Mouse Grab](superpowers/plans/2026-09-18-bevox-physics-mouse-grab.md) - Pick up a body with the mouse.
 * [Sleeping and Merging Debris](superpowers/plans/2026-09-19-bevox-sleep-and-merge.md) - Bodies at rest stop costing physics time, and a body that came out of the terrain and settled out of view goes back into it and frees its slot, as in Dwyer's devlog #13.
+* [Fracture](superpowers/plans/2026-09-24-bevox-fracture.md) - Bodies and terrain crack where a collision is too hard for the material; cracks are drawn as empty voxels and detachment produces the pieces.
 * [Debug Views](superpowers/plans/2026-09-24-bevox-debug-views.md) - Nine debug views selectable in the app from the function keys, eight of them free and one, the ray-step heatmap, measured before it is kept.
 * [Ambient Occlusion](superpowers/plans/2026-09-24-bevox-ambient-occlusion.md) - Creases and corners darken, so a body sitting on the floor reads as sitting on it, following Dwyer's devlog #15.
 * [Detachment Over Tree Nodes](superpowers/plans/2026-09-24-bevox-detachment-over-nodes.md) - The detachment search walks the tree's uniform nodes instead of single voxels, as Dwyer's devlog #12 does, so a cut into a large volume costs a few steps rather than thousands.

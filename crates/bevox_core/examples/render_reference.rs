@@ -21,12 +21,14 @@ fn main() {
         density: DEFAULT_DENSITY,
         friction: DEFAULT_FRICTION,
         restitution: DEFAULT_RESTITUTION,
+        strength: bevox_core::material::DEFAULT_STRENGTH,
     }).unwrap();
     let brick = table.push(Material {
         color: [180, 90, 70, 255],
         density: DEFAULT_DENSITY,
         friction: DEFAULT_FRICTION,
         restitution: DEFAULT_RESTITUTION,
+        strength: bevox_core::material::DEFAULT_STRENGTH,
     }).unwrap();
 
     let tree = build_scene(stone, brick);

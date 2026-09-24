@@ -34,10 +34,27 @@ pub fn sculpt(
         return;
     }
 
-    // The rigid motion before the cut, which every piece inherits.
-    let (com, velocity, spin) = (body.position, body.velocity, body.angular_velocity());
     let local = body.local_from_world().transform_point3(centre);
     body.volume.apply_sphere(local, radius, MaterialId::EMPTY);
+    split(bodies, index, materials, max_bodies);
+}
+
+/// Hands each disconnected piece of a body its own body, after something has
+/// cut the volume up.
+///
+/// Shared by the brush and by fracture, which differ only in which voxels they
+/// clear: the brush clears a sphere, a fracture clears cracks. Everything after
+/// that -- who keeps the identity, what the pieces inherit, what happens at the
+/// cap -- is the same question and has one answer.
+///
+/// A body left with nothing is removed. A body still in one piece, or one whose
+/// pieces would take the scene past `max_bodies`, is recomputed and left whole:
+/// a piece past the cap is not drawn, and a rigid body can hold disconnected
+/// voxels.
+pub fn split(bodies: &mut Vec<Body>, index: usize, materials: &MaterialTable, max_bodies: usize) {
+    // The rigid motion the cut did not change, which every piece inherits.
+    let body = &bodies[index];
+    let (com, velocity, spin) = (body.position, body.velocity, body.angular_velocity());
 
     let pieces = components(&body.volume);
     if pieces.is_empty() {

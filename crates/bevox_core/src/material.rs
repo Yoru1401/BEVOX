@@ -17,16 +17,27 @@ impl MaterialId {
 /// behaves on contact.
 ///
 /// Density is relative: only ratios between voxels, and later a joint's force
-/// against them, are observable. The contact columns are hundredths. All three
-/// are integers so `Material` stays `Eq`: `friction` 60 is a coefficient of
-/// 0.6, `restitution` 80 is 0.8. Friction may exceed 1; restitution above 1
-/// would add energy on every bounce, so it is clamped where it is used.
+/// against them, are observable. The contact columns are hundredths. Every
+/// column is an integer so `Material` stays `Eq`: `friction` 60 is a
+/// coefficient of 0.6, `restitution` 80 is 0.8. Friction may exceed 1;
+/// restitution above 1 would add energy on every bounce, so it is clamped
+/// where it is used.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Material {
     pub color: [u8; 4],
     pub density: u16,
     pub friction: u8,
     pub restitution: u8,
+    /// The impact this material survives, as the speed change a contact
+    /// imposes on the body that struck it, in voxels a second.
+    /// `UNBREAKABLE` survives anything.
+    ///
+    /// A speed, not an impulse, so that a large body does not shatter under
+    /// its own weight: a contact's impulse grows with the mass resting on it,
+    /// while the speed it takes away does not. It is derived from an impulse
+    /// all the same -- never from a force, which would depend on the tick
+    /// rate. `physics::fracture` says why.
+    pub strength: u16,
 }
 
 /// The density a material gets when its source says nothing about mass, such
@@ -38,6 +49,17 @@ pub const DEFAULT_FRICTION: u8 = 60;
 
 /// Barely bouncy, which is what most solids are.
 pub const DEFAULT_RESTITUTION: u8 = 5;
+
+/// What a material takes before it cracks when its source says nothing.
+///
+/// In voxels a second, as `Material::strength` is. A body resting under
+/// gravity changes speed by about 0.15 a tick, and a fall of twenty voxels
+/// arrives at about twenty, so forty is "survives a serious fall, breaks when
+/// thrown".
+pub const DEFAULT_STRENGTH: u16 = 40;
+
+/// A material that never fractures, however hard it is hit.
+pub const UNBREAKABLE: u16 = u16::MAX;
 
 /// The friction between two surfaces: the geometric mean, so the slipperier one
 /// dominates and anything against a frictionless surface slides free.
@@ -59,7 +81,12 @@ pub struct MaterialTable {
 impl MaterialTable {
     /// Creates a table whose slot 0 is the reserved empty material.
     pub fn new() -> Self {
-        let empty = Material { color: [0, 0, 0, 0], density: 0, friction: 0, restitution: 0 };
+        // Unbreakable rather than zero: there is nothing in an empty voxel to
+        // break. Nothing reads it -- empty space raises no contacts -- and if
+        // anything ever does, it fails toward no fracture rather than toward
+        // one on every touch.
+        let empty =
+            Material { color: [0, 0, 0, 0], density: 0, friction: 0, restitution: 0, strength: UNBREAKABLE };
         Self { entries: vec![empty] }
     }
 
@@ -116,10 +143,22 @@ mod tests {
     fn a_material_keeps_its_friction_and_bounce() {
         let mut table = MaterialTable::new();
         let id = table
-            .push(Material { color: [1, 2, 3, 255], density: 900, friction: 5, restitution: 80 })
+            .push(Material {
+                color: [1, 2, 3, 255],
+                density: 900,
+                friction: 5,
+                restitution: 80,
+                strength: 25,
+            })
             .unwrap();
         assert_eq!(table.get(id).friction, 5);
         assert_eq!(table.get(id).restitution, 80);
+        assert_eq!(table.get(id).strength, 25);
+        assert_eq!(
+            table.get(MaterialId::EMPTY).strength,
+            UNBREAKABLE,
+            "empty space must not be breakable; there is nothing there to break"
+        );
     }
 
     /// Friction combines as the geometric mean, so ice against stone is
@@ -144,6 +183,7 @@ mod tests {
          density: 2600,
          friction: DEFAULT_FRICTION,
          restitution: DEFAULT_RESTITUTION,
+         strength: DEFAULT_STRENGTH,
      })
      .unwrap();
         assert_eq!(table.get(id).density, 2600);
@@ -159,6 +199,7 @@ mod tests {
                 density: DEFAULT_DENSITY,
                 friction: DEFAULT_FRICTION,
                 restitution: DEFAULT_RESTITUTION,
+                strength: DEFAULT_STRENGTH,
             })
             .unwrap();
         let gpu = table.to_gpu();
@@ -174,6 +215,7 @@ mod tests {
          density: DEFAULT_DENSITY,
          friction: DEFAULT_FRICTION,
          restitution: DEFAULT_RESTITUTION,
+         strength: DEFAULT_STRENGTH,
      })
      .unwrap();
         let gpu = table.to_gpu();
@@ -209,6 +251,7 @@ mod tests {
          density: DEFAULT_DENSITY,
          friction: DEFAULT_FRICTION,
          restitution: DEFAULT_RESTITUTION,
+         strength: DEFAULT_STRENGTH,
      })
      .unwrap();
         let b = table
@@ -217,6 +260,7 @@ mod tests {
          density: DEFAULT_DENSITY,
          friction: DEFAULT_FRICTION,
          restitution: DEFAULT_RESTITUTION,
+         strength: DEFAULT_STRENGTH,
      })
      .unwrap();
         assert_eq!(a, MaterialId(1));
@@ -233,6 +277,7 @@ mod tests {
                 density: DEFAULT_DENSITY,
                 friction: DEFAULT_FRICTION,
                 restitution: DEFAULT_RESTITUTION,
+                strength: DEFAULT_STRENGTH,
             }).is_some());
         }
         assert!(table.push(Material {
@@ -240,6 +285,7 @@ mod tests {
             density: DEFAULT_DENSITY,
             friction: DEFAULT_FRICTION,
             restitution: DEFAULT_RESTITUTION,
+            strength: DEFAULT_STRENGTH,
         }).is_none());
     }
 }

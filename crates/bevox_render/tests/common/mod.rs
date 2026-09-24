@@ -45,6 +45,7 @@ pub fn parity_materials() -> MaterialTable {
             density: DEFAULT_DENSITY,
             friction: DEFAULT_FRICTION,
             restitution: DEFAULT_RESTITUTION,
+            strength: bevox_core::material::DEFAULT_STRENGTH,
         })
         .unwrap();
     // 2: brick
@@ -54,6 +55,7 @@ pub fn parity_materials() -> MaterialTable {
             density: DEFAULT_DENSITY,
             friction: DEFAULT_FRICTION,
             restitution: DEFAULT_RESTITUTION,
+            strength: bevox_core::material::DEFAULT_STRENGTH,
         })
         .unwrap();
     table
