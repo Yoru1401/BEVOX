@@ -1,6 +1,9 @@
 # Update Log
 
 ## 2026-09-24
+* **Creation**: `bevox_physics`, a force and impulse API on `Body`, and a
+  ceiling in voxels per second -
+  [A Physics Crate, Forces, and a Tick-Free Ceiling](superpowers/plans/2026-09-24-bevox-physics-crate.md).
 * **Update**: a falling body is limited by drag rather than a clamp, and
   contacts resist rolling so a lone voxel settles -
   [Sliding friction cannot stop a roll](concepts/rolling-needs-its-own-resistance.md).

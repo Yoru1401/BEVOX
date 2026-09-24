@@ -461,6 +461,22 @@ grid, which is why it must be out of view; the field is lowered as painting
 lowers it. A body spawned outright never merges, nor does one a joint names or
 the mouse holds.
 
+**Where the physics lives.** `bevox_physics` holds the simulation and depends
+on `bevox_core`, which holds the data. `bevox_render` depends on neither, and a
+gate on its manifest keeps it that way: it marches bodies, and must never need
+the simulation to do it. What `Body` carries -- mass properties, features, the
+warm-start impulses -- is therefore in core with it; what computes any of that
+is in the physics crate, `recompute` included.
+
+**Pushing a body.** `add_impulse`, `add_impulse_at`, `add_force`, `add_force_at`.
+An impulse is a change of momentum and lands at once; a force is gathered for
+the tick, integrated over it, and cleared, so keeping a push going means saying
+so every tick. Anything pushed wakes up. Gravity and drag keep their own path,
+being accelerations rather than forces.
+
+**The speed ceiling is a speed**, `MAX_SPEED`, in voxels per second -- not a
+distance per tick, which made it a different limit at every tick rate.
+
 **What a body falls through** is passed to the solver as `Air`, the way gravity
 always was, so a test can take one force away and watch the rest. The game runs
 in `Air::EARTH`: gravity, and quadratic drag set to balance it at a terminal

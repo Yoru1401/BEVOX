@@ -91,16 +91,20 @@ pub const TERMINAL_SPEED: f32 = 200.0;
 /// that is visible.
 pub const DRAG: f32 = -GRAVITY.y / (TERMINAL_SPEED * TERMINAL_SPEED);
 
-/// The furthest a body may move in one tick, in voxels: linear travel plus the
-/// swing of its furthest voxel. Speeds are capped to it, which is what lets
-/// speculative contacts stand in for continuous collision detection.
+/// The fastest a body may move, in voxels per **second**: linear speed plus
+/// the swing of its furthest voxel. Speeds are capped to it, which is what
+/// lets speculative contacts stand in for continuous collision detection.
 ///
-/// A safety net, not a speed limit. It sits above what drag allows -- 260
+/// A safety net, not a speed limit. It sits above what drag allows -- 256
 /// voxels a second against a terminal 200 -- so a falling body never reaches
 /// it, and what does reach it is something thrown or blasted, where being
 /// clamped beats tunnelling through a wall. The detection margin is the body's
-/// *actual* travel, so a cap this high costs a slow body nothing.
-pub const MAX_TRAVEL: f32 = 4.0;
+/// *actual* travel, so a ceiling this high costs a slow body nothing.
+///
+/// Per second, not per tick, which is the whole point: as voxels-per-tick it
+/// was a different speed at every tick rate -- 256 at 64 Hz, 512 at 128 --
+/// so changing the rate changed how fast anything in the game could go.
+pub const MAX_SPEED: f32 = 256.0;
 
 /// How strongly a contact resists a body rolling on it, as a fraction of what
 /// it resists sliding with.

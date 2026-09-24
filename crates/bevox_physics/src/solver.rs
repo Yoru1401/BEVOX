@@ -16,7 +16,7 @@ use super::fracture::{self, Fracture};
 use super::joint::{self, Joint};
 use super::sleep;
 use super::{
-    Air, BASE_MARGIN, BIAS, MAX_PUSH, MAX_TRAVEL, RESTITUTION_SWEEPS, ROLLING, SLOP, SUBSTEPS,
+    Air, BASE_MARGIN, BIAS, MAX_PUSH, MAX_SPEED, RESTITUTION_SWEEPS, ROLLING, SLOP, SUBSTEPS,
 };
 use bevox_core::body::{Body, BodyId, occupied_bounds};
 use bevox_core::contree::Contree;
@@ -129,7 +129,11 @@ pub fn step(
             // Drag before the cap, and the cap almost never fires: what limits
             // a fall is a force, so the body eases into its terminal speed
             // instead of having its acceleration switched off in one tick.
-            b.velocity += (air.gravity - air.drag * b.velocity * b.velocity.length()) * h;
+            // Gravity and drag are accelerations, so they skip the mass;
+            // whatever gameplay pushed with is a force and does not.
+            let pushed = b.force * b.mass.inverse_mass();
+            b.velocity += (air.gravity + pushed - air.drag * b.velocity * b.velocity.length()) * h;
+            b.angular_momentum += b.torque * h;
             cap_speed(b, world_inverse_inertia(b), r, dt);
         }
 
@@ -177,6 +181,13 @@ pub fn step(
     }
     for (j, &impulse) in joined.iter().zip(&impulses) {
         bodies[j.body].warm.insert(j.contact.key, impulse);
+    }
+
+    // Spent: a force acts for the tick it was given for, and no longer. A
+    // caller that wants to keep pushing says so every tick.
+    for b in bodies.iter_mut() {
+        b.force = Vec3::ZERO;
+        b.torque = Vec3::ZERO;
     }
 
     apply_restitution(bodies, &joined, &mut impulses, &approach);
@@ -374,18 +385,18 @@ fn radius(body: &Body) -> f32 {
 }
 
 /// Scales velocity and angular momentum together, so that a tick's travel
-/// (linear, plus the furthest voxel's swing) is at most `MAX_TRAVEL`. Returns
+/// (linear, plus the furthest voxel's swing) is at most `MAX_SPEED`. Returns
 /// that travel, which is how far detection must look ahead.
 fn cap_speed(body: &mut Body, inv_inertia: Mat3, radius: f32, dt: f32) -> f32 {
     let spin = (inv_inertia * body.angular_momentum).length();
-    let travel = (body.velocity.length() + spin * radius) * dt;
-    if travel > MAX_TRAVEL {
-        let scale = MAX_TRAVEL / travel;
+    let speed = body.velocity.length() + spin * radius;
+    if speed > MAX_SPEED {
+        let scale = MAX_SPEED / speed;
         body.velocity *= scale;
         body.angular_momentum *= scale;
-        return MAX_TRAVEL;
+        return MAX_SPEED * dt;
     }
-    travel
+    speed * dt
 }
 
 /// How fast a point fixed to the body, `r` from its centre of mass, is moving.
@@ -1147,7 +1158,7 @@ mod tests {
     /// pass through it: the speculative margin covers a tick's travel.
     ///
     /// The start height is chosen so that it would tunnel without the margin.
-    /// Capped, the body falls exactly `MAX_TRAVEL` per tick, and without the
+    /// Capped, the body falls exactly `MAX_SPEED * dt` per tick, and without the
     /// margin a corner is only caught while its centre is within 1.1 voxels
     /// above the floor voxel's centre -- a window narrower than the step, so
     /// most phases still catch it by luck. From 40.65 the steps straddle the
@@ -1156,12 +1167,21 @@ mod tests {
     fn a_body_at_the_speed_cap_does_not_tunnel_through_a_thin_floor() {
         let world = slab(64, 10..11);
         let field = DistanceField::build(&world);
-        let mut body = placed(cube(4, 4), Vec3::new(32.0, 40.65, 32.0), Quat::IDENTITY);
-        body.velocity = Vec3::new(0.0, -MAX_TRAVEL / DT, 0.0);
-        let mut bodies = vec![body];
-        run(&mut bodies, &world, &field, &materials(), GRAVITY, 120);
-        let y = bodies[0].position.y;
-        assert!((y - 13.0).abs() < 0.2, "ended at {y}, not on the floor at 13");
+        // At every rate, because the travel per tick is what the speculative
+        // contacts have to cover and a slower tick covers more of it: at 32 Hz
+        // the ceiling is eight voxels a tick against a floor one voxel thick.
+        for hz in [32.0f32, 64.0, 128.0] {
+            let dt = 1.0 / hz;
+            let mut body = placed(cube(4, 4), Vec3::new(32.0, 40.65, 32.0), Quat::IDENTITY);
+            body.velocity = Vec3::new(0.0, -MAX_SPEED, 0.0);
+            let mut bodies = vec![body];
+            for _ in 0..(2.0 / dt) as usize {
+                step(&mut bodies, &world, &field, &materials(), Air::VACUUM, dt, None, &mut []);
+            }
+            assert!(!bodies.is_empty(), "at {hz} Hz the body fell out of the world");
+            let y = bodies[0].position.y;
+            assert!((y - 13.0).abs() < 0.3, "at {hz} Hz it ended at {y}, not on the floor at 13");
+        }
     }
 
     /// Detection reads the live tree, so erasing the support drops a resting
@@ -1331,6 +1351,136 @@ mod tests {
         );
     }
 
+    /// A force acts for the tick it was given for, and then it is spent.
+    ///
+    /// Held down for a second it changes speed by `f/m`; given once it is gone
+    /// the next tick. A force that was never cleared would accelerate a body
+    /// for ever from a single push, which is the bug this shape prevents.
+    #[test]
+    fn a_force_acts_for_its_tick_and_no_longer() {
+        let world = slab(64, 0..8);
+        let field = DistanceField::build(&world);
+        let materials = materials();
+        let body = || {
+            let mut b = placed(cube(4, 4), Vec3::new(32.0, 40.0, 32.0), Quat::IDENTITY);
+            assert!(recompute(&mut b, &materials));
+            b
+        };
+
+        // Held for a second, in free flight, with nothing else acting.
+        let mut bodies = vec![body()];
+        let push = bodies[0].mass.mass * 10.0;
+        for _ in 0..(1.0 / DT) as usize {
+            bodies[0].add_force(Vec3::new(push, 0.0, 0.0));
+            step(&mut bodies, &world, &field, &materials, Air::STILL, DT, None, &mut []);
+        }
+        let held = bodies[0].velocity.x;
+        assert!(
+            (held - 10.0).abs() < 0.1,
+            "a force of ten times the mass, held for a second, left it at {held} not 10"
+        );
+
+        // Given once, then nothing.
+        let mut bodies = vec![body()];
+        bodies[0].add_force(Vec3::new(push, 0.0, 0.0));
+        step(&mut bodies, &world, &field, &materials, Air::STILL, DT, None, &mut []);
+        let after_one = bodies[0].velocity.x;
+        for _ in 0..20 {
+            step(&mut bodies, &world, &field, &materials, Air::STILL, DT, None, &mut []);
+        }
+        assert!(
+            (bodies[0].velocity.x - after_one).abs() < 1e-4,
+            "one push kept pushing: {after_one} became {}",
+            bodies[0].velocity.x
+        );
+        assert!(after_one > 0.0, "the push did nothing at all");
+    }
+
+    /// The ceiling is a speed, so it is the same speed at every tick rate.
+    ///
+    /// As voxels per tick it was 256 at 64 Hz and 512 at 128: changing the
+    /// rate changed how fast anything in the game could go.
+    #[test]
+    fn the_ceiling_is_the_same_speed_at_every_rate() {
+        let world = slab(64, 0..8);
+        let field = DistanceField::build(&world);
+        let materials = materials();
+        for hz in [32.0f32, 64.0, 128.0, 240.0] {
+            let dt = 1.0 / hz;
+            let mut body = placed(cube(4, 4), Vec3::new(32.0, 200.0, 32.0), Quat::IDENTITY);
+            assert!(recompute(&mut body, &materials));
+            body.velocity = Vec3::new(0.0, -10_000.0, 0.0);
+            let mut bodies = vec![body];
+            step(&mut bodies, &world, &field, &materials, Air::STILL, dt, None, &mut []);
+            let capped = bodies[0].velocity.length();
+            assert!(
+                (capped - MAX_SPEED).abs() < 1.0,
+                "at {hz} Hz the ceiling is {capped}, not {MAX_SPEED}"
+            );
+        }
+    }
+
+    /// The same scene at four tick rates lands in about the same place.
+    ///
+    /// A discrete solver is not tick-invariant and this does not pretend
+    /// otherwise: it pins a **bound**, measured before the physics crate
+    /// existed, so a later change cannot widen the spread without saying so.
+    /// What was measured then: a slide stopping within 0.38% across 32 to 240
+    /// Hz, and a fall landing within 0.02%.
+    ///
+    /// The spread is also required to be non-zero, because a solver that
+    /// ignored `dt` entirely would pass a bound and be far more wrong.
+    #[test]
+    fn the_same_scene_lands_alike_at_every_tick_rate() {
+        let world = slab(64, 0..8);
+        let field = DistanceField::build(&world);
+        let materials = materials();
+        let at = |dt: f32, seconds: f32, setup: &dyn Fn(&mut Body)| {
+            let mut body = placed(cube(4, 4), Vec3::new(20.0, 10.0, 32.0), Quat::IDENTITY);
+            assert!(recompute(&mut body, &materials));
+            setup(&mut body);
+            let mut bodies = vec![body];
+            for _ in 0..(seconds / dt) as usize {
+                step(&mut bodies, &world, &field, &materials, Air::EARTH, dt, None, &mut []);
+            }
+            bodies[0].position
+        };
+
+        let rates = [32.0f32, 64.0, 128.0, 240.0];
+        let nudge = |b: &mut Body| b.velocity = Vec3::new(30.0, 0.0, 0.0);
+        let slides: Vec<f32> = rates.iter().map(|&hz| at(1.0 / hz, 4.0, &nudge).x).collect();
+        let rests: Vec<f32> = rates.iter().map(|&hz| at(1.0 / hz, 3.0, &|_| {}).y).collect();
+        // A tenth of a second in, while it is genuinely still sliding. Resting
+        // positions alone are blind to time running at the wrong rate: halve
+        // every substep and the body traces the same path, only slower, and
+        // every resting place is exactly where it always was.
+        let midway: Vec<f32> = rates.iter().map(|&hz| at(1.0 / hz, 0.1, &nudge).x).collect();
+
+        let spread = |v: &[f32]| {
+            let (lo, hi) = v.iter().fold((f32::MAX, f32::MIN), |(l, h), &x| (l.min(x), h.max(x)));
+            (hi - lo) / (v.iter().sum::<f32>() / v.len() as f32).abs()
+        };
+        let (slide, rest, half) = (spread(&slides), spread(&rests), spread(&midway));
+        eprintln!(
+            "slide stop {slides:?} -> {:.3}%, rest {rests:?} -> {:.4}%, at 0.1s {midway:?} -> {:.3}%",
+            slide * 100.0,
+            rest * 100.0,
+            half * 100.0
+        );
+        assert!(
+            half < 0.02,
+            "a tenth of a second in, the four rates are {:.2}% apart: the simulation is not              advancing at the same rate per second",
+            half * 100.0
+        );
+        assert!(slide < 0.01, "the slide's stopping point spreads {:.2}% across rates", slide * 100.0);
+        assert!(rest < 0.001, "the resting height spreads {:.3}% across rates", rest * 100.0);
+        assert!(
+            slide > 0.0,
+            "every rate stopped the slide at exactly the same place, which a discrete solver \
+             cannot do: this is measuring nothing"
+        );
+    }
+
     /// A long fall eases into its terminal speed instead of having its
     /// acceleration switched off.
     ///
@@ -1383,10 +1533,10 @@ mod tests {
             gains.last().unwrap()
         );
         assert!(
-            terminal < MAX_TRAVEL / DT,
+            terminal < MAX_SPEED,
             "the fall reached {terminal} and the cap is {}: a falling body is being clamped, \
              which is what drag is here to prevent",
-            MAX_TRAVEL / DT
+            MAX_SPEED
         );
     }
 

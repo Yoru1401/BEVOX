@@ -93,8 +93,53 @@ The spec's structure section, this plan's Measurements, the bundle, and a concep
 
 ## Measurements
 
-(Filled in during execution.)
+**The tick-rate spread, before and after.** The same scene at four rates, run
+before any of this was built and again after all of it:
+
+| | 32 Hz | 64 Hz | 128 Hz | 240 Hz | Spread |
+|---|---|---|---|---|---|
+| slide stops at x | 27.3844 | 27.4440 | 27.4750 | 27.4894 | **0.383%** |
+| resting height y | 9.99964 | 9.99991 | 9.99998 | 9.99999 | **0.0035%** |
+| x a tenth of a second in | 22.5239 | 22.5344 | 22.5398 | 22.6929 | 0.749% |
+
+The first two rows are **identical to the numbers measured before the crate
+existed**, to every digit printed — which is the proof that moving the code and
+rewriting the ceiling changed no behaviour.
+
+`the_same_scene_lands_alike_at_every_tick_rate` pins those as a bound, not an
+equality. A discrete solver is not tick-invariant and the gate says so in its
+own words.
 
 ## What changed during execution
 
-(Filled in during execution.)
+- **`Body::recompute` had to leave `bevox_core`.** It computes mass properties
+  and features, both of which now live in the physics crate, so it is
+  `physics::mass::recompute(&mut Body, &MaterialTable)`. Twenty-five call sites
+  and six tests moved with it.
+- **Four types stayed behind**: `MassProperties`, `Features`, `ContactKey`,
+  `ContactImpulse`. `Body` holds them and the renderer holds `Body`, so they are
+  data in core while everything that computes them is in physics.
+- **Two accessors went from `pub(crate)` to `pub`** — `world_inverse_inertia`
+  and `point_velocity` — which is what crossing a crate boundary costs.
+- **The renderer's independence is now a gate**, reading its own manifest. It
+  would otherwise rot the first time someone reached for a physics helper, and
+  the code would still build.
+- **The resting-position gate was blind to time itself running wrong.** Fixing
+  every substep to 1/256 of a second regardless of `dt` passed it: the body
+  traces the same path, only slower, so every resting place is exactly where it
+  always was. The gate now also samples a tenth of a second in, while the body
+  is genuinely still sliding, and that break fails.
+- **`fracture.rs` carried a false comment.** It said `testing::XorShift64`
+  "lives behind `cfg(test)` and so cannot be used here" and duplicated the
+  generator. `testing` is a public module. The comment is gone.
+
+## Breaks that failed as required
+
+| Break | Gate that caught it |
+|---|---|
+| Forces never cleared after a tick | `a_force_acts_for_its_tick_and_no_longer` |
+| An impulse applied as though it were a force | `an_impulse_lands_now_and_a_force_waits_for_the_tick` |
+| `add_force_at` ignoring the lever arm | `a_push_off_centre_also_turns_the_body` |
+| A push that leaves a sleeper asleep | `pushing_a_sleeper_wakes_it` |
+| The ceiling back in voxels per tick | `the_ceiling_is_the_same_speed_at_every_rate` |
+| The substep fixed regardless of `dt` | `the_same_scene_lands_alike_at_every_tick_rate` |

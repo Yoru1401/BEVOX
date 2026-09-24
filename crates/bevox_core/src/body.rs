@@ -107,6 +107,16 @@ pub struct Body {
     /// Zero until `recompute`, which leaves a body built by `new` placed
     /// exactly as it was before bodies had mass.
     pub com: Vec3,
+    /// Force gathered for this tick, about to be integrated and then cleared.
+    ///
+    /// Gameplay pushes a body through `add_force`; the simulation consumes
+    /// this once a tick and clears it, so a force has to be applied again to
+    /// keep acting. That is what makes "push while the button is held" the
+    /// obvious thing to write and "push once, accelerate for ever" the
+    /// difficult one.
+    pub force: Vec3,
+    /// Torque gathered for this tick, about the centre of mass.
+    pub torque: Vec3,
     /// Zero until `recompute`. A body with no mass is not simulated.
     pub mass: MassProperties,
     /// Voxels per second.
@@ -151,6 +161,8 @@ impl Body {
             com: Vec3::ZERO,
             mass: MassProperties::default(),
             velocity: Vec3::ZERO,
+            force: Vec3::ZERO,
+            torque: Vec3::ZERO,
             angular_momentum: Vec3::ZERO,
             features: Features::default(),
             warm: HashMap::new(),
@@ -238,6 +250,50 @@ impl Body {
         self.world_inverse_inertia() * self.angular_momentum
     }
 
+    /// An instantaneous change of momentum, applied now.
+    ///
+    /// An impulse is not a force and is not accumulated: it *is* the change in
+    /// momentum, so it lands the moment it is given and is gone. A hit, a
+    /// kick, a blast.
+    pub fn add_impulse(&mut self, impulse: Vec3) {
+        self.velocity += impulse * self.mass.inverse_mass();
+        self.stir();
+    }
+
+    /// The same, applied at a point in the world, so it also spins the body.
+    ///
+    /// The lever is measured from the centre of mass, which is where the body
+    /// turns about -- not from `position`, which is the same point only until
+    /// the volume is edited.
+    pub fn add_impulse_at(&mut self, impulse: Vec3, world_point: Vec3) {
+        self.velocity += impulse * self.mass.inverse_mass();
+        self.angular_momentum += (world_point - self.position).cross(impulse);
+        self.stir();
+    }
+
+    /// A force, gathered for this tick and integrated over it.
+    ///
+    /// Give it again next tick to keep pushing: see `force`.
+    pub fn add_force(&mut self, force: Vec3) {
+        self.force += force;
+        self.stir();
+    }
+
+    /// The same, applied at a point in the world, so it also turns the body.
+    pub fn add_force_at(&mut self, force: Vec3, world_point: Vec3) {
+        self.force += force;
+        self.torque += (world_point - self.position).cross(force);
+        self.stir();
+    }
+
+    /// Anything pushed is awake. A sleeping body ignores contacts and gravity
+    /// until something wakes it, and a push it slept through would be a push
+    /// that did nothing.
+    fn stir(&mut self) {
+        self.asleep = false;
+        self.still_for = 0.0;
+    }
+
     /// Sets the spin, by setting the angular momentum that produces it.
     pub fn set_angular_velocity(&mut self, omega: Vec3) {
         self.angular_momentum = self.world_inverse_inertia().inverse() * omega;
@@ -316,6 +372,60 @@ mod tests {
 
     /// Two bodies are never the same body, and a clone is the same body: the
     /// warm-start cache keys on this.
+    /// An impulse lands at once and a force does not: that is the difference
+    /// between the two, and the whole reason both exist.
+    #[test]
+    fn an_impulse_lands_now_and_a_force_waits_for_the_tick() {
+        let mut body = Body::new(cube(), Vec3::ZERO, Quat::IDENTITY);
+        body.mass = MassProperties { mass: 4.0, inverse_inertia: Mat3::IDENTITY };
+
+        body.add_impulse(Vec3::new(8.0, 0.0, 0.0));
+        assert_eq!(body.velocity, Vec3::new(2.0, 0.0, 0.0), "an impulse of 8 on a mass of 4");
+        assert_eq!(body.angular_momentum, Vec3::ZERO, "an impulse through the centre spun it");
+
+        body.add_force(Vec3::new(100.0, 0.0, 0.0));
+        assert_eq!(body.velocity, Vec3::new(2.0, 0.0, 0.0), "a force moved the body on its own");
+        assert_eq!(body.force, Vec3::new(100.0, 0.0, 0.0), "the force was not gathered");
+    }
+
+    /// Off the centre of mass, both also turn the body, and the lever is
+    /// measured from the centre of mass rather than from `position`.
+    #[test]
+    fn a_push_off_centre_also_turns_the_body() {
+        let mut body = Body::new(cube(), Vec3::new(10.0, 0.0, 0.0), Quat::IDENTITY);
+        body.mass = MassProperties { mass: 2.0, inverse_inertia: Mat3::IDENTITY };
+
+        // Two voxels above the centre of mass, pushed along +X: it must spin
+        // about -Z and move along +X at once.
+        body.add_impulse_at(Vec3::new(4.0, 0.0, 0.0), Vec3::new(10.0, 2.0, 0.0));
+        assert_eq!(body.velocity, Vec3::new(2.0, 0.0, 0.0), "the linear half went missing");
+        assert_eq!(body.angular_momentum, Vec3::new(0.0, 0.0, -8.0), "r x j is not r x j");
+
+        body.add_force_at(Vec3::new(0.0, 6.0, 0.0), Vec3::new(13.0, 0.0, 0.0));
+        assert_eq!(body.force, Vec3::new(0.0, 6.0, 0.0));
+        assert_eq!(body.torque, Vec3::new(0.0, 0.0, 18.0), "the force's lever went missing");
+    }
+
+    /// A push wakes what it pushes. A sleeping body takes no part in a tick,
+    /// so a push it slept through would be a push that did nothing at all.
+    #[test]
+    fn pushing_a_sleeper_wakes_it() {
+        let mut body = Body::new(cube(), Vec3::ZERO, Quat::IDENTITY);
+        body.mass = MassProperties { mass: 1.0, inverse_inertia: Mat3::IDENTITY };
+        for push in [0, 1, 2, 3] {
+            body.asleep = true;
+            body.still_for = 9.0;
+            match push {
+                0 => body.add_impulse(Vec3::X),
+                1 => body.add_impulse_at(Vec3::X, Vec3::Y),
+                2 => body.add_force(Vec3::X),
+                _ => body.add_force_at(Vec3::X, Vec3::Y),
+            }
+            assert!(!body.asleep, "push {push} left the body asleep");
+            assert_eq!(body.still_for, 0.0, "push {push} left it counted as still");
+        }
+    }
+
     #[test]
     fn every_body_gets_its_own_id() {
         let a = Body::new(cube(), Vec3::ZERO, Quat::IDENTITY);

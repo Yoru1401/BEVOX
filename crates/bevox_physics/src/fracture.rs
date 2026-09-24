@@ -68,7 +68,7 @@ pub fn over_strength(blow: f32, strength: u16) -> Option<f32> {
 pub fn cracks(at: IVec3, over: f32, seed: u64) -> Vec<IVec3> {
     let reach = reach_of(over);
     let planes = planes_of(over);
-    let mut rng = Rng(seed | 1);
+    let mut rng = Rng::new(seed | 1);
     let normals: Vec<Vec3> = (0..planes).map(|_| rng.direction()).collect();
 
     let mut out = Vec::new();
@@ -107,17 +107,17 @@ pub fn planes_of(over: f32) -> u32 {
 
 /// Enough randomness to scatter crack planes, and no more.
 ///
-/// The same generator as `testing::XorShift64`, which lives behind `cfg(test)`
-/// and so cannot be used here. A dependency for sixteen lines of shift and xor
-/// would be worse than the repetition.
-struct Rng(u64);
+/// `bevox_core::testing::XorShift64` is the generator; this only adds the one
+/// thing cracks need from it.
+struct Rng(bevox_core::testing::XorShift64);
 
 impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(bevox_core::testing::XorShift64::new(seed))
+    }
+
     fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
+        self.0.next_u64()
     }
 
     /// A unit vector, near enough evenly spread for cracks.
