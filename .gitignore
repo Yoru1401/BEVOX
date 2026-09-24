@@ -2,3 +2,7 @@
 **/target
 /reference.png
 /assets
+
+# Obsidian keeps its UI state beside the notes; workspace.json changes on every
+# pane you move, and none of it describes the bundle.
+.obsidian/
