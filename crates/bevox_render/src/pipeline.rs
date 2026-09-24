@@ -1,5 +1,6 @@
 //! Bind group layout, compute pipeline and the dispatch that runs it.
 
+use crate::debug::DebugView;
 use crate::cull::GpuBodyRect;
 use crate::upload::{
     ExtractedMarchCamera, GpuBody, GpuSceneData, MarchTarget, MarchUniform, SceneUpdate,
@@ -167,9 +168,18 @@ const BODY_BYTES: u64 = (2 * size_of::<GpuBody>() + size_of::<GpuBodyRect>()) as
 pub struct MarchPipeline {
     /// The created layout, used when building bind groups.
     pub layout: BindGroupLayout,
-    pub pipeline: CachedComputePipelineId,
+    /// One per `DebugView`, in `DebugView::ALL` order. Choosing a view chooses
+    /// a pipeline, so no view costs the others a branch.
+    pub views: Vec<CachedComputePipelineId>,
     /// Coarse pass, dispatched before the main one when the beam flag is set.
     pub beam: CachedComputePipelineId,
+}
+
+impl MarchPipeline {
+    /// The pipeline that draws `view`.
+    pub fn pipeline(&self, view: DebugView) -> CachedComputePipelineId {
+        self.views[view.index()]
+    }
 }
 
 /// GPU-side buffers for the current scene.
@@ -303,18 +313,25 @@ pub fn init_march_pipeline(
     // Two forms of the same layout: the pipeline descriptor takes a descriptor,
     // while building a bind group needs a created layout.
     let layout = device.create_bind_group_layout("bevox_march_layout", &entries);
-    let layout_descriptor = BindGroupLayoutDescriptor::new("bevox_march_layout", &entries);
 
     let shader = asset_server.load(SHADER_PATH);
     let shader_beam = shader.clone();
     let layout_descriptor_beam = BindGroupLayoutDescriptor::new("bevox_march_layout", &entries);
-    let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("bevox_march".into()),
-        layout: vec![layout_descriptor],
-        shader,
-        entry_point: Some("march".into()),
-        ..default()
-    });
+    // Queued, not compiled: the cache builds each the first time it is asked
+    // for, so the views nobody selects cost nothing but their entry in this
+    // list. They share one layout because they read the same bindings.
+    let views = DebugView::ALL
+        .iter()
+        .map(|view| {
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some(format!("bevox_{}", view.entry_point()).into()),
+                layout: vec![BindGroupLayoutDescriptor::new("bevox_march_layout", &entries)],
+                shader: shader.clone(),
+                entry_point: Some(view.entry_point().into()),
+                ..default()
+            })
+        })
+        .collect();
 
     let beam = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("bevox_beam_prepass".into()),
@@ -324,7 +341,7 @@ pub fn init_march_pipeline(
         ..default()
     });
 
-    commands.insert_resource(MarchPipeline { layout, pipeline, beam });
+    commands.insert_resource(MarchPipeline { layout, views, beam });
 }
 
 /// Uploads scene buffers and the per-frame uniform into the render world.
@@ -505,10 +522,12 @@ pub fn prepare_march_buffers(
 
 /// Runs inside the render graph. Skips the frame if anything is not ready,
 /// rather than panicking: a pipeline still compiling is normal, not an error.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_march(
     pipeline: Option<Res<MarchPipeline>>,
     buffers: Option<Res<MarchBuffers>>,
     target: Option<Res<MarchTarget>>,
+    view: Option<Res<DebugView>>,
     images: Res<RenderAssets<GpuImage>>,
     pipeline_cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
@@ -520,7 +539,13 @@ pub fn dispatch_march(
     let Some(gpu_image) = images.get(&target.image) else {
         return;
     };
-    let Some(compute) = pipeline_cache.get_compute_pipeline(pipeline.pipeline) else {
+    // A view whose pipeline is still compiling falls back to the lit one, so
+    // pressing a key never blanks the window for a frame.
+    let view = view.map(|v| *v).unwrap_or_default();
+    let compute = pipeline_cache
+        .get_compute_pipeline(pipeline.pipeline(view))
+        .or_else(|| pipeline_cache.get_compute_pipeline(pipeline.pipeline(DebugView::Lit)));
+    let Some(compute) = compute else {
         return;
     };
 

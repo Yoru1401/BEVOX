@@ -110,6 +110,20 @@ shadow ray already answers for it.
   so it is on by default. The numbers are in
   `docs/superpowers/plans/2026-09-24-bevox-ambient-occlusion.md`.
 
+**Debug views** (2026-09-24). The function keys choose what the window draws:
+F1 the lit scene, then normals, depth, the UV of the hit voxel's face, material
+id, voxel id, unlit, sun shadows, ambient occlusion, and the ray-step heatmap.
+
+- Each view is its own compute entry point, and the render world holds one
+  pipeline per view. Choosing a view chooses a pipeline, so nothing branches per
+  pixel and the lit view runs exactly the shader it would run without them.
+- `DebugView` owns the whole table -- entry point, name and key -- so the app
+  has none of its own and a view cannot be added in one place and forgotten in
+  the other.
+- Measured against the shader before them: under 0.1 ms, not separable from
+  noise, and no pixel of the lit view changed. The numbers are in
+  `docs/superpowers/plans/2026-09-24-bevox-debug-views.md`.
+
 Each body owns its own `Contree`, packed into the shared node and voxel buffers
 behind a per-body base offset.
 

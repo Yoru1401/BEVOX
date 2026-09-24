@@ -13,6 +13,7 @@ use bevox_core::physics::solver::step;
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system};
 use bevox_render::cull::{Frustum, world_bound};
+use bevox_render::debug::DebugView;
 use bevox_render::pick::{Target, cursor_ray, pick};
 use bevox_render::pipeline::MAX_BODIES;
 use bevox_render::upload::{GpuBody, VoxelScene, apply_brush, build_gpu_scene, offset_from_clip};
@@ -73,6 +74,7 @@ fn main() {
         // After the physics tick, which runs in `FixedUpdate` ahead of this, and
         // before the rebuild a merge asks for.
         .add_systems(Update, merge_system.after(fly_camera_system).before(build_gpu_scene))
+        .add_systems(Update, debug_view_keys)
         .run();
 }
 
@@ -518,6 +520,20 @@ fn merge_system(
     }
 }
 
+/// The function-key row picks what the window draws: F1 the lit scene, then one
+/// buffer per key along the row.
+///
+/// The keys come from `DebugView` rather than a table here, so a view added to
+/// the renderer is reachable without touching the app.
+fn debug_view_keys(keys: Res<ButtonInput<KeyCode>>, mut view: ResMut<DebugView>) {
+    for candidate in DebugView::ALL {
+        if keys.just_pressed(candidate.key()) && *view != candidate {
+            *view = candidate;
+            info!("view: {}", candidate.name());
+        }
+    }
+}
+
 /// Erases a sphere, then hands whatever it cut free to the physics as bodies.
 ///
 /// The cap is the renderer's: past `MAX_BODIES` a body is uploaded but not
@@ -608,6 +624,31 @@ mod tests {
         // The column reaches far above the brush that cut its foot, so this is
         // the case the brush's own recount cannot cover.
         fullness_describes_the_world(&scene, "a detachment");
+    }
+
+    /// Every view's key selects it, and a frame with nothing pressed leaves the
+    /// view alone -- a system that reset to lit each frame would look like the
+    /// keys not working at all.
+    #[test]
+    fn the_function_keys_select_every_view() {
+        let mut world = World::new();
+        world.init_resource::<DebugView>();
+        let system = world.register_system(debug_view_keys);
+        let press = |world: &mut World, key: Option<KeyCode>| {
+            let mut input = ButtonInput::<KeyCode>::default();
+            if let Some(key) = key {
+                input.press(key);
+            }
+            world.insert_resource(input);
+            world.run_system(system).unwrap();
+        };
+
+        for view in DebugView::ALL {
+            press(&mut world, Some(view.key()));
+            assert_eq!(*world.resource::<DebugView>(), view, "{:?}'s key chose another view", view);
+            press(&mut world, None);
+            assert_eq!(*world.resource::<DebugView>(), view, "the view reset when nothing was pressed");
+        }
     }
 
     /// A stroke on a body edits the body, not the world behind it, and asks for

@@ -2,6 +2,7 @@
 
 pub mod camera;
 pub mod cull;
+pub mod debug;
 pub mod pick;
 pub mod pipeline;
 pub mod upload;
@@ -24,8 +25,10 @@ impl Plugin for BevoxRenderPlugin {
         app.insert_resource(BevoxReady)
             // Always present, so the renderer draws an empty world rather than
             // going dark when no scene has been inserted.
+            .init_resource::<debug::DebugView>()
             .init_resource::<upload::GpuSceneData>()
             .init_resource::<upload::SceneUpdate>()
+            .add_plugins(ExtractResourcePlugin::<debug::DebugView>::default())
             .add_plugins(ExtractResourcePlugin::<upload::MarchTarget>::default())
             .add_plugins(ExtractResourcePlugin::<upload::SceneUpdate>::default())
             .add_plugins(ExtractResourcePlugin::<upload::ExtractedMarchCamera>::default())

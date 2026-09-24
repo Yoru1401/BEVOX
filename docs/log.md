@@ -1,6 +1,8 @@
 # Update Log
 
 ## 2026-09-24
+* **Creation**: ten views on the function keys, and what they cost the lit
+  frame (nothing measurable) - [Debug Views](superpowers/plans/2026-09-24-bevox-debug-views.md).
 * **Creation**: a devlog-by-devlog record of Douglas Dwyer's engine, from all
   thirty transcripts — [Dwyer's devlogs](reference/dwyer-devlogs.md).
 * **Creation**: eight [concepts](concepts/) — the rules, measured numbers,

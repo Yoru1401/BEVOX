@@ -330,6 +330,10 @@ struct Hit {
     // then a coordinate in the body's own volume and means nothing against the
     // static tree or as a world position.
     from_body: bool,
+    // Traversal steps this ray spent. Summed across the static world and every
+    // body the ray was marched against, so it is what the pixel cost, not what
+    // the winning volume cost. Read by `march_steps` and by nothing else.
+    steps: u32,
 };
 
 /// Which face of a box the ray entered, from the per-axis entry distances.
@@ -373,7 +377,7 @@ fn traverse_at(
 
     let root_slab = ray_box(origin, inv_dir, vec3<f32>(0.0), vec3<f32>(f32(extent)));
     if !root_slab.hit || t_start > root_slab.t_exit {
-        return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0), false);
+        return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0), false, 0u);
     }
 
     // Index `node_base` is the root written by the uploader, so every arena
@@ -425,6 +429,7 @@ fn traverse_at(
                 vec3<u32>(entered),
                 entry_normal(origin, inv_dir, lo, hi),
                 false,
+                steps,
             );
         }
 
@@ -584,6 +589,7 @@ fn traverse_at(
                 best_origin,
                 entry_normal(origin, inv_dir, lo, hi),
                 false,
+                steps,
             );
         }
 
@@ -637,7 +643,7 @@ fn traverse_at(
         );
     }
 
-    return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0), false);
+    return Hit(false, 0u, 0.0, vec3<u32>(0u), vec3<f32>(0.0), false, steps);
 }
 
 /// The static world, at its fixed place in the shared buffers. Its signature
@@ -663,6 +669,9 @@ fn compose_bodies(origin: vec3<f32>, dir: vec3<f32>, world_hit: Hit, max_dist: f
     var best = world_hit;
     var limit = max_dist;
     if best.hit { limit = best.t; }
+    // What the pixel cost, not what the nearest volume cost: a ray that marches
+    // sixteen bodies and keeps one of them still paid for the sixteen.
+    var spent = world_hit.steps;
 
     let count = view.volume_params.w;
     for (var i = 0u; i < count; i = i + 1u) {
@@ -680,6 +689,7 @@ fn compose_bodies(origin: vec3<f32>, dir: vec3<f32>, world_hit: Hit, max_dist: f
         let local_dir = (b.local_from_world * vec4<f32>(dir, 0.0)).xyz;
 
         let h = traverse_at(local_origin, local_dir, 0.0, limit, b.node_base, b.voxel_base, b.depth, b.extent);
+        spent = spent + h.steps;
         if h.hit && h.t < limit {
             best = h;
             best.face_normal = (b.rotation * vec4<f32>(h.face_normal, 0.0)).xyz;
@@ -688,6 +698,7 @@ fn compose_bodies(origin: vec3<f32>, dir: vec3<f32>, world_hit: Hit, max_dist: f
             limit = h.t;
         }
     }
+    best.steps = spent;
     return best;
 }
 
@@ -1105,7 +1116,7 @@ fn shadow_origin(hit: Hit, id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
     return vec3<f32>(hit.voxel) + vec3<f32>(0.5) + hit.face_normal * 0.75;
 }
 
-/// Shadow flag in red: 255 shadowed, 0 lit. Parity test only.
+/// Shadow flag in red: 255 shadowed, 0 lit.
 @compute @workgroup_size(8, 8, 1)
 fn march_shadow(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
@@ -1125,7 +1136,7 @@ fn march_shadow(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(output, vec2<i32>(id.xy), colour);
 }
 
-/// Ambient occlusion in red, 255 fully shut out. Parity test only.
+/// Ambient occlusion in red, 255 fully shut out.
 @compute @workgroup_size(8, 8, 1)
 fn march_ao(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
@@ -1140,7 +1151,105 @@ fn march_ao(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(output, vec2<i32>(id.xy), colour);
 }
 
-/// Normal encoded into unsigned bytes, hit flag in alpha. Parity test only.
+/// How far the ray went, against the volume's own size: `t / extent`, so a ray
+/// that crosses the whole world reads white. Grey in all three channels, hit
+/// flag in alpha.
+///
+/// Not a projection depth. The marcher has a distance along the ray and nothing
+/// else, and a scene-relative ramp stays readable when the volume changes size.
+@compute @workgroup_size(8, 8, 1)
+fn march_depth(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(output);
+    if id.x >= size.x || id.y >= size.y { return; }
+
+    let hit = primary_hit(id, size);
+
+    var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if hit.hit {
+        let depth = clamp(hit.t / f32(view.volume_params.y), 0.0, 1.0);
+        colour = vec4<f32>(depth, depth, depth, 1.0);
+    }
+    textureStore(output, vec2<i32>(id.xy), colour);
+}
+
+/// Where the ray landed on the hit voxel's face, in the volume's own frame:
+/// red and green are the two axes the face spans, each in [0, 1).
+///
+/// The body branch repeats three lines of `voxel_centre` rather than sharing
+/// them. `voxel_centre` is on the lit path, and every edit to the lit path is
+/// re-benched here -- see docs/concepts/gpu-codegen-cliff.md. A debug view does
+/// not get to touch it.
+@compute @workgroup_size(8, 8, 1)
+fn march_uv(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(output);
+    if id.x >= size.x || id.y >= size.y { return; }
+
+    let hit = primary_hit(id, size);
+
+    var colour = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if hit.hit {
+        var point = view.camera_position.xyz + primary_ray(id, size) * hit.t;
+        if hit.from_body {
+            let b = bodies[hit_body];
+            let a = mat3x3<f32>(b.local_from_world[0].xyz, b.local_from_world[1].xyz, b.local_from_world[2].xyz);
+            point = a * point + b.local_from_world[3].xyz;
+        }
+        let f = fract(point);
+        let n = abs(hit.face_normal);
+        var uv = f.xy;
+        if n.x > 0.5 {
+            uv = f.yz;
+        } else if n.y > 0.5 {
+            uv = f.xz;
+        }
+        colour = vec4<f32>(uv.x, uv.y, 0.0, 1.0);
+    }
+    textureStore(output, vec2<i32>(id.xy), colour);
+}
+
+/// What the pixel cost: traversal steps, grey, 64 steps or more reading white.
+///
+/// Grey rather than a colour ramp on purpose. A ramp is easier to look at, and
+/// it is not monotone per channel, so no test could hold it to counting what it
+/// claims to count. Bright is expensive; that is enough to find the camera
+/// angle that hurts.
+///
+/// The count includes the static world and every body the ray was marched
+/// against, so it rises where bodies overlap on screen even when the pixel
+/// shows terrain.
+///
+/// 64, against a cap of 4096, because the distance field and the beam prepass
+/// seed a primary ray close to what it hits: with both on, a ray crossing the
+/// whole world costs single-digit steps more than one landing on the first
+/// voxel it meets. Scaled to the cap, the view would be black everywhere.
+@compute @workgroup_size(8, 8, 1)
+fn march_steps(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(output);
+    if id.x >= size.x || id.y >= size.y { return; }
+
+    let hit = primary_hit(id, size);
+
+    let cost = clamp(f32(hit.steps) / 64.0, 0.0, 1.0);
+    textureStore(output, vec2<i32>(id.xy), vec4<f32>(cost, cost, cost, 1.0));
+}
+
+/// The palette colour alone: no sun, no shadow, no ambient occlusion. What the
+/// materials actually are, before any light touches them.
+@compute @workgroup_size(8, 8, 1)
+fn march_unlit(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(output);
+    if id.x >= size.x || id.y >= size.y { return; }
+
+    let hit = primary_hit(id, size);
+
+    var colour = vec4<f32>(0.35, 0.47, 0.70, 1.0);  // sky, as `march` draws it
+    if hit.hit {
+        colour = vec4<f32>(palette[hit.material].rgb, 1.0);
+    }
+    textureStore(output, vec2<i32>(id.xy), colour);
+}
+
+/// Normal encoded into unsigned bytes, hit flag in alpha.
 @compute @workgroup_size(8, 8, 1)
 fn march_normal(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
@@ -1156,7 +1265,7 @@ fn march_normal(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(output, vec2<i32>(id.xy), colour);
 }
 
-/// Hit voxel coordinate in RGB, hit flag in alpha. Read by the parity test only.
+/// Hit voxel coordinate in RGB, hit flag in alpha.
 /// For a body hit this is the body-local voxel: an identity, not a position.
 @compute @workgroup_size(8, 8, 1)
 fn march_voxel_id(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -1178,7 +1287,7 @@ fn march_voxel_id(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(output, vec2<i32>(id.xy), colour);
 }
 
-/// Material identity in red, hit flag in green. Read by the parity test only.
+/// Material identity in red, hit flag in green.
 @compute @workgroup_size(8, 8, 1)
 fn march_identity(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);

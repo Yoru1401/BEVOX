@@ -10,7 +10,7 @@ use bevox_core::march::{MarchStats, march};
 use bevox_render::cull::GpuBodyRect;
 use bevox_render::upload::{VoxelScene, march_flags};
 use bevox_core::material::MaterialId;
-use glam::{Affine3A, EulerRot, Mat4, Quat, UVec3, Vec3, Vec4};
+use glam::{Affine3A, EulerRot, Mat4, Quat, UVec3, Vec2, Vec3, Vec4};
 
 mod common;
 use common::*;
@@ -1798,6 +1798,189 @@ fn ambient_occlusion_matches_the_cpu() {
     assert!(dark > 200, "only {dark} pixels are occluded; the scene has no corner to speak of");
     assert!(lit > 200, "only {lit} pixels are open; the scene is all corner");
     assert_eq!(mismatches, 0, "{mismatches} pixels disagreed; first {first}");
+}
+
+/// The ray-step view counts what a ray actually spends.
+///
+/// Not compared against `MarchStats`: the reference marcher counts a step per
+/// child it considers and the shader counts one per stack frame, so the two are
+/// honest about different things and their numbers do not meet. Nor against the
+/// empty-space accelerators, which change where a ray *starts* and leave the
+/// descent that follows much as it was.
+///
+/// What is asserted is what a cost view has to do to be worth opening. It must
+/// never read zero where a ray hit something. It must vary across the image,
+/// because a flat heatmap says "nothing is expensive". And it must not be the
+/// depth view wearing a hat: rays that stop at the same distance must still be
+/// seen to cost different amounts, which is the whole reason to look at it.
+#[test]
+fn the_ray_step_view_counts_steps() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (width, height) = (96u32, 96u32);
+    let tree = ao_corner_world();
+    let eye = Vec3::new(40.0, 24.0, 40.0);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(6.0, 9.0, 6.0) - eye, Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+    let offset_from_clip = (projection * view).inverse();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let pixels = run_march_flagged(
+        &device, &queue, &shader, "march_steps", offset_from_clip, eye, &tree, width, height,
+        march_flags::DEFAULT,
+    );
+
+    let mut stats = MarchStats::default();
+    let (mut hits, mut unmeasured) = (0usize, 0usize);
+    let (mut lowest, mut highest) = (u8::MAX, 0u8);
+    // Cost by distance, one bucket per voxel of depth.
+    let mut by_distance: std::collections::HashMap<i32, (u8, u8)> =
+        std::collections::HashMap::new();
+    for y in 0..height {
+        for x in 0..width {
+            let dir = ray_direction(offset_from_clip, x, y, width, height);
+            let i = ((y * width + x) * 4) as usize;
+            let Some(hit) = march(&tree, Affine3A::IDENTITY, eye, dir, 1000.0, false, &mut stats)
+            else {
+                continue;
+            };
+            hits += 1;
+            let cost = pixels[i];
+            if cost == 0 {
+                unmeasured += 1;
+            }
+            lowest = lowest.min(cost);
+            highest = highest.max(cost);
+            let bucket = by_distance.entry(hit.t as i32).or_insert((u8::MAX, 0));
+            bucket.0 = bucket.0.min(cost);
+            bucket.1 = bucket.1.max(cost);
+        }
+    }
+    // The widest disagreement between two rays that stopped at the same depth.
+    let at_one_depth = by_distance.values().map(|(lo, hi)| hi - lo).max().unwrap_or(0);
+
+    eprintln!(
+        "{hits} hit pixels, cost {lowest} to {highest} (255 = 64 steps),          up to {at_one_depth} apart at one depth"
+    );
+    assert!(hits > 2000, "only {hits} pixels hit; this proves little");
+    assert_eq!(unmeasured, 0, "{unmeasured} pixels hit something in no steps at all");
+    assert!(
+        highest - lowest > 10,
+        "every pixel costs between {lowest} and {highest}: a constant would pass this"
+    );
+    assert!(
+        at_one_depth > 5,
+        "rays that stop at the same distance all cost within {at_one_depth} of each other,          so this could be the depth view with a different scale"
+    );
+}
+
+/// The three debug views that carry data rather than a picture -- depth, UV and
+/// unlit -- say what the CPU says they should.
+///
+/// A debug view that lies is worse than no debug view: it sends you hunting a
+/// bug that is not there. So each is checked against the reference marcher, not
+/// merely checked for being non-blank.
+#[test]
+fn the_data_debug_views_match_the_cpu() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (width, height) = (96u32, 96u32);
+    let tree = ao_corner_world();
+    let materials = parity_materials();
+    let eye = Vec3::new(40.0, 24.0, 40.0);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(6.0, 9.0, 6.0) - eye, Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+    let offset_from_clip = (projection * view).inverse();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let run = |entry: &str| {
+        run_march_flagged(
+            &device, &queue, &shader, entry, offset_from_clip, eye, &tree, width, height,
+            march_flags::DEFAULT,
+        )
+    };
+    let (depth, uv, unlit) = (run("march_depth"), run("march_uv"), run("march_unlit"));
+
+    let mut stats = MarchStats::default();
+    let (mut hits, mut uv_spread, mut wrong) = (0usize, 0usize, Vec::new());
+    let (mut near, mut far) = (f32::MAX, 0.0f32);
+    let mut uv_seen = std::collections::HashSet::new();
+    for y in 0..height {
+        for x in 0..width {
+            let dir = ray_direction(offset_from_clip, x, y, width, height);
+            let i = ((y * width + x) * 4) as usize;
+            let Some(hit) = march(&tree, Affine3A::IDENTITY, eye, dir, 1000.0, false, &mut stats)
+            else {
+                // A miss is sky in the unlit view and nothing in the others.
+                if depth[i + 3] != 0 || uv[i + 3] != 0 {
+                    wrong.push(format!("({x},{y}) is a miss but a view marked it hit"));
+                }
+                continue;
+            };
+            hits += 1;
+            near = near.min(hit.t);
+            far = far.max(hit.t);
+
+            let want = (hit.t / tree.extent() as f32).clamp(0.0, 1.0);
+            let got = depth[i] as f32 / 255.0;
+            if (got - want).abs() > 1.5 / 255.0 {
+                wrong.push(format!("({x},{y}) depth: cpu {want}, gpu {got}"));
+            }
+
+            // Where on the face the ray landed, the way the shader takes it.
+            let point = eye + dir * hit.t;
+            let f = point - point.floor();
+            let n = hit.face_normal.abs();
+            let want_uv = if n.x > 0.5 {
+                Vec2::new(f.y, f.z)
+            } else if n.y > 0.5 {
+                Vec2::new(f.x, f.z)
+            } else {
+                Vec2::new(f.x, f.y)
+            };
+            let got_uv = Vec2::new(uv[i] as f32 / 255.0, uv[i + 1] as f32 / 255.0);
+            // A hit within a rounding step of a voxel edge has a `fract` that
+            // flips between 0 and 1, so distance is measured the short way
+            // round.
+            let d = (got_uv - want_uv).abs();
+            let wrapped = Vec2::new(d.x.min(1.0 - d.x), d.y.min(1.0 - d.y));
+            if wrapped.max_element() > 4.0 / 255.0 {
+                wrong.push(format!("({x},{y}) uv: cpu {want_uv:?}, gpu {got_uv:?}"));
+            }
+            uv_seen.insert(((got_uv.x * 8.0) as u32, (got_uv.y * 8.0) as u32));
+            if got_uv.x > 0.05 && got_uv.x < 0.95 {
+                uv_spread += 1;
+            }
+
+            let colour = materials.get(hit.material).color;
+            if (0..3).any(|c| unlit[i + c].abs_diff(colour[c]) > 1) {
+                wrong.push(format!(
+                    "({x},{y}) unlit: palette {:?}, gpu {:?}",
+                    &colour[..3],
+                    &unlit[i..i + 3]
+                ));
+            }
+        }
+    }
+
+    assert!(hits > 2000, "only {hits} pixels hit; this scene proves little");
+    assert!(
+        far - near > 20.0,
+        "every hit is at about the same distance ({near} to {far}), so a constant depth would pass"
+    );
+    assert!(
+        uv_spread > hits / 4 && uv_seen.len() > 16,
+        "the UVs barely vary ({uv_spread} off-edge, {} distinct), so a per-voxel constant would pass",
+        uv_seen.len()
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} pixels disagreed; first three: {:?}",
+        wrong.len(),
+        &wrong[..wrong.len().min(3)]
+    );
 }
 
 /// A body is occluded by the world it sits in, and by the same rule terrain is.
