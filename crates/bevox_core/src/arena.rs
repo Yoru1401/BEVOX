@@ -45,7 +45,7 @@ impl NodeArena {
     }
 
     pub fn alloc_nodes(&mut self, count: u32) -> u32 {
-        debug_assert!(count >= 1 && count <= CHILDREN);
+        debug_assert!((1..=CHILDREN).contains(&count));
         let start = match self.node_free[count as usize].pop() {
             Some(start) => start,
             None => {
@@ -59,12 +59,12 @@ impl NodeArena {
     }
 
     pub fn free_nodes(&mut self, start: u32, count: u32) {
-        debug_assert!(count >= 1 && count <= CHILDREN);
+        debug_assert!((1..=CHILDREN).contains(&count));
         self.node_free[count as usize].push(start);
     }
 
     pub fn alloc_voxels(&mut self, count: u32) -> u32 {
-        debug_assert!(count >= 1 && count <= CHILDREN);
+        debug_assert!((1..=CHILDREN).contains(&count));
         let start = match self.voxel_free[count as usize].pop() {
             Some(start) => start,
             None => {
@@ -78,7 +78,7 @@ impl NodeArena {
     }
 
     pub fn free_voxels(&mut self, start: u32, count: u32) {
-        debug_assert!(count >= 1 && count <= CHILDREN);
+        debug_assert!((1..=CHILDREN).contains(&count));
         self.voxel_free[count as usize].push(start);
     }
 

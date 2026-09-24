@@ -58,6 +58,41 @@ pub struct VoxelScene {
     pub bodies: Vec<Body>,
 }
 
+impl VoxelScene {
+    /// What the coarse grids must be told after anything changes `tree` inside
+    /// the world box `lo..=hi`, in voxels.
+    ///
+    /// Every path that edits the world goes through here, because fullness has
+    /// no safe direction to be stale in: counted too full it darkens what an
+    /// erase opened, counted too empty it lights a crease a merge just made.
+    /// Two paths learned that the hard way -- detachment frees pieces that can
+    /// lie far outside the brush, and merging writes a body into the world
+    /// nowhere near one -- and both were dark or bright for good, because
+    /// nothing else ever recounts.
+    ///
+    /// The distance field is not here on purpose: only geometry that was
+    /// *added* forces it down, and only the caller knows whether it added any.
+    pub fn world_changed(&mut self, lo: IVec3, hi: IVec3) {
+        let range = self.fullness.recount(&self.tree, lo, hi);
+        self.fullness_dirty = Some(widen(self.fullness_dirty.take(), range));
+    }
+
+    /// Lowers the field around geometry the caller just added.
+    pub fn lower_field(&mut self, centre: Vec3, radius: f32) {
+        let range = self.field.lower_around(centre, radius);
+        self.field_dirty = Some(widen(self.field_dirty.take(), range));
+    }
+}
+
+/// The range covering both, so two edits between two uploads cannot lose the
+/// first one's cells.
+fn widen(old: Option<Range<u32>>, new: Range<u32>) -> Range<u32> {
+    match old {
+        Some(old) => old.start.min(new.start)..old.end.max(new.end),
+        None => new,
+    }
+}
+
 /// Camera and volume parameters, as the shader sees them.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -501,7 +536,7 @@ pub fn build_gpu_scene(
 }
 
 /// The field packed four cells to a word, matching `pack_voxels`.
-pub fn pack_field(field: &DistanceField) -> Vec<u32> {
+fn pack_field(field: &DistanceField) -> Vec<u32> {
     bevox_core::gpu::pack_voxels(field.cells())
 }
 
@@ -514,6 +549,12 @@ pub fn field_words(field: &DistanceField) -> u32 {
 /// binding rather than two, because the compute stage is already at wgpu's
 /// default of eight storage buffers.
 pub fn pack_grids(field: &DistanceField, fullness: &Fullness) -> Vec<u32> {
+    // The shader indexes fullness with the field's edge, because one uniform
+    // word is cheaper than two and the two grids have always agreed. They agree
+    // only because both are `(extent / CELL_VOXELS).max(1)`; if that ever parts,
+    // ambient occlusion reads the wrong cells and no picture looks wrong enough
+    // to notice.
+    assert_eq!(field.edge(), fullness.edge(), "the coarse grids disagree on their edge");
     let mut words = pack_field(field);
     words.extend(bevox_core::gpu::pack_voxels(fullness.cells()));
     words
@@ -634,6 +675,7 @@ pub struct FieldWrite {
 /// Cloned into the render world every frame like the rest of the extracted
 /// state, which is only affordable because it is empty on frames with no edit.
 #[derive(Resource, Clone, Debug, ExtractResource)]
+#[derive(Default)]
 pub struct SceneUpdate {
     /// Always present. The root lives outside the arena, so no dirty range can
     /// name it, and nearly every edit replaces it.
@@ -654,20 +696,6 @@ pub struct SceneUpdate {
     pub bodies: Vec<GpuBody>,
 }
 
-impl Default for SceneUpdate {
-    fn default() -> Self {
-        Self {
-            root: GpuNode::default(),
-            nodes: Vec::new(),
-            voxels: Vec::new(),
-            field: Vec::new(),
-            node_high_water: 0,
-            voxel_word_high_water: 0,
-            bodies: Vec::new(),
-        }
-    }
-}
-
 /// Applies one brush stroke, updating the distance field only when it must.
 ///
 /// This is where the paint/erase asymmetry lives, and it lives here rather
@@ -678,13 +706,11 @@ impl Default for SceneUpdate {
 pub fn apply_brush(scene: &mut VoxelScene, centre: Vec3, radius: f32, material: MaterialId) {
     scene.tree.apply_sphere(centre, radius, material);
     if !material.is_empty() {
-        scene.field_dirty = Some(scene.field.lower_around(centre, radius));
+        scene.lower_field(centre, radius);
     }
-    // Either way for fullness: painting fills cells and erasing empties them,
-    // and neither direction is safe to leave stale.
     let reach = glam::IVec3::splat(radius.ceil() as i32 + 1);
     let at = centre.as_ivec3();
-    scene.fullness_dirty = Some(scene.fullness.recount(&scene.tree, at - reach, at + reach));
+    scene.world_changed(at - reach, at + reach);
 }
 
 /// The world's high-water marks: arena node slots in use, and packed voxel
@@ -971,6 +997,58 @@ mod tests {
             fullness_dirty: None,
             bodies: Vec::new(),
         }
+    }
+
+    /// Two edits between two uploads stage both, not just the last.
+    ///
+    /// The frame that merges a body and paints in the same tick is the one this
+    /// is for: each edit narrows to its own cells, and a dirty range that
+    /// replaced rather than widened would upload the second edit's cells and
+    /// leave the first's on the GPU as they were.
+    #[test]
+    fn two_edits_before_one_upload_stage_both() {
+        // A world wide enough that the two edits land in different words of
+        // the packed grid: at extent 64 the whole grid is sixteen words, and
+        // rounding a range outward to words hides the difference.
+        let mut tree = Contree::empty(4);
+        tree.apply_sphere(Vec3::splat(128.0), 12.0, MaterialId(1));
+        tree.arena_mut().clear_dirty();
+        let field = DistanceField::build(&tree);
+        let fullness = Fullness::build(&tree);
+        let mut scene = VoxelScene {
+            tree,
+            materials: MaterialTable::new(),
+            generation: 1,
+            field,
+            field_dirty: None,
+            fullness,
+            fullness_dirty: None,
+            bodies: Vec::new(),
+        };
+        let before = pack_grids(&scene.field, &scene.fullness);
+        // Far apart along the grid's slowest axis, so neither edit's range
+        // covers the other's.
+        apply_brush(&mut scene, Vec3::new(128.0, 128.0, 24.0), 5.0, MaterialId(1));
+        apply_brush(&mut scene, Vec3::new(128.0, 128.0, 232.0), 5.0, MaterialId(1));
+        let update = stage_scene_update(&mut scene);
+
+        let after = pack_grids(&scene.field, &scene.fullness);
+        let staged: Vec<u32> = update
+            .field
+            .iter()
+            .flat_map(|w| w.start_word..w.start_word + w.words.len() as u32)
+            .collect();
+        let missed: Vec<usize> = (0..after.len())
+            .filter(|&w| before[w] != after[w] && !staged.contains(&(w as u32)))
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "words {missed:?} changed and were never staged, so the GPU keeps the old ones"
+        );
+        assert!(
+            before != after,
+            "neither edit changed a packed word, so this proves nothing"
+        );
     }
 
     /// Painting must update the field in the same frame as the voxels, or the

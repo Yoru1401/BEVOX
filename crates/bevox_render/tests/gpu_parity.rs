@@ -10,7 +10,7 @@ use bevox_core::march::{MarchStats, march};
 use bevox_render::cull::GpuBodyRect;
 use bevox_render::upload::{VoxelScene, march_flags};
 use bevox_core::material::MaterialId;
-use glam::{Affine3A, Mat4, Quat, UVec3, Vec3, Vec4};
+use glam::{Affine3A, EulerRot, Mat4, Quat, UVec3, Vec3, Vec4};
 
 mod common;
 use common::*;
@@ -114,6 +114,10 @@ fn run_bodies(
     )
     .read_back(device, queue)
 }
+
+/// Per body voxel face seen: which body, which voxel, which face, and how many
+/// of its pixels the GPU shadowed against how many it drew.
+type FaceShadows = std::collections::HashMap<(usize, [u32; 3], [i32; 3]), (usize, usize)>;
 
 /// Material of the body-test floor, distinct from `body_cube`'s, so a test can
 /// tell body pixels from static ones in `march_identity`.
@@ -1559,8 +1563,7 @@ fn bodies_cast_shadows_that_match_the_cpu() {
     let mut stats = MarchStats::default();
     let (mut floor_by_body, mut by_other, mut by_itself, mut mismatches) = (0usize, 0usize, 0usize, 0usize);
     // Each body voxel face seen, and the GPU's shadow flags across its pixels.
-    let mut faces: std::collections::HashMap<(usize, [u32; 3], [i32; 3]), (usize, usize)> =
-        std::collections::HashMap::new();
+    let mut faces: FaceShadows = std::collections::HashMap::new();
     let mut first = String::new();
     for y in 0..height {
         for x in 0..width {
@@ -1720,17 +1723,9 @@ fn cpu_occlusion(fullness: &bevox_core::fullness::Fullness, centre: Vec3) -> f32
     ((total - 0.5) * 2.0).clamp(0.0, 1.0)
 }
 
-/// The GPU's ambient occlusion is the CPU's, per pixel, and it does what it is
-/// for: nothing on open floor, something in a corner.
-#[test]
-fn ambient_occlusion_matches_the_cpu() {
-    let Some((device, queue)) = gpu_device() else {
-        eprintln!("no GPU adapter available, skipping");
-        return;
-    };
-    let (width, height) = (96u32, 96u32);
-    // A floor with a wall rising from it: open floor far from the wall, and the
-    // crease where the two meet.
+/// A floor with a wall rising from it: open floor far from the wall, and the
+/// crease where the two meet, which is what ambient occlusion is for.
+fn ao_corner_world() -> Contree {
     let mut voxels = Vec::new();
     for z in 0..64 {
         for x in 0..64 {
@@ -1746,7 +1741,19 @@ fn ambient_occlusion_matches_the_cpu() {
             }
         }
     }
-    let tree = Contree::from_voxels(64, &voxels);
+    Contree::from_voxels(64, &voxels)
+}
+
+/// The GPU's ambient occlusion is the CPU's, per pixel, and it does what it is
+/// for: nothing on open floor, something in a corner.
+#[test]
+fn ambient_occlusion_matches_the_cpu() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (width, height) = (96u32, 96u32);
+    let tree = ao_corner_world();
     let fullness = bevox_core::fullness::Fullness::build(&tree);
     let eye = Vec3::new(40.0, 24.0, 40.0);
     let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(6.0, 9.0, 6.0) - eye, Vec3::Y);
@@ -1791,6 +1798,92 @@ fn ambient_occlusion_matches_the_cpu() {
     assert!(dark > 200, "only {dark} pixels are occluded; the scene has no corner to speak of");
     assert!(lit > 200, "only {lit} pixels are open; the scene is all corner");
     assert_eq!(mismatches, 0, "{mismatches} pixels disagreed; first {first}");
+}
+
+/// A body is occluded by the world it sits in, and by the same rule terrain is.
+///
+/// The body path reaches the hit voxel's centre through the body's placement --
+/// `voxel_centre` in the shader, the route `shadow_origin` documents -- so the
+/// body here is turned. An orientation the shader dropped, or a centre taken at
+/// the hit point instead of the voxel, moves every sample off its cell.
+#[test]
+fn ambient_occlusion_on_a_body_matches_the_cpu() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (width, height) = (96u32, 96u32);
+    let tree = ao_corner_world();
+    let fullness = bevox_core::fullness::Fullness::build(&tree);
+    // In the crease where floor and wall meet, turned off the world's grid, so
+    // the body's voxel centres are nowhere near the cell centres they sample.
+    // Placed as the other body tests place one: the volume's own centre lands
+    // on the point asked for.
+    let turn = Quat::from_euler(EulerRot::YXZ, 0.6, 0.3, 0.0);
+    let body = Body::new(body_cube(), Vec3::new(10.0, 10.0, 30.0) - turn * Vec3::splat(32.0), turn);
+    let eye = Vec3::new(44.0, 26.0, 44.0);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(10.0, 12.0, 28.0) - eye, Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1.0, 0.1, 500.0);
+    let offset_from_clip = (projection * view).inverse();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    let pixels = run_bodies(
+        &device, &queue, &shader, "march_ao", offset_from_clip, eye, &tree,
+        std::slice::from_ref(&body), width, height,
+    );
+
+    let mut stats = MarchStats::default();
+    let (mut mismatches, mut on_body, mut dark_body) = (0usize, 0usize, 0usize);
+    let mut first = String::new();
+    for y in 0..height {
+        for x in 0..width {
+            let dir = ray_direction(offset_from_clip, x, y, width, height);
+            let i = ((y * width + x) * 4) as usize;
+            let Some((hit, which)) =
+                cpu_composed_all(&tree, std::slice::from_ref(&body), eye, dir, &mut stats)
+            else {
+                continue;
+            };
+            let local = hit.voxel.as_vec3() + Vec3::splat(0.5);
+            let centre = match which {
+                Some(_) => body.world_from_local().transform_point3(local),
+                None => local,
+            };
+            let want = cpu_occlusion(&fullness, centre);
+            let got = pixels[i] as f32 / 255.0;
+            if which.is_some() {
+                on_body += 1;
+                if want > 0.25 {
+                    dark_body += 1;
+                }
+            }
+            // A world hit is exact to the byte. A body hit is not: the shader
+            // reaches the voxel's centre through the world hit point, whose
+            // `t` carries the march's own rounding, so the sample lands a
+            // hundredth of a voxel off the one computed here and the blend
+            // moves with it. Two bytes, where a wrong centre or a dropped
+            // blend moves whole tens.
+            let tolerance = if which.is_some() { 2.0 } else { 0.5 } / 255.0 + 1e-4;
+            if (got - want).abs() > tolerance {
+                if mismatches == 0 {
+                    let side = if which.is_some() { "body" } else { "world" };
+                    first = format!("at ({x},{y}) on the {side}: cpu={want} gpu={got}");
+                }
+                mismatches += 1;
+            }
+        }
+    }
+    eprintln!("{on_body} pixels on the body, {dark_body} of them occluded, {mismatches} mismatches");
+    assert!(on_body > 200, "only {on_body} pixels hit the body; nothing here tests the body path");
+    assert!(
+        dark_body > 50,
+        "only {dark_body} body pixels are occluded, so a body that sampled nothing would pass"
+    );
+    // The documented grazing pixels, as everywhere else a composed scene is
+    // compared: where the CPU and the GPU disagree about which surface a ray
+    // caught, they sample different voxels entirely. A real disagreement is
+    // thousands, not units.
+    assert!(mismatches <= 4, "{mismatches} pixels disagreed; first {first}");
 }
 
 /// A body whose content reaches its volume's max faces, seen from past them.
@@ -1961,7 +2054,7 @@ fn culling_bodies_outside_the_view_leaves_output_bit_identical() {
     let frustum =
         bevox_render::cull::Frustum::from_camera(offset_from_clip, offset_from_clip.inverse(), eye);
     let mut stats = MarchStats::default();
-    for i in 1..5 {
+    for (i, body) in bodies.iter().enumerate().take(5).skip(1) {
         let local = packed.body_local_bounds[i].expect("the cube has voxels");
         let centre = bevox_render::cull::world_bound(local, &packed.bodies[i]).centre;
         assert!(
@@ -1970,7 +2063,7 @@ fn culling_bodies_outside_the_view_leaves_output_bit_identical() {
         );
         let hit = (0..width * height).any(|p| {
             let dir = ray_direction(offset_from_clip, p % width, p / width, width, height);
-            bodies[i].march_world(eye, dir, 1000.0, &mut stats).is_some()
+            body.march_world(eye, dir, 1000.0, &mut stats).is_some()
         });
         assert!(hit, "body {i} is meant to straddle a side plane, but no pixel sees it");
     }

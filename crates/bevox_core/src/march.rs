@@ -124,6 +124,9 @@ pub fn march(
     )
 }
 
+// The descent's whole state, one frame of it. A struct for these would be
+// one more thing to move per node, in the marcher's hot loop.
+#[allow(clippy::too_many_arguments)]
 fn visit(
     volume: &Contree,
     node: Node,

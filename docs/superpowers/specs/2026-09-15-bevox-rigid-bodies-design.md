@@ -91,9 +91,13 @@ shadow ray already answers for it.
   shadows do.
 - A body samples the world's grid at its voxel's world centre, so a body in a
   crevice darkens. A body does not occlude itself; that needs a grid per body.
-- An edit recounts only the cubes it touched, and uploads that range, as the
-  distance field does. The grid shares the field's buffer because the shader was
-  already at wgpu's eight-storage-buffer limit.
+- Every path that changes the world recounts the cubes it touched, and uploads
+  that range, as the distance field does: the brush, a detachment (whose pieces
+  can lie far outside the brush), and a merge (which writes a body into the
+  world nowhere near one). Fullness has no safe direction to be stale in, unlike
+  the field, so all three go through `VoxelScene::world_changed`.
+- The grid shares the field's buffer because the shader was already at wgpu's
+  eight-storage-buffer limit.
 - Measured within drift on the bench scene, under half a millisecond either way,
   so it is on by default. The numbers are in
   `docs/superpowers/plans/2026-09-24-bevox-ambient-occlusion.md`.

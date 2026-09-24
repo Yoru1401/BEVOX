@@ -196,7 +196,7 @@ mod tests {
     /// scenes with uniform nodes of every size and loose voxels between them.
     #[test]
     fn the_walk_counts_what_the_voxels_say() {
-        let mut rng = XorShift64::new(0x0a0c_c1);
+        let mut rng = XorShift64::new(0x000a_0cc1);
         for case in 0..40 {
             let mut dense = DenseVolume::new(64).unwrap();
             // Blocks of 16, blocks of 4, then loose voxels: every node size.

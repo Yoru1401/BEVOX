@@ -42,7 +42,7 @@ impl DenseVolume {
     pub fn new(extent: u32) -> Result<Self, VolumeError> {
         if extent < crate::node::BRICK_EDGE
             || !extent.is_power_of_two()
-            || extent.trailing_zeros() % 2 != 0
+            || !extent.trailing_zeros().is_multiple_of(2)
         {
             return Err(VolumeError::InvalidExtent { extent });
         }

@@ -478,9 +478,17 @@ fn merge_settled(
             continue;
         }
         let body = scene.bodies.remove(i);
-        merge(&body, &mut scene.tree);
+        let written = merge(&body, &mut scene.tree);
         if let Some(b) = bound {
-            scene.field.lower_around(b.centre, b.radius);
+            scene.lower_field(b.centre, b.radius);
+        }
+        // The merged voxels are solid world now, wherever the body came to
+        // rest, and that is never where the brush last was.
+        if let (Some(lo), Some(hi)) = (
+            written.iter().copied().reduce(UVec3::min),
+            written.iter().copied().reduce(UVec3::max),
+        ) {
+            scene.world_changed(lo.as_ivec3(), hi.as_ivec3());
         }
         merged += 1;
     }
@@ -520,13 +528,34 @@ fn erase_and_detach(scene: &mut VoxelScene, centre: Vec3, radius: f32) {
     let reach = radius.ceil() as i32 + 1;
     let hit = centre.round().as_ivec3();
     let room = MAX_BODIES.saturating_sub(scene.bodies.len());
-    let VoxelScene { tree, materials, bodies, generation, .. } = scene;
+    let VoxelScene { tree, materials, .. } = scene;
     let freed = detach(tree, materials, hit - reach, hit + reach, room);
-    if !freed.is_empty() {
-        bodies.extend(freed);
-        // The body list changed, so the packed buffers must be rebuilt.
-        *generation += 1;
+    if freed.is_empty() {
+        return;
     }
+    // A freed piece is gone from the world, and it can reach a long way past
+    // the brush -- the bridge that falls when its one support is erased. The
+    // brush recounted its own neighbourhood and nothing else, so each piece's
+    // own box is recounted here or the air it left keeps occluding.
+    for boxed in freed.iter().filter_map(world_box).collect::<Vec<_>>() {
+        scene.world_changed(boxed.0, boxed.1);
+    }
+    scene.bodies.extend(freed);
+    // The body list changed, so the packed buffers must be rebuilt.
+    scene.generation += 1;
+}
+
+/// The world box a body covers, in voxels, wide enough to hold it at any angle.
+///
+/// The sphere is the one the culling already builds, so a body's reach has a
+/// single spelling.
+fn world_box(body: &bevox_core::body::Body) -> Option<(IVec3, IVec3)> {
+    let local = bevox_core::body::occupied_bounds(&body.volume)?;
+    let b = world_bound(local, &GpuBody::default().placed(body));
+    Some((
+        (b.centre - b.radius).floor().as_ivec3(),
+        (b.centre + b.radius).ceil().as_ivec3(),
+    ))
 }
 
 #[cfg(test)]
@@ -576,6 +605,9 @@ mod tests {
                 && scene.tree.get(UVec3::new(29, 20, 29)).is_empty(),
             "the column is still in the world as well"
         );
+        // The column reaches far above the brush that cut its foot, so this is
+        // the case the brush's own recount cannot cover.
+        fullness_describes_the_world(&scene, "a detachment");
     }
 
     /// A stroke on a body edits the body, not the world behind it, and asks for
@@ -719,6 +751,25 @@ mod tests {
         Frustum::from_camera(offset, offset.inverse(), eye)
     }
 
+    /// Fullness must still describe the world it was built from.
+    ///
+    /// Ambient occlusion has no safe direction to be stale in, and the two
+    /// paths that change the world away from the brush -- a piece detaching, a
+    /// body merging -- are the ones that forget. A mismatch here is a dark
+    /// crease in open air, or a merged pile that lights as if it were not
+    /// there, and it lasts until the scene is rebuilt.
+    fn fullness_describes_the_world(scene: &VoxelScene, what: &str) {
+        let fresh = bevox_core::fullness::Fullness::build(&scene.tree);
+        let wrong = scene
+            .fullness
+            .cells()
+            .iter()
+            .zip(fresh.cells())
+            .filter(|(have, want)| have != want)
+            .count();
+        assert_eq!(wrong, 0, "{wrong} fullness cells are stale after {what}");
+    }
+
     /// The demo scene with one brick cube centred at `centre`, asleep long
     /// enough to merge.
     fn settled_scene(centre: Vec3) -> VoxelScene {
@@ -732,8 +783,7 @@ mod tests {
         body.asleep = true;
         body.still_for = SLEEP_AFTER + MERGE_AFTER;
         VoxelScene { tree, materials, generation: 1, field, field_dirty: None,
- fullness,
- fullness_dirty: None, bodies: vec![body] }
+            fullness, fullness_dirty: None, bodies: vec![body] }
     }
 
     /// Where the settled body sleeps: in open air, where the distance field
@@ -758,6 +808,7 @@ mod tests {
         let fresh = DistanceField::build(&scene.tree);
         let over = scene.field.cells().iter().zip(fresh.cells()).filter(|(have, want)| have > want).count();
         assert_eq!(over, 0, "{over} field cells over-estimate the merged world, so rays would skip it");
+        fullness_describes_the_world(&scene, "a merge");
     }
 
     /// No merge in view, while jointed, while grabbed, before its time, or awake.
@@ -807,8 +858,7 @@ mod tests {
         let fullness = bevox_core::fullness::Fullness::build(&tree);
         let mut scene =
             VoxelScene { tree, materials, generation: 1, field, field_dirty: None,
- fullness,
- fullness_dirty: None, bodies: vec![] };
+                fullness, fullness_dirty: None, bodies: vec![] };
         // The demo column stands at x = 28..36, z = 28..36 from y = 6; cutting
         // its foot frees the whole thing.
         erase_and_detach(&mut scene, Vec3::new(32.0, 7.0, 32.0), 5.0);

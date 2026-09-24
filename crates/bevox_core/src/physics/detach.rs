@@ -489,7 +489,7 @@ mod tests {
     /// loose, disagrees with it.
     #[test]
     fn the_search_agrees_with_labelling_every_piece_in_full() {
-        let mut rng = crate::testing::XorShift64::new(0xde7a_c4);
+        let mut rng = crate::testing::XorShift64::new(0x00de_7ac4);
         for case in 0..600 {
             // Half the cases are loose voxels, where every cell of the walk is
             // one voxel; half are whole 4-blocks, which the tree keeps as

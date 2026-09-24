@@ -240,14 +240,14 @@ fn apply_restitution(
             if c.restitution <= 0.0 || base == 0.0 {
                 continue;
             }
-            let (a, mut b) = pair_mut(bodies, j.body, j.other);
+            let (a, b) = pair_mut(bodies, j.body, j.other);
             let vn = normal_velocity(a, b.as_deref(), c);
             let target = -c.restitution * approach;
             let k = effective_mass(a, b.as_deref(), c);
             let total = (impulse.normal + (target - vn) / k).max(base);
             let delta = total - impulse.normal;
             impulse.normal = total;
-            push(a, b.as_deref_mut(), c, c.normal * delta);
+            push(a, b, c, c.normal * delta);
         }
     }
 }

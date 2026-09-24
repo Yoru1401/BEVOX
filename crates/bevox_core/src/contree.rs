@@ -145,7 +145,7 @@ impl Contree {
     ///
     /// Where a coordinate repeats, the later entry wins.
     pub fn from_voxels(extent: u32, voxels: &[(UVec3, MaterialId)]) -> Self {
-        debug_assert!(extent.is_power_of_two() && extent.trailing_zeros() % 2 == 0);
+        debug_assert!(extent.is_power_of_two() && extent.trailing_zeros().is_multiple_of(2));
         let depth = extent.trailing_zeros() / 2;
         debug_assert!(depth >= 1);
         let mut tree = Self::empty(depth);

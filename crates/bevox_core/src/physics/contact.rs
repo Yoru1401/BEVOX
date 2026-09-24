@@ -536,7 +536,7 @@ mod tests {
     fn a_cube_resting_on_the_floor_touches_it_at_four_corners() {
         let world = slab(64, 0..8);
         let field = DistanceField::build(&world);
-        for angle in [0.0f32, 0.5236] {
+        for angle in [0.0f32, std::f32::consts::FRAC_PI_6] {
             let body = placed(cube(4, 4), Vec3::new(32.0, 10.0, 32.0), Quat::from_rotation_y(angle));
             let contacts = detect(&body, &world, &field, &materials(), 0.1);
             assert_eq!(contacts.len(), 4, "at {angle} rad: {contacts:#?}");

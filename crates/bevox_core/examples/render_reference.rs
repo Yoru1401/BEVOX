@@ -83,6 +83,7 @@ fn main() {
     println!("wrote reference.png");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn shade(
     tree: &Contree,
     table: &MaterialTable,

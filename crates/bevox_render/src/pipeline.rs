@@ -328,6 +328,7 @@ pub fn init_march_pipeline(
 }
 
 /// Uploads scene buffers and the per-frame uniform into the render world.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_march_buffers(
     mut commands: Commands,
     device: Res<RenderDevice>,

@@ -64,6 +64,14 @@ same session. 0 bodies +0.08 / +0.10 ms, 16 bodies -0.69 / -0.04 ms, drift
   (a stale field only under-estimates), but it does empty cubes, and AO left
   stale would darken what is now open. `erasing_stages_fullness_but_no_field_cells`
   holds both halves of that.
+- **Detachment and merging had to recount too, and did not at first.** The
+  brush recounted its own neighbourhood and nothing else, so a piece detaching
+  outside the brush radius -- the bridge that falls when its support goes --
+  left its old cubes counted full, and a merged body contributed no occlusion at
+  all. Both were permanent until a scene reload. The recount now lives in
+  `VoxelScene::world_changed`, which every path that edits the world calls, and
+  two gates in the app hold it: after a detachment and after a merge, the grid
+  must equal one built fresh from the world.
 - **The distance-field parity gate carries `AO` on both sides.** It compared
   `DEFAULT` against `NONE`; with AO in `DEFAULT` that would have been an AO
   comparison, not a skip comparison. The reference runs with `AO` now, which
@@ -77,3 +85,9 @@ same session. 0 bodies +0.08 / +0.10 ms, 16 bodies -0.69 / -0.04 ms, drift
 | A recount misses the edit's far edge | `a_recount_matches_a_fresh_build` |
 | Sampled at the hit point, not the voxel centre | `ambient_occlusion_matches_the_cpu`, 4155 pixels |
 | Nearest cell, not blended | `ambient_occlusion_matches_the_cpu`, 3894 pixels |
+| The freed pieces are not recounted | `erasing_a_support_spawns_a_body` |
+| The merged voxels are not recounted | `a_settled_body_out_of_view_merges_into_the_world` |
+| A second edit replaces the first's dirty range | `two_edits_before_one_upload_stage_both` |
+| The body's own frame is dropped | `ambient_occlusion_on_a_body_matches_the_cpu`, 766 pixels |
+| Sampled at the hit point (with a body) | same gate, 4163 pixels |
+| Nearest cell, not blended (with a body) | same gate, 4134 pixels |
