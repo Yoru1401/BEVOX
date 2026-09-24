@@ -10,8 +10,24 @@ the plan that carried one out; a plan's Measurements section holds the numbers
 the decision was made on, and its Breaks section the deliberate breaks each
 gate was proven with.
 
-Read a spec for what the engine is meant to be; read a plan for why one piece
-of it is the way it is, and what it cost.
+Read a spec for what the engine is meant to be, a concept for a fact worth
+carrying into the next piece of work, and a plan for why one piece of it is the
+way it is and what it cost.
+
+# Concepts
+
+Start here. Each one is a rule, a measured number, a decision or a post-mortem,
+lifted out of the plan that produced it.
+
+* [Concepts](concepts/) - what was learned building this, out of the plans that learned it.
+* [Every gate is proven by a deliberate break](concepts/deliberate-breaks.md) - a test that has never failed is not known to test anything.
+* [No safe stale direction](concepts/stale-direction.md) - the distance field may lag, fullness may not, so every editing path recounts it.
+* [The GPU codegen cliff](concepts/gpu-codegen-cliff.md) - code the shader never runs can still cost tens of percent; re-bench every march.wgsl edit.
+* [The body cap, and what a body costs](concepts/body-cap.md) - 0.265 ms per visible body, and why MAX_BODIES is 16.
+* [The frame budget, and where it goes](concepts/frame-budget.md) - sixteen bodies with shadows take 22.6 ms against 16.7.
+* [Both coarse grids ride in one storage buffer](concepts/coarse-grids-share-one-buffer.md) - wgpu's eight-storage-buffer limit, and what it forces.
+* [Only terrain debris merges back](concepts/terrain-only-merging.md) - what may return to the world, and why it must be out of view.
+* [Padding a joint block at its own scale](concepts/joint-block-conditioning.md) - identity padding against a 1e-5 block destroys the inverse in f32.
 
 # Design specs
 

@@ -1,6 +1,8 @@
 # Update Log
 
 ## 2026-09-24
+* **Creation**: eight [concepts](concepts/) — the rules, measured numbers,
+  decisions and post-mortems that were buried in the plans.
 * **Creation**: `docs/` became an OKF v0.2 knowledge bundle — every spec and plan
   carries frontmatter, and [the index](index.md) lists them.
 * **Update**: ambient occlusion, after Dwyer's fullness grid, and the two paths
