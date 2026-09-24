@@ -6,3 +6,7 @@
 # Obsidian keeps its UI state beside the notes; workspace.json changes on every
 # pane you move, and none of it describes the bundle.
 .obsidian/
+
+# Per-machine Claude Code permissions, not project configuration. A shared
+# .claude/settings.json would still be tracked.
+.claude/settings.local.json
