@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/bevox_core", "crates/bevox_render", "crates/bevox"]
+members = ["crates/bevox_core", "crates/bevox_physics", "crates/bevox_render", "crates/bevox"]
 
 [workspace.package]
 edition = "2024"

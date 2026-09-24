@@ -465,6 +465,7 @@ name = "bevox"
 version = "0.1.0"
 dependencies = [
  "bevox_core",
+ "bevox_physics",
  "bevox_render",
  "bevy",
 ]
@@ -477,6 +478,14 @@ dependencies = [
  "dot_vox",
  "glam",
  "image",
+]
+
+[[package]]
+name = "bevox_physics"
+version = "0.1.0"
+dependencies = [
+ "bevox_core",
+ "glam",
 ]
 
 [[package]]

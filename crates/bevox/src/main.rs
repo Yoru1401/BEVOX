@@ -3,14 +3,14 @@ mod scenes;
 use bevy::prelude::*;
 use bevox_core::distance_field::DistanceField;
 use bevox_core::material::MaterialId;
-use bevox_core::physics::merge::merge;
-use bevox_core::physics::sleep::wake_near;
-use bevox_core::physics::{Air, MERGE_AFTER, SLEEP_AFTER};
-use bevox_core::physics::detach::detach;
-use bevox_core::physics::fracture::{Fracture, cracks};
-use bevox_core::physics::joint::{Joint, follow};
-use bevox_core::physics::sculpt::{sculpt, split};
-use bevox_core::physics::solver::step;
+use bevox_physics::merge::merge;
+use bevox_physics::sleep::wake_near;
+use bevox_physics::{Air, MERGE_AFTER, SLEEP_AFTER};
+use bevox_physics::detach::detach;
+use bevox_physics::fracture::{Fracture, cracks};
+use bevox_physics::joint::{Joint, follow};
+use bevox_physics::sculpt::{sculpt, split};
+use bevox_physics::solver::step;
 use bevox_render::BevoxRenderPlugin;
 use bevox_render::camera::{FlyCamera, fly_camera_system};
 use bevox_render::cull::{Frustum, world_bound};
@@ -19,6 +19,7 @@ use bevox_render::pick::{Target, cursor_ray, pick};
 use bevox_render::pipeline::MAX_BODIES;
 use bevox_render::upload::{GpuBody, VoxelScene, apply_brush, build_gpu_scene, offset_from_clip};
 use scenes::{SceneKind, demo_body};
+use bevox_physics::mass::recompute;
 
 fn main() {
     App::new()
@@ -221,7 +222,7 @@ fn drop_body_input(
     let tilt = Quat::from_euler(EulerRot::XYZ, 0.4, 0.7, 0.2);
     let mut body =
         demo_body(transform.translation() + transform.forward().as_vec3() * 16.0, tilt);
-    if body.recompute(&scene.materials) {
+    if recompute(&mut body, &scene.materials) {
         scene.bodies.push(body);
         // A new body adds geometry to the packed buffers.
         scene.generation += 1;
@@ -549,7 +550,7 @@ fn apply_fractures(scene: &mut VoxelScene, fractures: &[Fracture]) -> bool {
         scene.tree.clear_voxels(&cut);
         // Clearing only raises true distances, so the field may lag. Fullness
         // may not: see `VoxelScene::world_changed`.
-        let reach = bevox_core::physics::fracture::reach_of(event.over) as i32;
+        let reach = bevox_physics::fracture::reach_of(event.over) as i32;
         scene.world_changed(at - reach, at + reach);
         changed = true;
 
@@ -752,7 +753,7 @@ mod tests {
         let field = DistanceField::build(&tree);
         let fullness = bevox_core::fullness::Fullness::build(&tree);
         let mut body = demo_body(Vec3::new(10.0, 40.0, 50.0), Quat::IDENTITY);
-        assert!(body.recompute(&materials));
+        assert!(recompute(&mut body, &materials));
         let voxels = body.volume.voxels().len();
         let world = tree.voxels().len();
         let mut scene = VoxelScene {
@@ -788,7 +789,7 @@ mod tests {
         keys.press(KeyCode::KeyG);
         world.insert_resource(keys);
         let mut body = demo_body(Vec3::ZERO, Quat::IDENTITY);
-        assert!(body.recompute(&demo_scene().1));
+        assert!(recompute(&mut body, &demo_scene().1));
         world.resource_mut::<GrabState>().held = Some(Joint::grab(&body, Vec3::ZERO));
         world.run_system(toggle).unwrap();
         let state = world.resource::<GrabState>();
@@ -807,7 +808,7 @@ mod tests {
         let field = DistanceField::build(&tree);
         let fullness = bevox_core::fullness::Fullness::build(&tree);
         let mut body = demo_body(Vec3::new(20.0, 40.0, 20.0), Quat::IDENTITY);
-        assert!(body.recompute(&materials));
+        assert!(recompute(&mut body, &materials));
         let mut grab = Joint::grab(&body, body.position);
         grab.anchor_b = body.position + Vec3::new(10.0, 0.0, 0.0);
         world.insert_resource(GrabState { enabled: true, held: Some(grab), distance: 10.0 });
@@ -911,7 +912,7 @@ mod tests {
         let field = DistanceField::build(&tree);
         let fullness = bevox_core::fullness::Fullness::build(&tree);
         let mut body = demo_body(centre, Quat::IDENTITY);
-        assert!(body.recompute(&materials));
+        assert!(recompute(&mut body, &materials));
         // As if detachment had cut it out of the terrain.
         body.from_terrain = true;
         body.asleep = true;
@@ -957,8 +958,8 @@ mod tests {
         let mut scene = settled_scene(ALOFT);
         let pin = scene.bodies[0].position;
         let joint = Joint::new(
-            &scene.bodies[0], None, bevox_core::physics::joint::Linear::Point,
-            bevox_core::physics::joint::Angular::Free, pin, pin, Vec3::Y,
+            &scene.bodies[0], None, bevox_physics::joint::Linear::Point,
+            bevox_physics::joint::Angular::Free, pin, pin, Vec3::Y,
         );
         assert_eq!(merge_settled(&mut scene, &[joint], None, &away), 0, "a jointed body merged");
 
@@ -1094,9 +1095,9 @@ mod tests {
         let field = DistanceField::build(&tree);
         let fullness = bevox_core::fullness::Fullness::build(&tree);
         let mut falling = demo_body(Vec3::new(20.0, 40.0, 20.0), Quat::IDENTITY);
-        assert!(falling.recompute(&materials));
+        assert!(recompute(&mut falling, &materials));
         let mut gone = demo_body(Vec3::new(20.0, -100.0, 20.0), Quat::IDENTITY);
-        assert!(gone.recompute(&materials));
+        assert!(recompute(&mut gone, &materials));
         world.insert_resource(VoxelScene {
             tree,
             materials,

@@ -15,7 +15,7 @@
 use super::contact::{boxes_overlap, world_box};
 use super::joint::Joint;
 use super::{BASE_MARGIN, SLEEP_AFTER, SLEEP_SPEED};
-use crate::body::{Body, BodyId};
+use bevox_core::body::{Body, BodyId};
 use glam::Vec3;
 
 /// Wakes every sleeper that something awake could move, until nothing
@@ -167,13 +167,13 @@ pub fn wake_near(bodies: &mut [Body], lo: Vec3, hi: Vec3) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::physics::Air;
-    use crate::contree::Contree;
-    use crate::distance_field::DistanceField;
-    use crate::material::{MaterialId, MaterialTable};
-    use crate::physics::fixtures::{cube, materials, placed, slab, slab_of};
-    use crate::physics::joint::{Angular, Linear};
-    use crate::physics::solver::step;
+    use crate::Air;
+    use bevox_core::contree::Contree;
+    use bevox_core::distance_field::DistanceField;
+    use bevox_core::material::{MaterialId, MaterialTable};
+    use crate::fixtures::{cube, materials, placed, slab, slab_of};
+    use crate::joint::{Angular, Linear};
+    use crate::solver::step;
     use glam::Quat;
 
     const DT: f32 = 1.0 / 64.0;

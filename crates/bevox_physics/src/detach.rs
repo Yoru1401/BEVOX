@@ -6,13 +6,14 @@
 //! solid terrain rather than one voxel, and gives up past a budget.
 
 use super::BUDGET;
-use crate::body::Body;
-use crate::contree::{Contree, level_extent};
-use crate::material::{MaterialId, MaterialTable};
-use crate::node::child_index;
-use crate::physics::classify::solid_at;
+use bevox_core::body::Body;
+use bevox_core::contree::{Contree, level_extent};
+use bevox_core::material::{MaterialId, MaterialTable};
+use bevox_core::node::child_index;
+use crate::classify::solid_at;
 use glam::{IVec3, Quat, UVec3};
 use std::collections::HashMap;
+use crate::mass::recompute;
 
 /// Face neighbours. Down is last, so it is popped first: the walk dives for the
 /// floor, and most cuts are into ground that reaches it within a few steps.
@@ -291,14 +292,14 @@ fn body_from(voxels: &[(UVec3, MaterialId)], materials: &MaterialTable) -> Optio
     }
     let local: Vec<_> = voxels.iter().map(|(p, m)| (*p - lo, *m)).collect();
     let mut body = Body::new(Contree::from_voxels(extent, &local), lo.as_vec3(), Quat::IDENTITY);
-    body.recompute(materials).then_some(body)
+    recompute(&mut body, materials).then_some(body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::material::MaterialId;
-    use crate::physics::BUDGET;
+    use bevox_core::material::MaterialId;
+    use crate::BUDGET;
 
     /// A floor with a column on it. Cutting the column's base leaves the rest of
     /// the column reaching nothing: that is the piece that falls.
@@ -319,7 +320,7 @@ mod tests {
     /// body may merge back into it.
     #[test]
     fn a_freed_piece_knows_it_came_from_the_terrain() {
-        let materials = crate::physics::fixtures::materials();
+        let materials = crate::fixtures::materials();
         let mut tree = floor_and_column();
         tree.clear_voxels(&[UVec3::new(8, 1, 8), UVec3::new(8, 2, 8)]);
         let freed = detach(&mut tree, &materials, IVec3::new(7, 0, 7), IVec3::new(9, 3, 9), 16);
@@ -416,7 +417,7 @@ mod tests {
     /// in the same places and its mass computed.
     #[test]
     fn a_freed_piece_becomes_a_body_where_it_stood() {
-        let materials = crate::physics::fixtures::materials();
+        let materials = crate::fixtures::materials();
         let mut tree = floor_and_column();
         tree.clear_voxels(&[UVec3::new(8, 1, 8), UVec3::new(8, 2, 8)]);
         let bodies = detach(&mut tree, &materials, IVec3::new(7, 0, 7), IVec3::new(9, 3, 9), 16);
@@ -447,7 +448,7 @@ mod tests {
     /// that cannot be drawn must not disappear.
     #[test]
     fn a_piece_stays_in_the_world_when_there_is_no_room() {
-        let materials = crate::physics::fixtures::materials();
+        let materials = crate::fixtures::materials();
         let mut tree = floor_and_column();
         tree.clear_voxels(&[UVec3::new(8, 1, 8), UVec3::new(8, 2, 8)]);
         let bodies = detach(&mut tree, &materials, IVec3::new(7, 0, 7), IVec3::new(9, 3, 9), 0);
@@ -472,7 +473,7 @@ mod tests {
         }
         let mut tree = Contree::from_voxels(16, &voxels);
         tree.clear_voxels(&[UVec3::new(4, 1, 4), UVec3::new(12, 1, 12)]);
-        let materials = crate::physics::fixtures::materials();
+        let materials = crate::fixtures::materials();
         let bodies = detach(&mut tree, &materials, IVec3::new(3, 0, 3), IVec3::new(13, 2, 13), 1);
         assert_eq!(bodies.len(), 1);
         assert_eq!(bodies[0].volume.voxels().len(), 6, "the shorter column was taken instead");
@@ -489,7 +490,7 @@ mod tests {
     /// loose, disagrees with it.
     #[test]
     fn the_search_agrees_with_labelling_every_piece_in_full() {
-        let mut rng = crate::testing::XorShift64::new(0x00de_7ac4);
+        let mut rng = bevox_core::testing::XorShift64::new(0x00de_7ac4);
         for case in 0..600 {
             // Half the cases are loose voxels, where every cell of the walk is
             // one voxel; half are whole 4-blocks, which the tree keeps as
@@ -693,7 +694,7 @@ mod tests {
     #[test]
     #[ignore]
     fn a_detach_is_timed() {
-        let materials = crate::physics::fixtures::materials();
+        let materials = crate::fixtures::materials();
         let median = |mut v: Vec<f64>| {
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
             v[v.len() / 2]

@@ -6,35 +6,18 @@
 //! the ownership rules are this design's own; see the spec's Provenance section.
 
 use super::classify::{Shape, classify, solid_at};
-use crate::body::{Body, BodyId, occupied_bounds};
-use crate::contree::Contree;
-use crate::distance_field::{CELL_VOXELS, DistanceField};
-use crate::material::{MaterialTable, combine_friction, combine_restitution};
+use bevox_core::body::{Body, BodyId, occupied_bounds};
+use bevox_core::contree::Contree;
+use bevox_core::distance_field::{CELL_VOXELS, DistanceField};
+use bevox_core::material::{MaterialTable, combine_friction, combine_restitution};
 use glam::{IVec3, UVec3, Vec3};
 use std::collections::HashMap;
+pub use bevox_core::body::ContactKey;
 
 /// The rounding radius of a voxel's corners and edges.
 pub const RADIUS: f32 = 0.5;
 
 const AXES: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
-
-/// Which voxel of which body touched which voxel of what.
-///
-/// Stable from tick to tick while the touch persists, which is what warm
-/// starting keys on. `other` names the world or the body on the far side, so an
-/// impulse cannot be carried over to a different neighbour.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct ContactKey {
-    /// The world, or the other body.
-    pub other: BodyId,
-    /// The voxel of the body this contact belongs to. Plain coordinates
-    /// rather than a `UVec3`, which is not ordered, and the solver sorts its
-    /// contacts so that a tick is reproducible.
-    pub mine: [u32; 3],
-    /// The voxel of `other`. Against the world, its world-space coordinate,
-    /// which is never negative where a contact can be.
-    pub theirs: [u32; 3],
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Contact {
@@ -472,8 +455,8 @@ fn keep_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::material::MaterialId;
-    use crate::physics::fixtures::{cube, cube_of, materials, placed, slab};
+    use bevox_core::material::MaterialId;
+    use crate::fixtures::{cube, cube_of, materials, placed, slab};
     use glam::Quat;
 
     const TOLERANCE: f32 = 1e-4;

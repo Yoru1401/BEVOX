@@ -5,11 +5,12 @@ use bevox_core::body::Body;
 use bevox_core::contree::Contree;
 use bevox_core::dense::DenseVolume;
 use bevox_core::material::{Material, MaterialId, MaterialTable};
-use bevox_core::physics::GRAVITY;
-use bevox_core::physics::joint::{Angular, Drive, Friction, Joint, Linear, Motor};
+use bevox_physics::GRAVITY;
+use bevox_physics::joint::{Angular, Drive, Friction, Joint, Linear, Motor};
 use bevox_render::camera::start_camera;
 use bevy::prelude::*;
 use std::f32::consts::{FRAC_PI_4, FRAC_PI_6};
+use bevox_physics::mass::recompute;
 
 /// Which scene is loaded.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -61,7 +62,7 @@ pub(crate) fn with_falling_body(tree: Contree, materials: MaterialTable) -> Scen
     let forward = (look_at - eye).normalize();
     let right = forward.cross(Vec3::Y).normalize_or_zero();
     let mut body = demo_body(eye + forward * 14.0 + right * 6.0, Quat::IDENTITY);
-    body.recompute(&materials);
+    recompute(&mut body, &materials);
     Scene { tree, materials, bodies: vec![body], joints: vec![], eye, look_at }
 }
 
@@ -317,17 +318,17 @@ fn brick(size: UVec3, corner: Vec3, materials: &MaterialTable) -> Body {
         }
     }
     let mut body = Body::new(Contree::from_voxels(16, &voxels), corner, Quat::IDENTITY);
-    assert!(body.recompute(materials), "a scene body must have mass");
+    assert!(recompute(&mut body, materials), "a scene body must have mass");
     body
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevox_core::physics::Air;
+    use bevox_physics::Air;
     use bevox_core::distance_field::DistanceField;
-    use bevox_core::physics::joint::follow;
-    use bevox_core::physics::solver::step;
+    use bevox_physics::joint::follow;
+    use bevox_physics::solver::step;
     use std::f32::consts::{PI, TAU};
 
     /// Every station of the joint scene does its job, headless, for ten

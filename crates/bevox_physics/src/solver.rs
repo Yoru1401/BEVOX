@@ -18,20 +18,13 @@ use super::sleep;
 use super::{
     Air, BASE_MARGIN, BIAS, MAX_PUSH, MAX_TRAVEL, RESTITUTION_SWEEPS, ROLLING, SLOP, SUBSTEPS,
 };
-use crate::body::{Body, BodyId, occupied_bounds};
-use crate::contree::Contree;
-use crate::distance_field::DistanceField;
-use crate::material::MaterialTable;
+use bevox_core::body::{Body, BodyId, occupied_bounds};
+use bevox_core::contree::Contree;
+use bevox_core::distance_field::DistanceField;
+use bevox_core::material::MaterialTable;
 use glam::{Mat3, Quat, UVec3, Vec2, Vec3};
 use std::collections::{HashMap, HashSet};
-
-/// What a contact carried last tick, for warm starting.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ContactImpulse {
-    pub normal: f32,
-    /// Along the contact's two tangents, in their order.
-    pub tangent: Vec2,
-}
+pub use bevox_core::body::ContactImpulse;
 
 /// What a tick produced besides new positions.
 #[derive(Clone, Debug, Default)]
@@ -574,11 +567,12 @@ fn integrate(body: &mut Body, h: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::material::MaterialId;
-    use crate::physics::GRAVITY;
-    use crate::physics::TERMINAL_SPEED;
-    use crate::physics::fixtures::{cube, cube_of, energy, materials, placed, slab, slab_of};
-    use crate::physics::joint::{Angular, Joint, Linear};
+    use bevox_core::material::MaterialId;
+    use crate::GRAVITY;
+    use crate::TERMINAL_SPEED;
+    use crate::mass::recompute;
+    use crate::fixtures::{cube, cube_of, energy, materials, placed, slab, slab_of};
+    use crate::joint::{Angular, Joint, Linear};
     use glam::EulerRot;
 
     const DT: f32 = 1.0 / 64.0;
@@ -673,7 +667,7 @@ mod tests {
 
         // Cut the column's base.
         world.clear_voxels(&[glam::UVec3::new(32, 8, 32), glam::UVec3::new(32, 9, 32)]);
-        let mut bodies = crate::physics::detach::detach(
+        let mut bodies = crate::detach::detach(
             &mut world,
             &materials,
             glam::IVec3::new(31, 7, 31),
@@ -926,7 +920,7 @@ mod tests {
         // does through `wake_near`.
         let (lo, hi) = world_box(&bodies[0], 1.0).unwrap();
         bodies.remove(0);
-        crate::physics::sleep::wake_near(&mut bodies, lo, hi);
+        crate::sleep::wake_near(&mut bodies, lo, hi);
         run(&mut bodies, &world, &field, &materials, GRAVITY, 10);
         assert!(
             bodies[0].velocity.y < -1.0,
@@ -1183,7 +1177,7 @@ mod tests {
         world.apply_sphere(Vec3::new(32.0, 6.0, 32.0), 6.0, MaterialId::EMPTY);
         // At rest this long the body sleeps, and a sleeper is woken by an edit
         // only through `wake_near`, as the app's edits call it.
-        crate::physics::sleep::wake_near(&mut bodies, Vec3::new(25.0, -1.0, 25.0), Vec3::new(39.0, 13.0, 39.0));
+        crate::sleep::wake_near(&mut bodies, Vec3::new(25.0, -1.0, 25.0), Vec3::new(39.0, 13.0, 39.0));
         step(&mut bodies, &world, &field, &materials(), Air::VACUUM, DT, None, &mut []);
         assert!(bodies[0].velocity.y < -1.0, "still held up: {:?}", bodies[0].velocity);
     }
@@ -1235,7 +1229,7 @@ mod tests {
                 .map(|i| {
                     let (x, z) = ((i % 4) as f32 * 6.0 + 20.0, (i / 4) as f32 * 6.0 + 20.0);
                     let mut b = placed(cube(4, 4), Vec3::new(x, 10.0, z), Quat::IDENTITY);
-                    b.recompute(&holds);
+                    recompute(&mut b, &holds);
                     b
                 })
                 .collect::<Vec<_>>()
@@ -1308,7 +1302,7 @@ mod tests {
 
         let roll = |floor: &Contree, volume: Contree, seconds: f32| {
             let mut body = placed(volume, Vec3::new(32.0, 9.0, 32.0), Quat::IDENTITY);
-            assert!(body.recompute(&materials));
+            assert!(recompute(&mut body, &materials));
             body.velocity = Vec3::new(4.0, 0.0, 0.0);
             let mut bodies = vec![body];
             for _ in 0..(seconds / DT) as usize {
@@ -1323,7 +1317,7 @@ mod tests {
         assert!(asleep, "a one-wide tower was still awake after five seconds, moving at {speed}");
 
         let mut body = placed(cube_of(1, 4, MaterialId(1)), Vec3::new(32.0, 8.5, 32.0), Quat::IDENTITY);
-        assert!(body.recompute(&materials));
+        assert!(recompute(&mut body, &materials));
         let spun = 6.0;
         body.angular_momentum = (world_inverse_inertia(&body).inverse()) * Vec3::new(0.0, spun, 0.0);
         let mut bodies = vec![body];
@@ -1352,7 +1346,7 @@ mod tests {
         let field = DistanceField::build(&world);
         let materials = materials();
         let mut body = placed(cube(4, 4), Vec3::new(32.0, 4000.0, 32.0), Quat::IDENTITY);
-        assert!(body.recompute(&materials));
+        assert!(recompute(&mut body, &materials));
         let mut bodies = vec![body];
 
         let (mut speeds, mut fastest_gain) = (Vec::new(), 0.0f32);
@@ -1412,7 +1406,7 @@ mod tests {
         // and bleeds the approach speed away over two ticks, which halves the
         // blow and is a property of the detector rather than of fracture.
         let mut body = placed(cube_of(4, 4, material), Vec3::new(32.0, 11.0, 32.0), Quat::IDENTITY);
-        assert!(body.recompute(&materials));
+        assert!(recompute(&mut body, &materials));
         body.velocity = Vec3::new(0.0, -speed, 0.0);
         let mut bodies = vec![body];
         let mut fractures = Vec::new();

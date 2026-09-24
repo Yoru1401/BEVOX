@@ -1,0 +1,9 @@
+[package]
+name = "bevox_physics"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bevox_core = { path = "../bevox_core" }
+glam = "0.32"

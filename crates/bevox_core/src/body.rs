@@ -7,12 +7,7 @@
 
 use crate::contree::Contree;
 use crate::march::{Hit, MarchStats, march};
-use crate::material::MaterialTable;
-use crate::physics::classify::{Features, features};
-use crate::physics::contact::ContactKey;
-use crate::physics::solver::ContactImpulse;
-use crate::physics::mass::{MassProperties, mass_properties};
-use glam::{Affine3A, IVec3, Quat, UVec3, Vec3};
+use glam::{Affine3A, IVec3, Mat3, Quat, UVec3, Vec2, Vec3};
 use std::collections::HashMap;
 
 /// Which body a contact is against. The static world is `WORLD`.
@@ -32,6 +27,68 @@ fn next_id() -> BodyId {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     BodyId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+// The shapes a `Body` carries. They live here rather than in the physics
+// crate because the renderer marches bodies and must not depend on the
+// simulation to do it. What *computes* them is in `bevox_physics`; what
+// they are is here.
+
+/// How heavy a body is and how it resists turning. The centre of mass it is
+/// measured about lives on `Body`, because it also places the body.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MassProperties {
+    pub mass: f32,
+    /// Inverse inertia tensor about the centre of mass, in the body's own axes.
+    pub inverse_inertia: Mat3,
+}
+
+impl Default for MassProperties {
+    /// No mass: a body that is not simulated.
+    fn default() -> Self {
+        Self { mass: 0.0, inverse_inertia: Mat3::ZERO }
+    }
+}
+
+impl MassProperties {
+    /// Zero for a body with no mass.
+    pub fn inverse_mass(&self) -> f32 {
+        if self.mass > 0.0 { 1.0 / self.mass } else { 0.0 }
+    }
+}
+
+/// A body's corner and edge voxels, the only ones tested against the world.
+#[derive(Clone, Debug, Default)]
+pub struct Features {
+    pub corners: Vec<UVec3>,
+    /// With the axis each edge runs along.
+    pub edges: Vec<(UVec3, usize)>,
+}
+
+/// Which voxel of which body touched which voxel of what.
+///
+/// Stable from tick to tick while the touch persists, which is what warm
+/// starting keys on. `other` names the world or the body on the far side, so an
+/// impulse cannot be carried over to a different neighbour.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ContactKey {
+    /// The world, or the other body.
+    pub other: BodyId,
+    /// The voxel of the body this contact belongs to. Plain coordinates
+    /// rather than a `UVec3`, which is not ordered, and the solver sorts its
+    /// contacts so that a tick is reproducible.
+    pub mine: [u32; 3],
+    /// The voxel of `other`. Against the world, its world-space coordinate,
+    /// which is never negative where a contact can be.
+    pub theirs: [u32; 3],
+}
+
+/// What a contact carried last tick, for warm starting.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ContactImpulse {
+    pub normal: f32,
+    /// Along the contact's two tangents, in their order.
+    pub tangent: Vec2,
 }
 
 /// A voxel volume placed in the world by a rigid transform, and the state that
@@ -166,13 +223,13 @@ impl Body {
     }
 
     /// The inverse inertia tensor in world axes.
-    pub(crate) fn world_inverse_inertia(&self) -> glam::Mat3 {
+    pub fn world_inverse_inertia(&self) -> glam::Mat3 {
         let r = glam::Mat3::from_quat(self.orientation);
         r * self.mass.inverse_inertia * r.transpose()
     }
 
     /// How fast a point fixed to the body, `r` from its centre of mass, moves.
-    pub(crate) fn point_velocity(&self, r: Vec3) -> Vec3 {
+    pub fn point_velocity(&self, r: Vec3) -> Vec3 {
         self.velocity + self.angular_velocity().cross(r)
     }
 
@@ -186,26 +243,6 @@ impl Body {
         self.angular_momentum = self.world_inverse_inertia().inverse() * omega;
     }
 
-    /// Recomputes mass properties after the volume changed, or for the first
-    /// time. The pivot moves to the new centre of mass and `position` moves
-    /// with it, so every voxel stays where it was in the world.
-    ///
-    /// Returns `false`, and leaves the body massless, when nothing in the
-    /// volume weighs anything: such a body should be removed.
-    pub fn recompute(&mut self, materials: &MaterialTable) -> bool {
-        self.warm.clear();
-        let voxels = self.volume.voxels();
-        let Some((mass, com)) = mass_properties(&voxels, materials) else {
-            self.mass = MassProperties::default();
-            self.features = Features::default();
-            return false;
-        };
-        self.position += self.orientation * (com - self.com);
-        self.com = com;
-        self.mass = mass;
-        self.features = features(&self.volume, &voxels);
-        true
-    }
 }
 
 /// The tightest box holding a volume's geometry, in its own voxel coordinates:
@@ -275,57 +312,7 @@ mod tests {
         dense.into_contree()
     }
 
-    /// Recomputing moves the pivot, never the voxels. Milestone 4's brush edits
-    /// recompute a body in mid-air and must not make it jump.
-    #[test]
-    fn recompute_keeps_every_voxel_where_it_was() {
-        let materials = crate::physics::fixtures::materials();
-        // An L, so the centre of mass is nowhere near the volume's corner or
-        // its middle.
-        let mut voxels = Vec::new();
-        for x in 0..8 {
-            voxels.push((UVec3::new(x, 0, 0), MaterialId(1)));
-        }
-        for y in 1..6 {
-            voxels.push((UVec3::new(0, y, 0), MaterialId(2)));
-        }
-        let orientation = Quat::from_euler(glam::EulerRot::XYZ, 0.4, -1.1, 0.7);
-        let mut body =
-            Body::new(Contree::from_voxels(16, &voxels), Vec3::new(5.0, -3.0, 9.0), orientation);
 
-        let world = |b: &Body, list: &[(UVec3, MaterialId)]| -> Vec<Vec3> {
-            list.iter()
-                .map(|(p, _)| b.world_from_local().transform_point3(p.as_vec3() + 0.5))
-                .collect()
-        };
-        let before = world(&body, &voxels);
-        assert!(body.recompute(&materials));
-        assert_ne!(body.com, Vec3::ZERO, "the pivot did not move, so this proves nothing");
-        for (a, b) in before.iter().zip(world(&body, &voxels)) {
-            assert!((*a - b).length() < 1e-4, "recompute moved a voxel from {a:?} to {b:?}");
-        }
-
-        // Erase the upright of the L. The pivot moves again; the rest stays put.
-        let base: Vec<_> = voxels.iter().copied().filter(|(p, _)| p.y == 0).collect();
-        let before = world(&body, &base);
-        let com = body.com;
-        body.volume = Contree::from_voxels(16, &base);
-        assert!(body.recompute(&materials));
-        assert_ne!(body.com, com, "the edit did not move the pivot, so this proves nothing");
-        for (a, b) in before.iter().zip(world(&body, &base)) {
-            assert!((*a - b).length() < 1e-4, "an edit moved a voxel from {a:?} to {b:?}");
-        }
-    }
-
-    #[test]
-    fn recompute_classifies_the_voxels() {
-        let mut body =
-            Body::new(crate::physics::fixtures::cube(4, 4), Vec3::ZERO, Quat::IDENTITY);
-        assert!(body.features.corners.is_empty());
-        assert!(body.recompute(&crate::physics::fixtures::materials()));
-        assert_eq!(body.features.corners.len(), 8);
-        assert_eq!(body.features.edges.len(), 24);
-    }
 
     /// Two bodies are never the same body, and a clone is the same body: the
     /// warm-start cache keys on this.
@@ -338,47 +325,8 @@ mod tests {
         assert_ne!(a.id, BodyId::WORLD, "the world's id is reserved");
     }
 
-    /// Spin set is spin read back, for a body turned any way: the world inertia
-    /// turns with it.
-    #[test]
-    fn angular_velocity_round_trips() {
-        let mut voxels = Vec::new();
-        for x in 0..6 {
-            voxels.push((UVec3::new(x, 0, 0), MaterialId(1)));
-        }
-        voxels.push((UVec3::new(0, 1, 0), MaterialId(2)));
-        let materials = crate::physics::fixtures::materials();
-        let mut body = Body::new(
-            Contree::from_voxels(16, &voxels),
-            Vec3::ZERO,
-            Quat::from_euler(glam::EulerRot::XYZ, 0.4, 1.2, -0.3),
-        );
-        assert!(body.recompute(&materials));
-        let omega = Vec3::new(0.7, -1.1, 0.4);
-        body.set_angular_velocity(omega);
-        let back = body.angular_velocity();
-        assert!((back - omega).length() < 1e-4, "{back:?}");
-    }
 
-    #[test]
-    fn a_body_with_no_voxels_does_not_recompute() {
-        let mut body = Body::new(Contree::empty(2), Vec3::ZERO, Quat::IDENTITY);
-        assert!(!body.recompute(&crate::physics::fixtures::materials()));
-        assert_eq!(body.mass.mass, 0.0);
-    }
 
-    /// Every render test builds bodies with `new` and never recomputes them.
-    /// Their placement must be the exact matrix it was before bodies had mass.
-    #[test]
-    fn a_body_never_recomputed_is_placed_exactly_as_before() {
-        let orientation = Quat::from_euler(glam::EulerRot::XYZ, 0.3, 0.9, -0.4);
-        let position = Vec3::new(12.5, -4.0, 30.0);
-        let body = Body::new(cube(), position, orientation);
-        assert_eq!(
-            body.world_from_local(),
-            Affine3A::from_rotation_translation(orientation, position)
-        );
-    }
 
     /// An untransformed body is marched exactly as the bare volume is, or the
     /// composition would perturb a scene that has not moved.
@@ -475,24 +423,6 @@ mod tests {
         );
     }
 
-    /// The two transforms must actually invert each other, or every conversion
-    /// in the renderer is subtly wrong in a way that looks like a physics bug.
-    #[test]
-    fn the_frames_are_inverses() {
-        let body = Body::new(
-            cube(),
-            Vec3::new(5.0, -3.0, 11.0),
-            Quat::from_euler(glam::EulerRot::XYZ, 0.3, -0.7, 1.1),
-        );
-        let p = Vec3::new(17.0, 4.0, -9.0);
-        let round_trip = body.world_from_local().transform_point3(
-            body.local_from_world().transform_point3(p),
-        );
-        assert!(
-            (round_trip - p).length() < 1e-3,
-            "a point round-tripped through both frames landed at {round_trip:?}, not {p:?}"
-        );
-    }
 
     /// Rotation must not rescale the ray, or `t` stops meaning the same thing
     /// in both frames and the renderer's nearest-hit comparison silently

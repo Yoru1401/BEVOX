@@ -69,6 +69,19 @@ impl Plugin for BevoxRenderPlugin {
 mod tests {
     use super::*;
 
+    /// The renderer marches bodies; it must never need the simulation to do
+    /// it. `Body` and the state it carries live in `bevox_core` for exactly
+    /// this reason, and a stray `use bevox_physics::...` here would undo it
+    /// silently -- the code would build and the layering would be gone.
+    #[test]
+    fn the_renderer_does_not_depend_on_the_physics_crate() {
+        let manifest = std::fs::read_to_string("Cargo.toml").expect("the crate's own manifest");
+        assert!(
+            !manifest.contains("bevox_physics"),
+            "bevox_render's manifest names bevox_physics; the renderer has taken a dependency              on the simulation"
+        );
+    }
+
     #[test]
     fn the_plugin_builds_on_a_minimal_app() {
         let mut app = App::new();

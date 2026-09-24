@@ -8,10 +8,11 @@
 //! than like new bodies appeared.
 
 use super::detach::components;
-use crate::body::Body;
-use crate::contree::Contree;
-use crate::material::{MaterialId, MaterialTable};
+use bevox_core::body::Body;
+use bevox_core::contree::Contree;
+use bevox_core::material::{MaterialId, MaterialTable};
 use glam::{UVec3, Vec3};
+use crate::mass::recompute;
 
 /// Paints or erases a sphere, given in world space, on `bodies[index]`.
 ///
@@ -64,7 +65,7 @@ pub fn split(bodies: &mut Vec<Body>, index: usize, materials: &MaterialTable, ma
     let would_have = bodies.len() - 1 + pieces.len();
     if pieces.len() == 1 || would_have > max_bodies {
         let body = &mut bodies[index];
-        body.recompute(materials);
+        recompute(body, materials);
         carry_motion(body, com, velocity, spin);
         return;
     }
@@ -81,7 +82,7 @@ pub fn split(bodies: &mut Vec<Body>, index: usize, materials: &MaterialTable, ma
         // A piece of terrain cut in two is still terrain, and a piece of a
         // spawned body is not.
         body.from_terrain = parent.from_terrain;
-        if body.recompute(materials) {
+        if recompute(&mut body, materials) {
             carry_motion(&mut body, com, velocity, spin);
             split_off.push(body);
         }
@@ -90,7 +91,7 @@ pub fn split(bodies: &mut Vec<Body>, index: usize, materials: &MaterialTable, ma
     let body = &mut bodies[index];
     let others: Vec<UVec3> = pieces[1..].iter().flatten().copied().collect();
     body.volume.clear_voxels(&others);
-    body.recompute(materials);
+    recompute(body, materials);
     carry_motion(body, com, velocity, spin);
     bodies.extend(split_off);
 }
@@ -106,7 +107,7 @@ fn paint(body: &mut Body, centre: Vec3, radius: f32, material: MaterialId, mater
     // Growing moved the grid under the body, so the centre is carried again.
     let local = body.local_from_world().transform_point3(centre);
     body.volume.apply_sphere(local, radius, material);
-    body.recompute(materials);
+    recompute(body, materials);
 }
 
 /// Gives a piece the motion its centre of mass had as a point of the parent,
@@ -119,7 +120,7 @@ fn carry_motion(body: &mut Body, com: Vec3, velocity: Vec3, spin: Vec3) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::physics::fixtures::{cube, materials, placed};
+    use crate::fixtures::{cube, materials, placed};
     use glam::{EulerRot, Quat};
 
     fn world_voxels(body: &Body) -> Vec<[i32; 3]> {

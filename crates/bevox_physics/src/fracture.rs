@@ -13,7 +13,7 @@
 //! and 60 frames a second, which is a physics bug that looks like a gameplay
 //! feature. `the_same_collision_breaks_at_any_tick_rate` holds that.
 
-use crate::body::BodyId;
+use bevox_core::body::BodyId;
 use glam::{IVec3, UVec3, Vec3};
 
 /// A contact that carried more than its material could take.
@@ -50,7 +50,7 @@ pub const REBOUND: f32 = 0.6;
 ///
 /// `None` for a material that holds, and for `UNBREAKABLE` whatever the blow.
 pub fn over_strength(blow: f32, strength: u16) -> Option<f32> {
-    if strength == crate::material::UNBREAKABLE || blow <= strength as f32 {
+    if strength == bevox_core::material::UNBREAKABLE || blow <= strength as f32 {
         return None;
     }
     Some(blow / strength as f32)
@@ -136,9 +136,9 @@ impl Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contree::Contree;
-    use crate::material::{MaterialId, UNBREAKABLE};
-    use crate::physics::detach::loose_pieces;
+    use bevox_core::contree::Contree;
+    use bevox_core::material::{MaterialId, UNBREAKABLE};
+    use crate::detach::loose_pieces;
 
     /// A cube of solid voxels, which the cracks are cut into.
     fn block(extent: u32) -> Contree {

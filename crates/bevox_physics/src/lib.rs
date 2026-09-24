@@ -1,4 +1,4 @@
-//! Rigid-body physics for voxel bodies, after Douglas Dwyer's engine: voxels
+//! Rigid-body physics for BEVOX for voxel bodies, after Douglas Dwyer's engine: voxels
 //! classified as corners, edges and faces; rounded-voxel contacts; a temporal
 //! Gauss-Seidel solver.
 //!
@@ -157,9 +157,10 @@ pub const BASE_MARGIN: f32 = 0.1;
 // on which physics modules a build compiles.
 #[allow(dead_code)]
 pub(crate) mod fixtures {
-    use crate::body::Body;
-    use crate::contree::Contree;
-    use crate::material::{Material, MaterialId, MaterialTable};
+    use crate::mass::recompute;
+    use bevox_core::body::Body;
+    use bevox_core::contree::Contree;
+    use bevox_core::material::{Material, MaterialId, MaterialTable};
     use glam::{Quat, UVec3, Vec3};
 
     /// Material 1 weighs 1000 and grips; 2 weighs 3000 and grips; 3 is
@@ -173,7 +174,7 @@ pub(crate) mod fixtures {
                 density: 1000,
                 friction: 60,
                 restitution: 0,
-                strength: crate::material::DEFAULT_STRENGTH,
+                strength: bevox_core::material::DEFAULT_STRENGTH,
             })
             .unwrap();
         table
@@ -182,7 +183,7 @@ pub(crate) mod fixtures {
                 density: 3000,
                 friction: 60,
                 restitution: 0,
-                strength: crate::material::DEFAULT_STRENGTH,
+                strength: bevox_core::material::DEFAULT_STRENGTH,
             })
             .unwrap();
         table
@@ -191,7 +192,7 @@ pub(crate) mod fixtures {
                 density: 1000,
                 friction: 0,
                 restitution: 0,
-                strength: crate::material::DEFAULT_STRENGTH,
+                strength: bevox_core::material::DEFAULT_STRENGTH,
             })
             .unwrap();
         table
@@ -200,7 +201,7 @@ pub(crate) mod fixtures {
                 density: 1000,
                 friction: 60,
                 restitution: 80,
-                strength: crate::material::DEFAULT_STRENGTH,
+                strength: bevox_core::material::DEFAULT_STRENGTH,
             })
             .unwrap();
         table
@@ -209,7 +210,7 @@ pub(crate) mod fixtures {
                 density: 1000,
                 friction: 60,
                 restitution: 99,
-                strength: crate::material::DEFAULT_STRENGTH,
+                strength: bevox_core::material::DEFAULT_STRENGTH,
             })
             .unwrap();
         // 6: glass. Breaks at a speed a body reaches falling a voxel or two.
@@ -230,7 +231,7 @@ pub(crate) mod fixtures {
                 density: 1000,
                 friction: 60,
                 restitution: 0,
-                strength: crate::material::UNBREAKABLE,
+                strength: bevox_core::material::UNBREAKABLE,
             })
             .unwrap();
         table
@@ -279,7 +280,7 @@ pub(crate) mod fixtures {
             .map(|b| {
                 0.5 * b.mass.mass * b.velocity.length_squared()
                     + 0.5 * b.angular_velocity().dot(b.angular_momentum)
-                    + b.mass.mass * -crate::physics::GRAVITY.y * b.position.y
+                    + b.mass.mass * -crate::GRAVITY.y * b.position.y
             })
             .sum()
     }
@@ -288,7 +289,7 @@ pub(crate) mod fixtures {
     /// `centre` in the world.
     pub fn placed(volume: Contree, centre: Vec3, orientation: Quat) -> Body {
         let mut body = Body::new(volume, Vec3::ZERO, orientation);
-        assert!(body.recompute(&materials()), "a fixture body must have mass");
+        assert!(recompute(&mut body, &materials()), "a fixture body must have mass");
         body.position = centre;
         body
     }

@@ -5,9 +5,10 @@
 //! against another volume. A face voxel is touched only where a corner of the
 //! other volume reaches it, and an interior voxel never is.
 
-use crate::contree::Contree;
-use crate::material::MaterialId;
+use bevox_core::contree::Contree;
+use bevox_core::material::MaterialId;
 use glam::{IVec3, UVec3};
+pub use bevox_core::body::Features;
 
 const AXES: [IVec3; 3] = [IVec3::X, IVec3::Y, IVec3::Z];
 
@@ -51,14 +52,6 @@ pub fn classify(solid: impl Fn(IVec3) -> bool, p: IVec3) -> Shape {
     }
 }
 
-/// A body's corner and edge voxels, the only ones tested against the world.
-#[derive(Clone, Debug, Default)]
-pub struct Features {
-    pub corners: Vec<UVec3>,
-    /// With the axis each edge runs along.
-    pub edges: Vec<(UVec3, usize)>,
-}
-
 /// Classifies every one of `voxels`, which must be `tree`'s own.
 pub fn features(tree: &Contree, voxels: &[(UVec3, MaterialId)]) -> Features {
     let mut out = Features::default();
@@ -75,7 +68,7 @@ pub fn features(tree: &Contree, voxels: &[(UVec3, MaterialId)]) -> Features {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::physics::fixtures::cube;
+    use crate::fixtures::cube;
 
     fn shapes_of(tree: &Contree) -> Vec<Shape> {
         tree.voxels()

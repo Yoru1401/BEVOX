@@ -2,8 +2,8 @@
 //! its slot, as in Dwyer's devlog #13. The app decides when; this is what it
 //! does.
 
-use crate::body::Body;
-use crate::contree::Contree;
+use bevox_core::body::Body;
+use bevox_core::contree::Contree;
 use glam::{IVec3, UVec3, Vec3};
 use std::collections::HashSet;
 
@@ -37,8 +37,8 @@ pub fn merge(body: &Body, tree: &mut Contree) -> Vec<UVec3> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::material::MaterialId;
-    use crate::physics::fixtures::cube_of;
+    use bevox_core::material::MaterialId;
+    use crate::fixtures::cube_of;
     use glam::{EulerRot, Quat};
 
     /// An unturned body on whole coordinates merges voxel for voxel, each with

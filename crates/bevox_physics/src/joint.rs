@@ -13,7 +13,7 @@
 
 use super::{BIAS, GRAB_MAX_FORCE, GRAB_MAX_TORQUE};
 use super::classify::solid_at;
-use crate::body::{Body, BodyId};
+use bevox_core::body::{Body, BodyId};
 use glam::{Mat3, Quat, Vec3};
 
 /// What a joint does with the two anchors.
@@ -561,14 +561,14 @@ pub fn follow(joints: &mut Vec<Joint>, bodies: &[Body]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::physics::Air;
-    use crate::contree::Contree;
-    use crate::distance_field::DistanceField;
-    use crate::material::{MaterialId, MaterialTable};
-    use crate::physics::GRAVITY;
-    use crate::physics::fixtures::{cube, cube_of, energy, materials, placed};
-    use crate::physics::sculpt::sculpt;
-    use crate::physics::solver::step;
+    use crate::Air;
+    use bevox_core::contree::Contree;
+    use bevox_core::distance_field::DistanceField;
+    use bevox_core::material::{MaterialId, MaterialTable};
+    use crate::GRAVITY;
+    use crate::fixtures::{cube, cube_of, energy, materials, placed};
+    use crate::sculpt::sculpt;
+    use crate::solver::step;
     use glam::{Quat, UVec3};
 
     const DT: f32 = 1.0 / 64.0;
@@ -951,7 +951,7 @@ mod tests {
     /// the pose it was grabbed in, rather than hanging from the corner.
     #[test]
     fn a_grab_holds_the_point_and_the_pose() {
-        use crate::physics::GRAB_MAX_FORCE;
+        use crate::GRAB_MAX_FORCE;
         let space = Space::new();
         let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
         let corner = bodies[0].world_from_local().transform_point3(Vec3::new(0.01, 3.99, 0.01));
@@ -972,7 +972,7 @@ mod tests {
     #[test]
     fn a_grab_lifts_a_light_body_but_not_a_heavy_one() {
         let materials = materials();
-        let world = crate::physics::fixtures::slab(64, 0..8);
+        let world = crate::fixtures::slab(64, 0..8);
         let field = DistanceField::build(&world);
         let lift = |volume: Contree, centre: Vec3| -> f32 {
             let mut bodies = vec![placed(volume, centre, Quat::IDENTITY)];
@@ -995,7 +995,7 @@ mod tests {
     /// tick reaches at most `F dt / m`.
     #[test]
     fn a_far_target_pulls_with_the_capped_force() {
-        use crate::physics::GRAB_MAX_FORCE;
+        use crate::GRAB_MAX_FORCE;
         let space = Space::new();
         let mut bodies = vec![placed(cube(4, 4), Vec3::new(30.0, 30.0, 30.0), Quat::IDENTITY)];
         let mut grab = Joint::grab(&bodies[0], bodies[0].position);
