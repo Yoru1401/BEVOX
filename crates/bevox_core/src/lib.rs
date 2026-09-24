@@ -5,6 +5,7 @@ pub mod contree;
 pub mod dense;
 pub mod distance_field;
 pub mod edit;
+pub mod fullness;
 pub mod gpu;
 pub mod march;
 pub mod mask_table;
