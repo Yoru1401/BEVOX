@@ -235,11 +235,21 @@ Each part that neither reaches the floor nor outgrows the budget becomes its own
 body. Its voxels are removed from the source through the ordinary edit path, so
 the render world uploads a delta, and its mass properties are computed.
 
-The search walks **voxels**. Dwyer's devlog #12 walks the tree's **uniform
-nodes** instead, which is far faster on a large piece, because a uniform solid
-node is one graph node rather than thousands. That is the upgrade when a
-measurement asks for it; the budget and the early exit are what make the simple
-walk safe until then.
+The search walks the tree's **uniform nodes**, as Dwyer's devlog #12 does: a
+step crosses a whole solid region rather than one voxel. A step is a cell —
+a uniform solid node, or a single voxel where the tree is subdivided to the
+leaf — and two cells are joined when their boxes meet face to face, which is
+the same 6-connectivity walking voxels gave. Each face is scanned column by
+column just outside the box, skipping the width of each neighbour found, so a
+face costs one lookup per neighbour rather than one per voxel; a column with a
+hole in it cannot skip, because past the hole the next column may hold a
+neighbour this one never saw.
+
+Measured (release, interleaved against the voxel walk in one run): freeing a
+2,560-voxel column takes 0.23 ms against 1.03-1.12, about 4.5 times faster. A
+cut into solid ground, where the early exit already ends the walk in a few
+steps, is unchanged at about 0.26 ms. The budget still counts voxels, so what
+detaches is exactly what detached before.
 
 A piece is never taken when the renderer has no room to draw it: past the body
 cap, the largest pieces go first and the rest stay in the world, still drawn.
@@ -470,7 +480,8 @@ this list is all that is known of it here:
 Filled in by this design, **not** shown in his devlogs:
 
 - the exact pair-test formulas and rounding radii;
-- the voxel-level detachment search, its budget and its early exit;
+- the detachment search's budget, its early exit, and the face scan that
+  skips a neighbour's width;
 - the free and locked parts that make his list sixteen types, which is a
   reading of it;
 - the distance joint as a rope, which he describes as "within a radius";

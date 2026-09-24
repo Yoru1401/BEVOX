@@ -1,15 +1,15 @@
 //! Terrain that an edit cuts free becomes a body.
 //!
 //! After Dwyer's devlog #12: a depth-first search over face neighbours, in which
-//! a piece that cannot reach the ground is no longer part of the world. His
-//! search walks the tree's uniform nodes, which is much faster on a large
-//! volume; this one walks voxels and gives up past a budget. The spec's
-//! Detachment section says why, and what it would take to change.
+//! a piece that cannot reach the ground is no longer part of the world. The
+//! search walks the tree's uniform nodes, so a step crosses a whole region of
+//! solid terrain rather than one voxel, and gives up past a budget.
 
 use super::BUDGET;
 use crate::body::Body;
-use crate::contree::Contree;
+use crate::contree::{Contree, level_extent};
 use crate::material::{MaterialId, MaterialTable};
+use crate::node::child_index;
 use crate::physics::classify::solid_at;
 use glam::{IVec3, Quat, UVec3};
 use std::collections::HashMap;
@@ -26,9 +26,10 @@ const NEIGHBOURS: [IVec3; 6] =
 /// than `budget`, at which point the search gives up rather than walking a
 /// mountain. Both leave the piece in the world, which is the safe direction.
 pub fn loose_pieces(tree: &Contree, lo: IVec3, hi: IVec3, budget: usize) -> Vec<Vec<UVec3>> {
-    // Which walk reached each voxel first. A later walk that runs into one of an
-    // earlier walk's voxels is on that walk's piece, which was not loose, or it
-    // would have been walked to the end and every voxel of it claimed.
+    // Which walk reached each cell first, by the cell's origin. A later walk
+    // that runs into one of an earlier walk's cells is on that walk's piece,
+    // which was not loose, or it would have been walked to the end and every
+    // cell of it claimed.
     let mut seen: HashMap<IVec3, usize> = HashMap::new();
     let mut pieces = Vec::new();
     let mut walks = 0;
@@ -36,7 +37,10 @@ pub fn loose_pieces(tree: &Contree, lo: IVec3, hi: IVec3, budget: usize) -> Vec<
         for y in lo.y..=hi.y {
             for x in lo.x..=hi.x {
                 let seed = IVec3::new(x, y, z);
-                if !solid_at(tree, seed) || seen.contains_key(&seed) {
+                let Some(cell) = cell_at(tree, seed) else {
+                    continue;
+                };
+                if seen.contains_key(&cell.origin) {
                     continue;
                 }
                 walks += 1;
@@ -49,6 +53,107 @@ pub fn loose_pieces(tree: &Contree, lo: IVec3, hi: IVec3, budget: usize) -> Vec<
     pieces
 }
 
+/// One step of the walk: a box of solid voxels the tree holds as a single
+/// node, or one voxel where it is subdivided to the leaf.
+///
+/// A node's box is aligned to its own size, so the box spans
+/// `origin .. origin + size` on each axis and `origin.y == 0` is exactly "on
+/// the ground".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Cell {
+    origin: IVec3,
+    size: i32,
+}
+
+impl Cell {
+    fn voxels(self) -> usize {
+        let n = self.size as usize;
+        n * n * n
+    }
+
+    /// The far corner, one past the box.
+    fn end(self) -> IVec3 {
+        self.origin + IVec3::splat(self.size)
+    }
+}
+
+/// The cell holding `p`: the uniform solid node it lands in, or its own voxel.
+/// `None` where the tree is empty there, or `p` is outside it.
+///
+/// The descent is `Contree::get`'s, keeping the box each step narrows to.
+fn cell_at(tree: &Contree, p: IVec3) -> Option<Cell> {
+    let extent = tree.extent() as i32;
+    if p.cmplt(IVec3::ZERO).any() || p.cmpge(IVec3::splat(extent)).any() {
+        return None;
+    }
+    let mut node = tree.root();
+    let mut level = tree.depth() - 1;
+    let mut origin = IVec3::ZERO;
+    loop {
+        if !node.is_subdivided() {
+            let size = level_extent(level) as i32;
+            return node.is_uniform_solid().then_some(Cell { origin, size });
+        }
+        let local = (p - origin).as_uvec3();
+        if level == 0 {
+            let i = child_index(local.x, local.y, local.z);
+            return node.child_slot(i).map(|_| Cell { origin: p, size: 1 });
+        }
+        let step = level_extent(level - 1);
+        let cell = local / step;
+        let i = child_index(cell.x, cell.y, cell.z);
+        let slot = node.child_slot(i)?;
+        node = tree.arena().node(slot);
+        origin += (cell * step).as_ivec3();
+        level -= 1;
+    }
+}
+
+/// Every cell touching `cell` across its six faces.
+///
+/// Each face is scanned column by column just outside the box, and each hit
+/// skips the width of the cell it found, so the scan costs one lookup per
+/// neighbour rather than one per voxel of the face. Against a wall of single
+/// voxels that is one lookup each, which is what the voxel walk paid anyway.
+fn neighbours(tree: &Contree, cell: Cell, out: &mut Vec<Cell>) {
+    out.clear();
+    let (lo, hi) = (cell.origin, cell.end());
+    for axis in 0..3 {
+        let (u, v) = ([1, 0, 0][axis], [2, 2, 1][axis]);
+        for side in [lo[axis] - 1, hi[axis]] {
+            let mut a = lo[u];
+            while a < hi[u] {
+                let mut step_u = cell.size;
+                // Whether this column had a hole. Skipping ahead is only safe
+                // when it did not: past a hole, the next column may hold a
+                // neighbour this one never saw.
+                let mut gap = false;
+                let mut b = lo[v];
+                while b < hi[v] {
+                    let mut at = IVec3::ZERO;
+                    at[axis] = side;
+                    at[u] = a;
+                    at[v] = b;
+                    match cell_at(tree, at) {
+                        Some(found) => {
+                            out.push(found);
+                            // Skip what this neighbour covers on both axes: on
+                            // `v` now, and on `u` no further than it reaches.
+                            step_u = step_u.min(found.end()[u] - a);
+                            b = found.end()[v];
+                        }
+                        None => {
+                            gap = true;
+                            b += 1;
+                        }
+                    }
+                }
+                a += if gap { 1 } else { step_u.max(1) };
+            }
+        }
+    }
+}
+
 /// Walks the piece holding `seed` as walk number `id`. `None` when it is
 /// grounded, too big, or joins a piece an earlier walk already gave up on.
 fn walk(
@@ -58,36 +163,47 @@ fn walk(
     id: usize,
     seen: &mut HashMap<IVec3, usize>,
 ) -> Option<Vec<UVec3>> {
-    let mut stack = vec![seed];
-    let mut piece = Vec::new();
-    seen.insert(seed, id);
-    while let Some(p) = stack.pop() {
+    let start = cell_at(tree, seed)?;
+    let mut stack = vec![start];
+    let mut cells = Vec::new();
+    let mut voxels = 0usize;
+    let mut found = Vec::new();
+    seen.insert(start.origin, id);
+    while let Some(cell) = stack.pop() {
         // Grounded: stop at once. The rest of this piece stays unwalked, and any
         // later walk that reaches it runs into what this one claimed and stops
         // too. Walking on would cost the whole budget for every cut into the
         // ground, which is most cuts.
-        if p.y == 0 {
+        if cell.origin.y == 0 {
             return None;
         }
-        piece.push(p.as_uvec3());
-        if piece.len() > budget {
+        cells.push(cell);
+        voxels += cell.voxels();
+        if voxels > budget {
             return None;
         }
-        for step in NEIGHBOURS {
-            let n = p + step;
-            if !solid_at(tree, n) {
-                continue;
-            }
-            match seen.get(&n) {
+        neighbours(tree, cell, &mut found);
+        for n in &found {
+            match seen.get(&n.origin) {
                 None => {
-                    seen.insert(n, id);
-                    stack.push(n);
+                    seen.insert(n.origin, id);
+                    stack.push(*n);
                 }
-                // An earlier walk's voxel: this is that walk's piece, which was
+                // An earlier walk's cell: this is that walk's piece, which was
                 // grounded or too big, or it would have been walked to the end
-                // and every voxel of it claimed.
+                // and every cell of it claimed.
                 Some(&other) if other != id => return None,
                 Some(_) => {}
+            }
+        }
+    }
+    let mut piece = Vec::with_capacity(voxels);
+    for cell in cells {
+        for z in cell.origin.z..cell.end().z {
+            for y in cell.origin.y..cell.end().y {
+                for x in cell.origin.x..cell.end().x {
+                    piece.push(IVec3::new(x, y, z).as_uvec3());
+                }
             }
         }
     }
@@ -374,25 +490,70 @@ mod tests {
     #[test]
     fn the_search_agrees_with_labelling_every_piece_in_full() {
         let mut rng = crate::testing::XorShift64::new(0xde7a_c4);
-        for case in 0..300 {
+        for case in 0..600 {
+            // Half the cases are loose voxels, where every cell of the walk is
+            // one voxel; half are whole 4-blocks, which the tree keeps as
+            // uniform nodes, so the walk steps over boxes of 64 voxels and
+            // crosses between sizes. Only the second kind exercises that.
+            let blocky = case % 2 == 1;
             let mut voxels = Vec::new();
-            for z in 0..16 {
-                for y in 0..16 {
-                    for x in 0..16 {
-                        if rng.next_below(100) < 38 {
-                            voxels.push((UVec3::new(x, y, z), MaterialId(1)));
+            if blocky {
+                for z in (0..16).step_by(4) {
+                    for y in (0..16).step_by(4) {
+                        for x in (0..16).step_by(4) {
+                            if rng.next_below(100) < 45 {
+                                continue;
+                            }
+                            for dz in 0..4 {
+                                for dy in 0..4 {
+                                    for dx in 0..4 {
+                                        voxels.push((UVec3::new(x + dx, y + dy, z + dz), MaterialId(1)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Loose voxels among the blocks, so cells of both sizes meet
+                // and a neighbour may touch a face anywhere, not only at the
+                // corner the scan starts from.
+                for z in 0..16 {
+                    for y in 0..16 {
+                        for x in 0..16 {
+                            if rng.next_below(100) < 12 {
+                                voxels.push((UVec3::new(x, y, z), MaterialId(1)));
+                            }
+                        }
+                    }
+                }
+                voxels.sort_unstable_by_key(|(p, _)| (p.z, p.y, p.x));
+                voxels.dedup_by_key(|(p, _)| *p);
+            } else {
+                for z in 0..16 {
+                    for y in 0..16 {
+                        for x in 0..16 {
+                            if rng.next_below(100) < 38 {
+                                voxels.push((UVec3::new(x, y, z), MaterialId(1)));
+                            }
                         }
                     }
                 }
             }
             let tree = Contree::from_voxels(16, &voxels);
+            if blocky {
+                let sizes = voxels.iter().filter_map(|(p, _)| cell_at(&tree, p.as_ivec3()));
+                assert!(
+                    sizes.map(|c| c.size).max().unwrap_or(1) > 1,
+                    "case {case} holds no uniform node, so the walk never steps over a box"
+                );
+            }
             let lo = IVec3::new(
                 rng.next_below(12) as i32,
                 rng.next_below(12) as i32,
                 rng.next_below(12) as i32,
             );
             let hi = lo + IVec3::splat(3);
-            let budget = [3, 8, 25, 60, BUDGET][case % 5];
+            let budget = [3, 8, 25, 60, 200, BUDGET][case % 6];
 
             // Pieces are each sorted already; order the list of them by content.
             let key = |piece: &Vec<UVec3>| piece.iter().map(|p| p.to_array()).collect::<Vec<_>>();
@@ -401,7 +562,72 @@ mod tests {
             let mut want: Vec<_> = reference(&tree, lo, hi, budget).iter().map(key).collect();
             want.sort();
             assert_eq!(got, want, "case {case}, budget {budget}, box {lo}..={hi}");
+            // And against the walk it replaced, voxel for voxel.
+            let mut voxelwise: Vec<_> =
+                loose_pieces_by_voxel(&tree, lo, hi, budget).iter().map(key).collect();
+            voxelwise.sort();
+            assert_eq!(got, voxelwise, "the cell walk and the voxel walk disagree, case {case}");
         }
+    }
+
+    /// The voxel walk the cell walk replaced, kept to measure against: the same
+    /// early exit and the same budget, one voxel a step.
+    fn loose_pieces_by_voxel(tree: &Contree, lo: IVec3, hi: IVec3, budget: usize) -> Vec<Vec<UVec3>> {
+        fn walk_voxels(
+            tree: &Contree,
+            seed: IVec3,
+            budget: usize,
+            id: usize,
+            seen: &mut HashMap<IVec3, usize>,
+        ) -> Option<Vec<UVec3>> {
+            let mut stack = vec![seed];
+            let mut piece = Vec::new();
+            seen.insert(seed, id);
+            while let Some(p) = stack.pop() {
+                if p.y == 0 {
+                    return None;
+                }
+                piece.push(p.as_uvec3());
+                if piece.len() > budget {
+                    return None;
+                }
+                for step in NEIGHBOURS {
+                    let n = p + step;
+                    if !solid_at(tree, n) {
+                        continue;
+                    }
+                    match seen.get(&n) {
+                        None => {
+                            seen.insert(n, id);
+                            stack.push(n);
+                        }
+                        Some(&other) if other != id => return None,
+                        Some(_) => {}
+                    }
+                }
+            }
+            piece.sort_unstable_by_key(|p| (p.z, p.y, p.x));
+            Some(piece)
+        }
+
+        let mut seen: HashMap<IVec3, usize> = HashMap::new();
+        let mut pieces = Vec::new();
+        let mut walks = 0;
+        for z in lo.z..=hi.z {
+            for y in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    let seed = IVec3::new(x, y, z);
+                    if !solid_at(tree, seed) || seen.contains_key(&seed) {
+                        continue;
+                    }
+                    walks += 1;
+                    if let Some(piece) = walk_voxels(tree, seed, budget, walks, &mut seen) {
+                        pieces.push(piece);
+                    }
+                }
+            }
+        }
+        pieces
     }
 
     fn reference(tree: &Contree, lo: IVec3, hi: IVec3, budget: usize) -> Vec<Vec<UVec3>> {
@@ -496,6 +722,23 @@ mod tests {
             tree.clear_voxels(&cut);
             tree
         };
+        let time = |walk: fn(&Contree, IVec3, IVec3, usize) -> Vec<Vec<UVec3>>,
+                    tree: &Contree,
+                    lo: IVec3,
+                    hi: IVec3,
+                    expect: usize| {
+            median(
+                (0..9)
+                    .map(|_| {
+                        let start = std::time::Instant::now();
+                        let pieces = walk(tree, lo, hi, BUDGET);
+                        let ms = start.elapsed().as_secs_f64() * 1000.0;
+                        assert_eq!(pieces.len(), expect);
+                        ms
+                    })
+                    .collect(),
+            )
+        };
         let freed = median(
             (0..9)
                 .map(|_| {
@@ -539,6 +782,26 @@ mod tests {
                 })
                 .collect(),
         );
+        // The same two scenes, cell walk against the voxel walk it replaced,
+        // interleaved in this one run.
+        let column = column();
+        let (cut_lo, cut_hi) = (IVec3::new(27, 0, 27), IVec3::new(36, 2, 36));
+        let (hole_lo, hole_hi) = (IVec3::new(26, 25, 26), IVec3::new(38, 32, 38));
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            rows.push((
+                time(loose_pieces, &column, cut_lo, cut_hi, 1),
+                time(loose_pieces_by_voxel, &column, cut_lo, cut_hi, 1),
+                time(loose_pieces, &ground, hole_lo, hole_hi, 0),
+                time(loose_pieces_by_voxel, &ground, hole_lo, hole_hi, 0),
+            ));
+        }
         println!("detach, median ms: 2560-voxel column freed {freed:.3}, hole in ground {grounded:.3}");
+        for (cells_column, voxels_column, cells_hole, voxels_hole) in rows {
+            println!(
+                "  A/B column: cells {cells_column:.3} vs voxels {voxels_column:.3} | \
+                 hole: cells {cells_hole:.3} vs voxels {voxels_hole:.3}"
+            );
+        }
     }
 }

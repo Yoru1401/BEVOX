@@ -32,8 +32,23 @@ A walk step is a **cell**: a maximal uniform-solid node, or a single voxel where
 
 ## Measurements
 
-(Filled in during execution.)
+`a_detach_is_timed`, release, the cell walk interleaved with the voxel walk it replaced, three rounds in one run:
+
+| Scene | Cell walk | Voxel walk |
+|---|---|---|
+| A 2,560-voxel column cut free | 0.232 / 0.234 / 0.234 ms | 1.029 / 1.076 / 1.122 ms |
+| A hole dug in solid ground, nothing freed | 0.260 / 0.268 / 0.269 ms | 0.223 / 0.235 / 0.274 ms |
+
+- **Freeing a piece: about 4.5 times faster.**
+- **The grounded case is unchanged**, and may be a hair slower: the early exit already ended it after a few steps, so there was nothing to win. That is the common case for a cut into terrain.
+- The workspace: 350 tests pass, 11 ignored, no warnings.
 
 ## What changed during execution
 
-(Filled in during execution.)
+1. **A real bug, caught by the property test once its scenes mixed cell sizes.** The face scan skipped ahead by the narrowest neighbour found in a column, but a column with an empty gap can have a different neighbour one step along, which was then never visited. Skipping is now only done for a column with no hole in it.
+2. **The property test's scenes were the weak point, twice.**
+   - As written they were 38% random noise, where every cell is a single voxel, so the whole point of the change went untested. Half the cases are now blocks the tree keeps as uniform nodes.
+   - Blocks alone were still not enough: with everything aligned, a neighbour always covers the corner column, and the break that scanned only the corner passed. Loose voxels are now scattered among the blocks.
+3. **The property test also pins the two walks against each other**, voxel for voxel, not only against the full-labelling reference.
+4. **A non-vacuity check was fixed** rather than deleted: it demanded a uniform node at the origin, which scattering voxels can remove; it now asks that some cell in the scene is bigger than a voxel.
+5. **The budget was left at 20,000 voxels**, as decided. Whether to raise it is now a decision with numbers behind it.
