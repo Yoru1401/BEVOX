@@ -833,6 +833,6 @@ A body slides to a stop on stone in the distance Coulomb friction predicts, keep
 ## What this plan deliberately does not do
 
 - **No body against body.** That is milestone 3's second half: it restructures the solver so two moving bodies share a contact, and it needs body identity in the warm-start cache.
-- **No rolling resistance and no spinning friction.** A ball would roll forever; nothing in the scene is a ball yet.
+- **No rolling resistance and no spinning friction.** A ball would roll forever; nothing in the scene is a ball yet. **Wrong, and corrected 2026-09-24:** every voxel with no solid neighbour classifies as a `Corner`, which is a sphere of radius 0.5, so the scene was full of balls the moment detachment freed a single voxel. Lone voxels rolled for ever and never slept. See [Sliding friction cannot stop a roll](../../concepts/rolling-needs-its-own-resistance.md).
 - **No static-versus-dynamic friction split.** One coefficient per pair, as Dwyer has.
 - **No sleeping.** Milestone 2 measured resting bodies at 0.05 ms each; that is the number that would justify it.

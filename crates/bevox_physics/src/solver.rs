@@ -114,6 +114,12 @@ pub fn step(
         .iter()
         .map(|j| bodies[j.body].warm.get(&j.contact.key).copied().unwrap_or_default())
         .collect();
+    // The most any contact carried at any point in the tick. The accumulated
+    // impulse is a running total that a separating contact drives back to zero
+    // before the tick ends, so it cannot answer "did these surfaces ever press
+    // on each other" -- which is what tells a collision from a speculative
+    // contact that closed and never touched. `break_what_gave_way` needs that.
+    let mut peak: Vec<f32> = vec![0.0; joined.len()];
     // The speed the bodies arrive with, which the substeps are about to destroy.
     // A bounce is written in terms of it, so it is recorded here.
     let approach: Vec<f32> = joined
@@ -148,11 +154,12 @@ pub fn step(
             }
         }
         solve_joints(bodies, &mut joints, &links, inv_h, true);
-        for (j, impulse) in joined.iter().zip(impulses.iter_mut()) {
+        for ((j, impulse), peak) in joined.iter().zip(impulses.iter_mut()).zip(peak.iter_mut()) {
             let (a, mut b) = pair_mut(bodies, j.body, j.other);
             solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, true);
             solve_friction(a, b.as_deref_mut(), &j.contact, impulse);
             solve_rolling(a, b, &j.contact, *impulse);
+            *peak = peak.max(impulse.normal);
         }
 
         for b in bodies.iter_mut().filter(|b| b.mass.mass > 0.0 && !b.asleep) {
@@ -163,11 +170,12 @@ pub fn step(
         // motion reaches the body: relaxing it would stop the body dead every
         // substep, and letting go would throw nothing.
         solve_joints(bodies, &mut joints[..scene_joints], &links[..scene_joints], inv_h, false);
-        for (j, impulse) in joined.iter().zip(impulses.iter_mut()) {
+        for ((j, impulse), peak) in joined.iter().zip(impulses.iter_mut()).zip(peak.iter_mut()) {
             let (a, mut b) = pair_mut(bodies, j.body, j.other);
             solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, false);
             solve_friction(a, b.as_deref_mut(), &j.contact, impulse);
             solve_rolling(a, b, &j.contact, *impulse);
+            *peak = peak.max(impulse.normal);
         }
     }
 
@@ -191,7 +199,7 @@ pub fn step(
     }
 
     apply_restitution(bodies, &joined, &mut impulses, &approach);
-    let fractures = break_what_gave_way(bodies, tree, materials, &joined, &impulses);
+    let fractures = break_what_gave_way(bodies, tree, materials, &joined, &approach, &peak);
     sleep::settle(bodies, &joints, &radii, dt);
     StepOutcome { rebuild: bodies.len() != before, fractures }
 }
@@ -200,25 +208,49 @@ pub fn step(
 /// handed back to the bodies for the ones that did.
 ///
 /// Both sides of a contact are tested: a crate dropped on ice can break the
-/// crate, the ice, or both. The impulse is the one the contact ended the tick
-/// with, restitution included, which is what the collision actually applied.
+/// crate, the ice, or both, and both are asked about the same blow.
 fn break_what_gave_way(
     bodies: &mut [Body],
     tree: &Contree,
     materials: &MaterialTable,
     joined: &[Joined],
-    impulses: &[ContactImpulse],
+    approach: &[f32],
+    peak: &[f32],
 ) -> Vec<Fracture> {
     let mut fractures = Vec::new();
     let mut give_back = Vec::new();
-    for (at, (j, impulse)) in joined.iter().zip(impulses).enumerate() {
+    for (at, j) in joined.iter().enumerate() {
         let c = &j.contact;
         let mut broke = false;
-        // The speed this contact took out of the striking body, which is what
-        // a material's strength is written in. Dividing by the mass is what
-        // keeps a big body from breaking under its own weight: its resting
-        // contacts carry a far larger impulse and take away the same speed.
-        let blow = impulse.normal * bodies[j.body].mass.inverse_mass();
+        // How fast the two surfaces met, which is what a material's strength is
+        // written in.
+        //
+        // Dwyer's devlog 28 thresholds the contact impulse and argues the case
+        // against a force: a collision resolves inside one tick, so the force
+        // it reports depends on the tick rate and the impulse does not. A
+        // closing speed keeps that -- it is read before the substeps touch it,
+        // so it is the same number at 64 Hz and at 128 -- and fixes two things
+        // his units do not have to face here.
+        //
+        // An impulse grows with the mass a contact holds up, so resting weight
+        // alone would break things: `strength` is a u16, and a 20,000-voxel
+        // piece leans on its contacts with some 1e7 of impulse. And an impulse
+        // divided by a mass has to pick a mass, which the owning body is not:
+        // a contact belongs to whichever body the scene lists first, so the
+        // same collision read two different ways depending on the list order.
+        //
+        // A closing speed has neither problem. It is symmetric, so one
+        // collision has one blow whichever side is asked about, and at rest it
+        // is nothing however heavy the load.
+        let blow = -approach[at];
+        // A contact that never carried anything is one the surfaces never
+        // reached: a speculative contact holds the full approach speed for the
+        // tick before they touch, and nothing has struck anything yet. The
+        // running total is no use here -- by the end of the tick a contact that
+        // did its work and let go is back at zero -- so this asks the peak.
+        if peak[at] <= 0.0 {
+            continue;
+        }
         let mut side = |voxel: [u32; 3], body: Option<BodyId>, strength: u16| {
             if let Some(over) = fracture::over_strength(blow, strength) {
                 broke = true;
@@ -226,7 +258,7 @@ fn break_what_gave_way(
                     at: c.world_point,
                     voxel: UVec3::from(voxel),
                     body,
-                    impulse: impulse.normal,
+                    impulse: peak[at],
                     blow,
                     over,
                 });
@@ -251,10 +283,14 @@ fn break_what_gave_way(
 
     // Separately, because the scan holds the bodies immutably. Breaking
     // something costs less speed than bouncing off it: see `fracture::REBOUND`.
+    //
+    // Against the peak, not the running total: a collision that resolved and
+    // let go inside the tick ends it carrying nothing, and giving back a share
+    // of nothing would leave the striking body stopped dead at a hole it made.
     for at in give_back {
         let j = &joined[at];
         let (a, b) = pair_mut(bodies, j.body, j.other);
-        push(a, b, &j.contact, -j.contact.normal * impulses[at].normal * fracture::REBOUND);
+        push(a, b, &j.contact, -j.contact.normal * peak[at] * fracture::REBOUND);
     }
     fractures
 }
@@ -500,12 +536,6 @@ fn solve(
     push(a, b, c, c.normal * delta);
 }
 
-/// Coulomb friction along the contact's two tangents.
-///
-/// The accumulated tangent impulse is clamped as a vector rather than per axis:
-/// clamping each axis alone would let the total reach sqrt(2) times the limit,
-/// and a body pushed diagonally would slide further than one pushed along an
-/// axis.
 /// Resistance to rolling, which sliding friction cannot provide.
 ///
 /// A rolling contact barely slips, so `solve_friction` finds almost no relative
@@ -538,6 +568,12 @@ fn inverse_inertia_about(a: &Body, b: Option<&Body>, axis: Vec3) -> f32 {
     (of(a) + b.map_or(0.0, of)).max(1e-12)
 }
 
+/// Coulomb friction along the contact's two tangents.
+///
+/// The accumulated tangent impulse is clamped as a vector rather than per axis:
+/// clamping each axis alone would let the total reach sqrt(2) times the limit,
+/// and a body pushed diagonally would slide further than one pushed along an
+/// axis.
 fn solve_friction(
     a: &mut Body,
     b: Option<&mut Body>,
@@ -1603,7 +1639,7 @@ mod tests {
         );
     }
 
-    /// Dwyer's devlog 28, and the reason the threshold is on impulse: what
+    /// Dwyer's devlog 28, and the reason the threshold is not on force: what
     /// breaks must not depend on how often the physics ticks.
     ///
     /// The discriminating half is the second one. A blow **under** the
@@ -1612,10 +1648,12 @@ mod tests {
     /// collision look sixty-four times worse at 64 Hz and a hundred and
     /// twenty-eight times at 128, so it shatters everything at every rate.
     ///
-    /// The peak per-tick blow itself is *not* rate-independent, and this gate
-    /// does not pretend it is: 16.4 at 64 Hz against 10.4 at 128 on this scene,
-    /// because a collision the detector sees coming is resolved over more ticks
-    /// at a finer rate. What must match is the outcome.
+    /// The blow is now exactly rate-independent, where the impulse it used to
+    /// be derived from was not -- that read 16.4 at 64 Hz against 10.4 at 128
+    /// on this scene, because a collision the detector sees coming is spread
+    /// over more ticks at a finer rate. A closing speed is read once, before
+    /// the substeps touch it, so both rates see the same arrival. The gate
+    /// still asks only that the outcome match, which is the thing that matters.
     #[test]
     fn the_same_collision_breaks_at_any_tick_rate() {
         let broke = |speed: f32, dt: f32| !slam(MaterialId(6), speed, dt).0.is_empty();
@@ -1639,6 +1677,105 @@ mod tests {
             "a body that broke what it hit was still falling at {through} and one that did not at {off}: \
              the impulse is not being handed back, so the pieces fall out of a hole nothing \
              went through"
+        );
+    }
+
+    /// One collision between two bodies, run with the two listed in either
+    /// order, breaks the same things by the same amount.
+    ///
+    /// A contact belongs to whichever body the scene lists first, which has
+    /// nothing to do with which of them struck the other. Reading the blow as
+    /// the contact's impulse divided by *that* body's mass therefore made the
+    /// answer depend on the list order: the impulse two bodies exchange is set
+    /// by their reduced mass, so naming the light one reports nearly the whole
+    /// closing speed and naming the heavy one reports a twenty-fourth of it.
+    /// The same glass cube then shatters or survives according to where in a
+    /// `Vec` it sat.
+    ///
+    /// A closing speed is symmetric, so there is no owner to pick.
+    #[test]
+    fn a_collision_breaks_the_same_things_whichever_body_is_listed_first() {
+        let materials = materials();
+        let world = Contree::empty(3);
+        let field = DistanceField::build(&world);
+
+        // A brittle cube thrown at a heavier one. The gap is well outside the
+        // contact margin, so the collision happens during the run rather than
+        // being resolved away as a speculative contact on the first substep.
+        let collide = |swapped: bool| -> Vec<Fracture> {
+            let anvil =
+                placed(cube_of(4, 4, MaterialId(2)), Vec3::new(32.0, 32.0, 32.0), Quat::IDENTITY);
+            let mut pebble =
+                placed(cube_of(2, 4, MaterialId(6)), Vec3::new(32.0, 40.0, 32.0), Quat::IDENTITY);
+            pebble.velocity = Vec3::new(0.0, -100.0, 0.0);
+            let mut bodies =
+                if swapped { vec![pebble, anvil] } else { vec![anvil, pebble] };
+            let mut broke = Vec::new();
+            for _ in 0..16 {
+                let out =
+                    step(&mut bodies, &world, &field, &materials, Air::STILL, DT, None, &mut []);
+                broke.extend(out.fractures);
+            }
+            broke
+        };
+
+        let (heavy_first, light_first) = (collide(false), collide(true));
+        let hardest = |f: &[Fracture]| f.iter().map(|f| f.blow).fold(0.0f32, f32::max);
+        assert!(
+            !heavy_first.is_empty(),
+            "a brittle cube thrown at 100 broke nothing with the heavy body listed first; the \
+             blow is being divided by that body's mass"
+        );
+        assert!(!light_first.is_empty(), "it broke nothing with the light body listed first");
+        assert!(
+            (hardest(&heavy_first) - hardest(&light_first)).abs() < 1.0,
+            "the same collision read as {:.1} one way round and {:.1} the other",
+            hardest(&heavy_first),
+            hardest(&light_first)
+        );
+        assert!(
+            hardest(&heavy_first) > 50.0,
+            "the blow came out at {:.1} for a collision closing at 100, so it is not a speed",
+            hardest(&heavy_first)
+        );
+    }
+
+    /// Weight alone breaks nothing, however long it leans.
+    ///
+    /// This is what rules out Dwyer's own threshold, which is on the contact
+    /// impulse (devlog 28). An impulse grows with the mass a contact holds up:
+    /// each of these cubes leans on the one below with some 2e4 of it per tick,
+    /// against a `u16` strength where glass is 20. His materials are in N.s and
+    /// do not meet this; ours would shatter a stack for standing there.
+    #[test]
+    fn resting_weight_breaks_nothing() {
+        let materials = materials();
+        let world = slab_of(64, 0..8, MaterialId(6));
+        let field = DistanceField::build(&world);
+        let mut bodies: Vec<Body> = (0..3)
+            .map(|i| {
+                placed(
+                    cube_of(4, 4, MaterialId(6)),
+                    Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0),
+                    Quat::IDENTITY,
+                )
+            })
+            .collect();
+
+        let mut broke = Vec::new();
+        for _ in 0..1200 {
+            let out =
+                step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut []);
+            broke.extend(out.fractures);
+        }
+        assert_eq!(bodies.len(), 3, "the stack came apart");
+        assert!(
+            broke.is_empty(),
+            "a glass stack standing still broke {} things, the heaviest blow {:.3} against a \
+             strength of {}",
+            broke.len(),
+            broke.iter().map(|f| f.blow).fold(0.0f32, f32::max),
+            crate::fixtures::GLASS_STRENGTH,
         );
     }
 

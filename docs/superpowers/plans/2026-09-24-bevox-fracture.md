@@ -10,7 +10,7 @@ generated: { by: claude-opus-5/claude-code, at: 2026-09-24T00:00:00Z }
 
 **Goal:** Throw a box hard enough and it breaks. Hit a wall hard enough and the wall breaks. What breaks, and into how many pieces, comes from the material and the strength of the collision.
 
-**Architecture:** After Dwyer's devlog 28, whose insight is that fracture needs almost no new machinery. A contact whose accumulated impulse passes the material's strength raises a fracture event; the event draws cracks by **setting voxels empty**; and the code that already turns disconnected voxels into rigid bodies -- `detach` for the world, `sculpt`'s split for a body -- produces the pieces. Nothing plans a pattern, labels a piece or copies a volume.
+**Architecture:** After Dwyer's devlog 28, whose insight is that fracture needs almost no new machinery. A contact whose blow passes the material's strength raises a fracture event; the event draws cracks by **setting voxels empty**; and the code that already turns disconnected voxels into rigid bodies -- `detach` for the world, `sculpt`'s split for a body -- produces the pieces. Nothing plans a pattern, labels a piece or copies a volume.
 
 **Spec:** `docs/superpowers/specs/2026-09-15-bevox-rigid-bodies-design.md`
 
@@ -20,7 +20,7 @@ generated: { by: claude-opus-5/claude-code, at: 2026-09-24T00:00:00Z }
 
 - No new dependencies. `bevox_core` keeps no Bevy and no GPU dependency.
 - Every gate is proven by a deliberate break.
-- **Impulse, never force.** Force depends on the tick rate, so a threshold on force breaks differently at 30 and 60 fps. This gets its own gate.
+- **Never force.** Force depends on the tick rate, so a threshold on force breaks differently at 30 and 60 fps. This gets its own gate. Dwyer's own threshold is the contact impulse; what shipped is the speed the surfaces met at, which keeps his rate-independence and is stated as a departure below.
 - Physics is never merged to master.
 - `MAX_BODIES` is 16. A fracture that would free more pieces than there is room for leaves the rest in place rather than deleting them.
 - Flori runs the app; I do not.
@@ -29,12 +29,16 @@ generated: { by: claude-opus-5/claude-code, at: 2026-09-24T00:00:00Z }
 
 | His | Here |
 |---|---|
-| Impulse over a per-material threshold raises a fracture event | the same, read off the solver's accumulated normal impulse |
-| The impulse at those contacts is reduced, so a rock carries on through the window | the same, as a fraction of the normal impulse returned to the bodies |
+| Impulse over a per-material threshold raises a fracture event | **adapted.** The threshold is the speed the two surfaces met at, not the impulse. See the departures below |
+| The impulse at those contacts is reduced, so a rock carries on through the window | the same, as a fraction of the peak normal impulse returned to the bodies |
 | Cracks are drawn by setting voxels empty; the "neighbourhood disconnector" makes the pieces | the same, with `detach` for the world and `sculpt`'s split for a body |
 | Patterns are authored boolean voxel volumes in a per-material table, cached in six orientations | **not taken.** Cracks are generated analytically from planes through the impact. There is no modding API to author patterns for, and an authored-pattern table is a data format, a cache and an editor for a look we can get from three random planes |
 
-That last row is the one deliberate departure, and it is reversible: the crack generator is one function behind one call, so a pattern table can replace it without touching the solver or the application path.
+Two rows depart from him.
+
+The **pattern** row is reversible: the crack generator is one function behind one call, so a pattern table can replace it without touching the solver or the application path.
+
+The **threshold** row is not a preference but a units problem. His thresholds are in N.s; `Material::strength` is a `u16`. An impulse grows with the mass a contact holds up, so in these units a stack standing still carries impulses in the hundreds of thousands against a glass strength of 20 -- `resting_weight_breaks_nothing` fails by 61,134 fractures against his literal rule. The blow is therefore the closing speed at detection, which keeps the property his argument is *for* (it does not depend on the tick rate) and is symmetric, so both sides of one collision are asked about one number.
 
 ## Tasks
 
@@ -147,16 +151,26 @@ and would have made fracture look 260 times more expensive than it is.
   at once: a resting 4-voxel cube already carries about 2,400 impulse per
   contact, so everything shattered where it stood. A contact's impulse grows
   with the mass resting on it, which makes a big body break under its own
-  weight; the speed that impulse takes away does not. `strength` is now voxels
-  per second, and the blow is `impulse / mass`. Dwyer's threshold is still an
-  impulse threshold -- this only divides both sides by the same mass.
+  weight; a speed does not. `strength` is voxels per second.
+
+  **Superseded 2026-09-28.** The blow was `impulse / mass`, and the mass it used
+  was the contact's *owning* body -- which is whichever of the two the scene
+  lists first, nothing to do with which struck which. The same collision read
+  two different ways depending on `Vec` order, by a factor of 24 on the gate
+  scene, and a resting stack could still shatter when the mass ratio was large.
+  The blow is now the closing speed at detection, which needs no mass and no
+  owner. `DEFAULT_STRENGTH` moved from 40 to 150 and the brittle fixture from 5
+  to 20 with it, because the numbers now mean arrival speeds directly.
 - **The tick-rate gate had to be rewritten around outcomes.** The peak per-tick
-  blow is *not* rate-independent: 16.4 at 64 Hz against 10.4 at 128 on the test
-  scene, because a collision the detector sees coming is spread over more ticks
-  at a finer rate. What is rate-independent is **what breaks**, so the gate
-  asserts that a blow over strength breaks at both rates and a blow under it
-  breaks at neither. The second half is the discriminating one: a threshold read
-  as a force shatters things at every rate and fails it.
+  blow was *not* rate-independent while it came from the impulse: 16.4 at 64 Hz
+  against 10.4 at 128 on the test scene, because a collision the detector sees
+  coming is spread over more ticks at a finer rate. What is rate-independent is
+  **what breaks**, so the gate asserts that a blow over strength breaks at both
+  rates and a blow under it breaks at neither. The second half is the
+  discriminating one: a threshold read as a force shatters things at every rate
+  and fails it. (Since 2026-09-28 the blow is a closing speed read before the
+  substeps touch it, so it is now exactly rate-independent as well. The gate
+  still asks only about outcomes, which is the thing that matters.)
 - **The body has to start inside the contact margin** for a collision to land in
   one tick. Further out, the speculative contact appears a tick early and bleeds
   the approach speed away over two, which halves the blow. That is a property of
@@ -171,10 +185,12 @@ and would have made fracture look 260 times more expensive than it is.
   through the impact, seeded by the voxel and the impulse. It is one function
   behind one call, and a pattern table can replace it without the solver or the
   application path noticing.
-- **The speed cap sets the ceiling on any blow.** `MAX_TRAVEL` is 1.25 voxels a
-  tick, so at 64 Hz nothing can arrive faster than 80 voxels a second. Every
-  strength must sit well under that or the material is unbreakable in practice,
-  which is why `DEFAULT_STRENGTH` is 40 and not 400.
+- **The speed cap sets the ceiling on any blow.** Every strength must sit under
+  it or the material is unbreakable in practice. This read `MAX_TRAVEL` at 1.25
+  voxels a tick, so 80 voxels a second at 64 Hz, which is why `DEFAULT_STRENGTH`
+  was 40. `MAX_TRAVEL` was replaced by `MAX_SPEED` at 256 voxels a second in the
+  physics-crate plan, so the ceiling is now 256 whatever the tick rate, and 150
+  is the tough-material number that the old ceiling had no room for.
 
 ## Breaks that failed as required
 
@@ -190,3 +206,5 @@ and would have made fracture look 260 times more expensive than it is.
 | Cracks cut but nothing split | `a_body_hit_hard_enough_comes_apart` |
 | The world cut without telling the grids | `breaking_the_floor_keeps_the_grids_honest` |
 | The body cap ignored | `a_full_scene_leaves_a_broken_body_whole` |
+| The blow divided by the owning body's mass (2026-09-28) | `a_collision_breaks_the_same_things_whichever_body_is_listed_first` |
+| The threshold read as Dwyer's raw impulse (2026-09-28) | `resting_weight_breaks_nothing`, by 61,134 fractures |

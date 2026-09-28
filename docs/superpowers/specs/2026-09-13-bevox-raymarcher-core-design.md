@@ -25,7 +25,10 @@ techniques.
 
 The core is done when all of the following hold:
 
-1. A MagicaVoxel `.vox` scene loads and renders at 1920x1080 on the target hardware.
+1. A MagicaVoxel `.vox` scene loads and renders at 1280x720 on the target hardware.
+   (1920x1080 as written; the window, every benchmark and the body cap are
+   1280x720, and the cap is resolution-dependent, so that is the number the
+   project is actually held to.)
 2. Voxels are shaded with implicitly generated per-voxel normals against a directional
    sun, with hard shadows from a single secondary ray.
 3. A sphere brush adds and removes voxels at runtime, and only the affected GPU buffer
@@ -46,10 +49,10 @@ measurement at milestone 5.
 |---|---|
 | GPU | NVIDIA GeForce GTX 1650, 4 GB VRAM (Turing, no RT cores) |
 | CPU | Intel Core i5-10400, 6 cores / 12 threads |
-| Toolchain | rustc / cargo 1.96.0 |
+| Toolchain | rustc / cargo 1.96.0 at the time of writing; 1.98.1 on 2026-09-28 |
 | Bevy | 0.19.1 (requires Rust >= 1.95) |
 | Model loading | dot_vox 5.2.0 |
-| Platform | Native desktop (Windows) only |
+| Platform | Native desktop: Windows **and** Linux (revised 2026-09-28) |
 
 4 GB of VRAM is the binding constraint on this hardware, not compute throughput.
 
@@ -204,11 +207,18 @@ Four stages per frame:
    adjacent beam rays. This cap is what makes the optimization conservative; without it,
    thin geometry develops holes.
 3. **Main pass** — a compute dispatch at full resolution. Seeds its starting distance from
-   the **minimum** over the 2x2 block of beam texels surrounding it, marches, and on a hit computes the
+   the **minimum over the 3x3 neighbourhood** of beam texels around it, marches, and on a hit computes the
    implicit normal from neighbour occupancy and casts one shadow ray toward the sun.
-   Writes `Rgba8UnormSrgb`.
-4. **Composite** — a render graph node blits the storage texture into Bevy's view target,
-   ordered before `camera_driver`.
+   Writes `Rgba8Unorm`.
+
+   3x3, not the 2x2 block this said: a pixel sits anywhere inside its beam's
+   cell, so the geometry it is about to meet may have been seen by the beam on
+   either side of it, not only by its own or the next one. Dwyer takes "four or
+   six neighbours" (devlog 18); 3x3 is the conservative reading. And the format
+   is linear `Rgba8Unorm`, not sRGB — see the colour-space note below.
+4. **Composite** — the image is shown by a window-sized `Sprite` under a `Camera2d`,
+   not by a render-graph node blitting into a view target. The compute pass writes the
+   storage texture and Bevy's ordinary 2D pass draws it.
 
 ### Bind groups
 
@@ -238,15 +248,23 @@ cell sizes differ and DDA is not valid. Descent uses an explicit five-deep stack
 ## Error handling
 
 - **Hard step cap in every march loop.** A non-terminating loop in a compute shader hangs
-  the GPU and the desktop with it. Every loop has a maximum iteration count, returns a miss
-  on overrun, and increments a debug counter. Dwyer lost time to exactly this failure mode
+  the GPU and the desktop with it. Every loop has a maximum iteration count and returns a
+  miss on overrun. Dwyer lost time to exactly this failure mode
   in Devlog #1, caused by floating-point imprecision letting a ray oscillate between two
   adjacent cells.
+
+  **Not built: the debug counter.** This said the shader increments one; it does
+  not, and there is no binding for it. Only the CPU reference counts overruns
+  (`MarchStats::overruns`), and the parity test asserts that count is zero. A
+  shader that starts overrunning on new geometry reports a miss and says
+  nothing. Building it costs a storage binding, and the compute stage is
+  already at wgpu's default limit of eight.
 - **VRAM budget enforcement.** Model loads and edits that would exceed 512 MB are rejected
   with a surfaced error. The device is never asked for an allocation that could fail.
 - **Pipeline compilation failure.** `PipelineCache` reporting a pipeline as not ready
   causes the graph node to skip that frame. It is not a panic.
-- **wgpu error scopes** are enabled in debug builds.
+- **wgpu error scopes.** **Not built.** This said they are enabled in debug builds; there
+  are none in the tree.
 
 ## Testing
 
@@ -275,7 +293,8 @@ by eye.
 Headless wgpu device, fixed scene, output hashed against a golden image. The key
 invariant: beam prepass enabled must produce **bit-identical** output to beam prepass
 disabled, and likewise for the bitmask filter. An optimization that changes a pixel is a
-defect, not a trade-off. The step-cap overrun counter must be zero on all test scenes.
+defect, not a trade-off. The CPU reference's overrun counter must be zero on all test
+scenes; the shader has no counter to check (see Error handling).
 
 ## Measurement
 

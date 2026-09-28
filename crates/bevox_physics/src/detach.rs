@@ -13,12 +13,80 @@ use bevox_core::node::child_index;
 use crate::classify::solid_at;
 use glam::{IVec3, Quat, UVec3};
 use std::collections::HashMap;
+use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+
+/// Which walk has claimed each cell, by the cell's origin.
+///
+/// Dwyer keeps this as a **dense bitmap** of visited nodes (devlog 12), and
+/// says that constant-time "is this node in the component" is what makes
+/// walking nodes worth doing. A dense array is not available here: his world is
+/// chunked, while this tree's extent reaches 4096, so one entry per voxel
+/// coordinate would be 6.9e10 of them -- and a walk may roam anywhere in it,
+/// up to `BUDGET` voxels from the cut.
+///
+/// So it stays a map, with the hashing made cheap instead. The default
+/// `DefaultHasher` is SipHash, chosen to be resistant to collision attacks on
+/// untrusted keys; these keys are three integers we computed ourselves, and the
+/// walk does a lookup per neighbour found.
+type Seen<S = BuildHasherDefault<CellHasher>> = HashMap<IVec3, usize, S>;
+
+/// A multiply-xor-shift hasher for the handful of integers a cell origin is.
+///
+/// Not a general-purpose hasher: it is fine for keys that differ in their low
+/// bits, which grid coordinates do, and it has none of SipHash's guarantees
+/// about adversarial input. Nothing outside this module may use it.
+#[derive(Default)]
+struct CellHasher(u64);
+
+impl Hasher for CellHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+
+    fn write_i32(&mut self, n: i32) {
+        self.write_u64(n as u32 as u64);
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        // The xorshift-multiply of splitmix64's finaliser, which spreads three
+        // small coordinates across the whole word in a few instructions.
+        let mixed = (self.0 ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = mixed ^ (mixed >> 31);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 use crate::mass::recompute;
 
-/// Face neighbours. Down is last, so it is popped first: the walk dives for the
-/// floor, and most cuts are into ground that reaches it within a few steps.
+/// Face neighbours, for the voxel walk in `components`, which has no floor to
+/// reach and so no order it prefers.
 const NEIGHBOURS: [IVec3; 6] =
     [IVec3::Y, IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z, IVec3::NEG_Y];
+
+/// The six faces of a cell as `(axis, far side)`, in the order the walk scans
+/// them.
+///
+/// **Down is last, so the stack pops it first and the walk dives for the
+/// floor.** Most cuts are into ground that reaches `y == 0` within a few steps,
+/// and the walk stops the moment it does, so the order is what makes the common
+/// case cheap rather than a full flood fill of the terrain.
+///
+/// The voxel walk had this in `NEIGHBOURS` and the cell walk lost it: scanning
+/// axis by axis, `+z` was pushed last and dived sideways instead. Restored
+/// 2026-09-28, with the cost of not having it measured in `a_detach_is_timed`.
+const FACES: [(usize, bool); 6] =
+    [(1, true), (0, false), (0, true), (2, false), (2, true), (1, false)];
+
+/// The order the cell walk used between the node rewrite and 2026-09-28: every
+/// axis in turn, low side then high. Kept so the two can be timed against each
+/// other in one run.
+#[cfg(test)]
+const FACES_BY_AXIS: [(usize, bool); 6] =
+    [(0, false), (0, true), (1, false), (1, true), (2, false), (2, true)];
 
 /// The pieces of `tree` around the box `lo..=hi` that no longer reach the
 /// ground, each sorted.
@@ -27,11 +95,25 @@ const NEIGHBOURS: [IVec3; 6] =
 /// than `budget`, at which point the search gives up rather than walking a
 /// mountain. Both leave the piece in the world, which is the safe direction.
 pub fn loose_pieces(tree: &Contree, lo: IVec3, hi: IVec3, budget: usize) -> Vec<Vec<UVec3>> {
+    loose_pieces_in::<BuildHasherDefault<CellHasher>>(tree, lo, hi, budget, &FACES)
+}
+
+/// The same, with the face order named, so `a_detach_is_timed` can put the
+/// order that dives for the floor against the one the node rewrite left behind
+/// in a single run. The pieces are identical either way -- only the number of
+/// steps taken to find them changes.
+fn loose_pieces_in<S: BuildHasher + Default>(
+    tree: &Contree,
+    lo: IVec3,
+    hi: IVec3,
+    budget: usize,
+    faces: &[(usize, bool); 6],
+) -> Vec<Vec<UVec3>> {
     // Which walk reached each cell first, by the cell's origin. A later walk
     // that runs into one of an earlier walk's cells is on that walk's piece,
     // which was not loose, or it would have been walked to the end and every
     // cell of it claimed.
-    let mut seen: HashMap<IVec3, usize> = HashMap::new();
+    let mut seen: Seen<S> = Seen::default();
     let mut pieces = Vec::new();
     let mut walks = 0;
     for z in lo.z..=hi.z {
@@ -45,7 +127,7 @@ pub fn loose_pieces(tree: &Contree, lo: IVec3, hi: IVec3, budget: usize) -> Vec<
                     continue;
                 }
                 walks += 1;
-                if let Some(piece) = walk(tree, seed, budget, walks, &mut seen) {
+                if let Some(piece) = walk(tree, seed, budget, walks, &mut seen, faces) {
                     pieces.push(piece);
                 }
             }
@@ -116,12 +198,13 @@ fn cell_at(tree: &Contree, p: IVec3) -> Option<Cell> {
 /// skips the width of the cell it found, so the scan costs one lookup per
 /// neighbour rather than one per voxel of the face. Against a wall of single
 /// voxels that is one lookup each, which is what the voxel walk paid anyway.
-fn neighbours(tree: &Contree, cell: Cell, out: &mut Vec<Cell>) {
+fn neighbours(tree: &Contree, cell: Cell, out: &mut Vec<Cell>, faces: &[(usize, bool); 6]) {
     out.clear();
     let (lo, hi) = (cell.origin, cell.end());
-    for axis in 0..3 {
+    for &(axis, far) in faces {
         let (u, v) = ([1, 0, 0][axis], [2, 2, 1][axis]);
-        for side in [lo[axis] - 1, hi[axis]] {
+        {
+            let side = if far { hi[axis] } else { lo[axis] - 1 };
             let mut a = lo[u];
             while a < hi[u] {
                 let mut step_u = cell.size;
@@ -157,12 +240,13 @@ fn neighbours(tree: &Contree, cell: Cell, out: &mut Vec<Cell>) {
 
 /// Walks the piece holding `seed` as walk number `id`. `None` when it is
 /// grounded, too big, or joins a piece an earlier walk already gave up on.
-fn walk(
+fn walk<S: BuildHasher>(
     tree: &Contree,
     seed: IVec3,
     budget: usize,
     id: usize,
-    seen: &mut HashMap<IVec3, usize>,
+    seen: &mut Seen<S>,
+    faces: &[(usize, bool); 6],
 ) -> Option<Vec<UVec3>> {
     let start = cell_at(tree, seed)?;
     let mut stack = vec![start];
@@ -183,7 +267,7 @@ fn walk(
         if voxels > budget {
             return None;
         }
-        neighbours(tree, cell, &mut found);
+        neighbours(tree, cell, &mut found, faces);
         for n in &found {
             match seen.get(&n.origin) {
                 None => {
@@ -568,6 +652,15 @@ mod tests {
                 loose_pieces_by_voxel(&tree, lo, hi, budget).iter().map(key).collect();
             voxelwise.sort();
             assert_eq!(got, voxelwise, "the cell walk and the voxel walk disagree, case {case}");
+            // And against the face order the walk used before it dived for the
+            // floor. The order decides how soon a walk meets `y == 0` and
+            // stops, and a walk that stops fences later walks in with its
+            // claims -- so "the order is only a speed" is a claim that has to
+            // be held, not assumed.
+            let mut by_axis: Vec<_> =
+                loose_pieces_in::<Fast>(&tree, lo, hi, budget, &FACES_BY_AXIS).iter().map(key).collect();
+            by_axis.sort();
+            assert_eq!(got, by_axis, "the two face orders disagree, case {case}");
         }
     }
 
@@ -579,7 +672,7 @@ mod tests {
             seed: IVec3,
             budget: usize,
             id: usize,
-            seen: &mut HashMap<IVec3, usize>,
+            seen: &mut Seen,
         ) -> Option<Vec<UVec3>> {
             let mut stack = vec![seed];
             let mut piece = Vec::new();
@@ -611,7 +704,7 @@ mod tests {
             Some(piece)
         }
 
-        let mut seen: HashMap<IVec3, usize> = HashMap::new();
+        let mut seen = Seen::default();
         let mut pieces = Vec::new();
         let mut walks = 0;
         for z in lo.z..=hi.z {
@@ -804,5 +897,72 @@ mod tests {
                  hole: cells {cells_hole:.3} vs voxels {voxels_hole:.3}"
             );
         }
+
+        // Diving for the floor against scanning axis by axis, A/B/A in this one
+        // run. The grounded scene is the one that should care: the walk stops
+        // the moment it touches y == 0, so trying the downward face first is
+        // what keeps a cut into terrain to a few steps.
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            order.push((
+                time(loose_pieces, &ground, hole_lo, hole_hi, 0),
+                time(loose_pieces_by_axis, &ground, hole_lo, hole_hi, 0),
+                time(loose_pieces, &column, cut_lo, cut_hi, 1),
+                time(loose_pieces_by_axis, &column, cut_lo, cut_hi, 1),
+            ));
+        }
+        for (dive_hole, axis_hole, dive_column, axis_column) in order {
+            println!(
+                "  A/B face order, hole: dive {dive_hole:.3} vs by-axis {axis_hole:.3} | \
+                 column: dive {dive_column:.3} vs by-axis {axis_column:.3}"
+            );
+        }
+
+        // The visited map's hasher, A/B/A in the same run. Dwyer's dense bitmap
+        // is not available at this extent, so what is on trial is whether
+        // hashing three integers we computed ourselves needs SipHash.
+        let mut hashers = Vec::new();
+        for _ in 0..3 {
+            hashers.push((
+                time(loose_pieces, &column, cut_lo, cut_hi, 1),
+                time(loose_pieces_siphashed, &column, cut_lo, cut_hi, 1),
+                time(loose_pieces, &ground, hole_lo, hole_hi, 0),
+                time(loose_pieces_siphashed, &ground, hole_lo, hole_hi, 0),
+            ));
+        }
+        for (fast_column, sip_column, fast_hole, sip_hole) in hashers {
+            println!(
+                "  A/B hasher, column: fast {fast_column:.3} vs siphash {sip_column:.3} | \
+                 hole: fast {fast_hole:.3} vs siphash {sip_hole:.3}"
+            );
+        }
     }
+
+    /// The hasher the walk ships with, and the standard library's, so the two
+    /// can be timed against each other in one run.
+    type Fast = std::hash::BuildHasherDefault<CellHasher>;
+    type SipHash = std::collections::hash_map::RandomState;
+
+    /// `loose_pieces` with the visited map hashed by SipHash, as it was before
+    /// 2026-09-28. For the timing comparison only.
+    fn loose_pieces_siphashed(
+        tree: &Contree,
+        lo: IVec3,
+        hi: IVec3,
+        budget: usize,
+    ) -> Vec<Vec<UVec3>> {
+        loose_pieces_in::<SipHash>(tree, lo, hi, budget, &FACES)
+    }
+
+    /// `loose_pieces` with the face order the node rewrite left behind, for the
+    /// timing comparison only.
+    fn loose_pieces_by_axis(
+        tree: &Contree,
+        lo: IVec3,
+        hi: IVec3,
+        budget: usize,
+    ) -> Vec<Vec<UVec3>> {
+        loose_pieces_in::<Fast>(tree, lo, hi, budget, &FACES_BY_AXIS)
+    }
+
 }

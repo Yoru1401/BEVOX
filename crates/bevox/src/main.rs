@@ -338,18 +338,6 @@ impl Default for BrushSettings {
     }
 }
 
-/// Left click paints at the cursor, right click erases, the wheel resizes.
-///
-/// Camera look is on middle-drag, which is what frees both other buttons for
-/// editing. Two earlier arrangements were bugs: erase on right-click when look
-/// was also on right-click destroyed geometry on every camera rotation, and
-/// erase on middle-click shared a physical control with the resize wheel. Ctrl
-/// is the movement-speed boost and nothing else.
-///
-/// The pick runs against the same tree the renderer draws, so what is clicked
-/// is what was seen. Placing the sphere at the hit point rather than at the
-/// voxel centre keeps the brush from stepping in whole voxels as the camera
-/// turns.
 /// The cursor in normalised device coordinates: -1 to 1 on each axis, y up.
 ///
 /// Screen coordinates run y-down from the top-left, so y is flipped. This
@@ -365,6 +353,18 @@ fn cursor_ndc(window: &Window) -> Option<Vec2> {
     Some(Vec2::new(p.x / w * 2.0 - 1.0, 1.0 - p.y / h * 2.0))
 }
 
+/// Left click paints at the cursor, right click erases, the wheel resizes.
+///
+/// Camera look is on middle-drag, which is what frees both other buttons for
+/// editing. Two earlier arrangements were bugs: erase on right-click when look
+/// was also on right-click destroyed geometry on every camera rotation, and
+/// erase on middle-click shared a physical control with the resize wheel. Ctrl
+/// is the movement-speed boost and nothing else.
+///
+/// The pick runs against the same tree the renderer draws, so what is clicked
+/// is what was seen. Placing the sphere at the hit point rather than at the
+/// voxel centre keeps the brush from stepping in whole voxels as the camera
+/// turns.
 #[allow(clippy::too_many_arguments)]
 fn brush_input(
     buttons: Res<ButtonInput<MouseButton>>,

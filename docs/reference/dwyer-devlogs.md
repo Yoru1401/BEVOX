@@ -1131,4 +1131,4 @@ actually built and measured.
 | 20 — corner and edge voxels, voxels as rounded shapes | [milestone 2](../superpowers/plans/2026-09-18-bevox-physics-milestone-2.md) |
 | 26 — TGS, warm starting keyed by voxel pair, per-material density, friction, restitution | [milestone 2](../superpowers/plans/2026-09-18-bevox-physics-milestone-2.md), [friction and restitution](../superpowers/plans/2026-09-18-bevox-physics-friction-restitution.md) |
 | 30 — `C`, `J`, and one λ for sixteen joint types | [Dwyer's joints](../superpowers/plans/2026-09-18-bevox-physics-dwyer-joints.md), [joint block conditioning](../concepts/joint-block-conditioning.md) |
-| 28 — fracture by impulse, cracks drawn as empty voxels, the disconnector doing the rest | not built |
+| 28 — fracture by impulse, cracks drawn as empty voxels, the disconnector doing the rest | [fracture](../superpowers/plans/2026-09-24-bevox-fracture.md) — cracks and the disconnector as he has them; the threshold adapted from his impulse to a closing speed |

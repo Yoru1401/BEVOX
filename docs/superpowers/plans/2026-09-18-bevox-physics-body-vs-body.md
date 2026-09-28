@@ -718,6 +718,6 @@ A cube thrown at another knocks it along and stops, momentum conserved. Three cu
 ## What this plan deliberately does not do
 
 - **No sleeping and no islands.** The measurement in Task 4 is what would justify them.
-- **No rolling resistance, no spinning friction.**
+- **No rolling resistance, no spinning friction.** **Wrong, and corrected 2026-09-24:** a lone voxel is a `Corner`, which is a sphere, so bodies that roll were already reachable. See [Sliding friction cannot stop a roll](../../concepts/rolling-needs-its-own-resistance.md).
 - **No fracture.** Dwyer has it; it needs a damage model this project has not specified.
 - **No joints.** That is milestone 5, and it is what the mouse grab is built on.

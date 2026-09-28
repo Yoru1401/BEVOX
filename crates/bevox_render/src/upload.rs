@@ -103,7 +103,7 @@ pub struct MarchUniform {
     pub camera_position: [f32; 4],
     /// Normalised direction *toward* the sun.
     pub sun_direction: [f32; 4],
-    /// `[depth, extent, march_flags, 0]`.
+    /// `[depth, extent, march_flags, marched body count]`.
     pub volume_params: [u32; 4],
     /// `[field_edge, field_cell_size, shadow casters, where they start]`.
     pub field_params: [u32; 4],

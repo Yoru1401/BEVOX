@@ -1,5 +1,33 @@
 # Update Log
 
+## 2026-09-28
+* **Fix**: a fracture's blow is the speed the two surfaces met at, not the
+  contact impulse divided by the owning body's mass. The owner is whichever
+  body the scene lists first, so the same collision read two ways -- and a
+  resting stack could shatter under weight that never moved. Two gates, each
+  proven by the alternative it rules out -
+  [Fracture](superpowers/plans/2026-09-24-bevox-fracture.md).
+* **Fix**: the detachment walk dives for the floor again, and its visited map
+  stopped being hashed with SipHash. A cut into terrain went from 0.26 ms to
+  0.138 -
+  [Detachment Over Tree Nodes](superpowers/plans/2026-09-24-bevox-detachment-over-nodes.md).
+* **Update**: the specs' Provenance section gained devlog 28, which fracture was
+  built from but which it never listed, and the five places this engine departs
+  from Dwyer that were not written down: the blow as a speed, rolling
+  resistance, the ambient-occlusion blend done without a sampler, the visited
+  map, and classification on every edit -
+  [BEVOX Rigid Bodies](superpowers/specs/2026-09-15-bevox-rigid-bodies-design.md).
+* **Update**: rolling resistance is recorded as a consequence of Dwyer's rounded
+  corners and edges rather than an invention -- a lone voxel is entirely corner,
+  so his shapes make it a sphere - and the two plans that deferred it with
+  "nothing in the scene is a ball yet" say so -
+  [Sliding friction cannot stop a roll](concepts/rolling-needs-its-own-resistance.md).
+* **Update**: claims the code does not support are corrected or marked unbuilt --
+  the contact lookup reach, the beam seed's neighbourhood, the output format, the
+  composite stage, the render resolution, the platform, and the GPU's absent
+  step-cap counter and error scopes -
+  [BEVOX ray-marcher core](superpowers/specs/2026-09-13-bevox-raymarcher-core-design.md).
+
 ## 2026-09-24
 * **Creation**: `bevox_physics`, a force and impulse API on `Body`, and a
   ceiling in voxels per second -

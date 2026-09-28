@@ -7,11 +7,27 @@
 //! matter of **deleting the right voxels** and letting detachment do what it
 //! already does.
 //!
-//! The threshold is on **impulse, never force**. A collision resolves inside one
-//! tick, so the same collision at 10 ms a tick and at 5 ms reports twice the
-//! force and the same impulse. A force threshold would break differently at 30
-//! and 60 frames a second, which is a physics bug that looks like a gameplay
-//! feature. `the_same_collision_breaks_at_any_tick_rate` holds that.
+//! The threshold is **never on force**, and that part is his. A collision
+//! resolves inside one tick, so the same collision at 10 ms a tick and at 5 ms
+//! reports twice the force; a force threshold breaks differently at 30 and 60
+//! frames a second, which is a physics bug that looks like a gameplay feature.
+//! `the_same_collision_breaks_at_any_tick_rate` holds that.
+//!
+//! **Where this parts from him: he thresholds the contact impulse, and this
+//! thresholds the speed the two surfaces met at.** Both are rate-independent,
+//! so his argument is kept; the closing speed answers two things his N.s units
+//! do not have to face.
+//!
+//! - An impulse grows with the mass a contact holds up. `Material::strength` is
+//!   a `u16`, and a resting stack leans on its contacts with impulses in the
+//!   hundreds of thousands, so an impulse threshold in these units shatters
+//!   anything for standing still. `resting_weight_breaks_nothing` is that gate,
+//!   and against an impulse it fails by 61,134 fractures.
+//! - Dividing an impulse by a mass to recover a speed has to choose a mass, and
+//!   a contact's owner is not it: a contact belongs to whichever body the scene
+//!   lists first. The same collision then read two ways.
+//!   `a_collision_breaks_the_same_things_whichever_body_is_listed_first` is that
+//!   gate. A closing speed is symmetric and needs no owner.
 
 use bevox_core::body::BodyId;
 use glam::{IVec3, UVec3, Vec3};
@@ -28,10 +44,13 @@ pub struct Fracture {
     pub voxel: UVec3,
     /// Whose voxel it is. `None` is the static world.
     pub body: Option<BodyId>,
-    /// What the contact carried, in the solver's units.
+    /// The most the contact carried at any point in the tick, in the solver's
+    /// units. The peak rather than what it ended with: a collision that
+    /// resolved and let go is back at zero by the end of the tick.
     pub impulse: f32,
-    /// The speed that took out of the striking body, in voxels a second, which
-    /// is what was tested against the material's strength.
+    /// How fast the two surfaces met, in voxels a second, which is what was
+    /// tested against the material's strength. The same number whichever side
+    /// of the contact is asked about.
     pub blow: f32,
     /// How far past that strength it went: 1.0 exactly at the threshold, 3.0
     /// for three times what the material could take. What sizes the cracks.

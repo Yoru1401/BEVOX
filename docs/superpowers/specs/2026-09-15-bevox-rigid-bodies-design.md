@@ -195,7 +195,11 @@ Once per physics tick, for every pair that can touch:
    contact.
 3. **Lookup.** A candidate voxel's centre is transformed into the other side's
    grid, and every voxel within `ceil(margin + 0.5)` of the voxel containing it
-   is examined: 3x3x3 at rest, 5x5x5 at the speed cap. Dwyer's devlog says the
+   is examined: 3x3x3 at rest, 11x11x11 at the speed cap. (`ceil(margin + 0.5)`
+   is a radius, so the box is twice it plus one: at rest the margin is
+   `BASE_MARGIN` 0.1 and the reach 1, and at the cap the margin is
+   `MAX_SPEED * dt + BASE_MARGIN`, 4.1 at 64 Hz, and the reach 5. This said
+   5x5x5, reading the radius as the extent.) Dwyer's devlog says the
    nearest 8. That misses speculative contacts, and a corner resting exactly one
    voxel above a floor sits on its tie boundary, so the contact would come and
    go from tick to tick and warm starting would lose it.
@@ -268,8 +272,12 @@ search using **6-connectivity** (face neighbours only), starting from the solid
 voxels around the edit.
 
 - **Grounded** means reaching the world's floor (`y == 0`). A walk stops the
-  moment it does, and dives downward first, so a cut into the ground costs a
-  few dozen steps rather than a full search.
+  moment it does, and **tries the downward face last so the stack pops it
+  first**, so a cut into the ground costs a few dozen steps rather than a full
+  search. The order is worth about 27% of the grounded case, which is the common
+  one; the node rewrite dropped it for four days without a test noticing,
+  because the order changes how fast the walk finds the floor and never what
+  comes free.
 - **Too big** means outgrowing a budget. A walk that does gives up and calls the
   piece grounded, so a cut into a mountainside never walks the mountain.
 - A later walk that runs into an earlier walk's voxels is on that earlier
@@ -291,9 +299,15 @@ neighbour this one never saw.
 
 Measured (release, interleaved against the voxel walk in one run): freeing a
 2,560-voxel column takes 0.23 ms against 1.03-1.12, about 4.5 times faster. A
-cut into solid ground, where the early exit already ends the walk in a few
-steps, is unchanged at about 0.26 ms. The budget still counts voxels, so what
-detaches is exactly what detached before.
+cut into solid ground cost about 0.26 ms and now costs **0.138**, once the
+downward-first face order was restored and the visited map stopped being hashed
+with SipHash. The budget still counts voxels, so what detaches is exactly what
+detached before.
+
+The visited set is a hash map where Dwyer uses a dense bitmap, which is the one
+place this search cannot follow him: his world is chunked, and this tree's
+extent reaches 4096, so a dense array would be 6.9e10 entries and a walk may
+roam anywhere inside `BUDGET` of the cut.
 
 A piece is never taken when the renderer has no room to draw it: past the body
 cap, the largest pieces go first and the rest stay in the world, still drawn.
@@ -506,14 +520,24 @@ by **setting voxels empty**; and the code that already turns loose voxels into
 bodies makes the pieces -- `sculpt::split` for a body, `detach` for the world.
 Nothing plans a piece or copies a volume.
 
-- **The blow is a speed**, the impulse the contact carried divided by the mass
-  it acted on, in voxels a second. An impulse threshold would have a large body
-  shatter under its own weight, because a contact's impulse grows with the mass
-  resting on it. It is never a *force*: a collision resolves inside one tick, so
-  a force threshold breaks differently at 30 and 60 frames a second.
+- **The blow is a speed**: how fast the two surfaces met, read at detection
+  before the substeps destroy it, in voxels a second. It is never a *force* --
+  a collision resolves inside one tick, so a force threshold breaks differently
+  at 30 and 60 frames a second -- and this is the reason Dwyer gives for
+  thresholding the impulse.
+- **This is where fracture parts from him**, and the reason is units, not
+  taste. His thresholds are in N.s; `strength` here is a `u16`. An impulse
+  grows with the mass a contact holds up, so in these units a stack standing
+  still carries impulses in the hundreds of thousands against a glass strength
+  of 20, and his rule shatters anything for existing. A closing speed keeps his
+  rate-independence and adds symmetry: one collision has one blow, so both
+  sides are asked the same question. A blow divided by *a* mass has to pick one,
+  and a contact's owner is whichever body the scene lists first -- which is how
+  the same collision came to read two ways.
 - **Part of the impulse is handed back** to a contact that broke something, so a
   body carries on through what it broke instead of stopping at a hole nothing
-  went through.
+  went through. The share is of the *peak* the contact carried: one that
+  resolved and let go inside the tick ends it carrying nothing.
 - **Cracks are a few random planes** through the impact, seeded by the voxel and
   the impulse, reaching further and cutting more finely the harder the hit.
   Dwyer authors boolean pattern volumes per material instead; that is a data
@@ -582,6 +606,19 @@ this list is all that is known of it here:
   - Sleeping.
   - Merging debris back into the terrain when out of view.
   - Multithreading.
+- **#28, [How I made voxels SHATTER on impact](https://www.youtube.com/watch?v=lsTHpbEN0dE).**
+  - A contact whose **impulse** passes the material's threshold raises a
+    fracture event, checked inside the solver against the materials of the two
+    voxels touching there.
+  - Why it must not be a force: a collision resolves within one tick, so the
+    same 4 N.s reads as 400 N at 10 ms a tick and 800 N at 5 ms.
+  - The impulse at a fracturing contact is reduced, so the bodies carry
+    velocity into the next tick -- "what makes or breaks the realism here".
+  - Cracks are drawn by **setting voxels empty**, and the disconnector that
+    fells trees produces the pieces; nothing plans or copies a piece.
+  - Patterns are authored boolean voxel volumes in a per-material fracture
+    table, chosen by impulse plus randomness, each cached in six orientations,
+    with helpers from planes and Worley noise.
 
 Filled in by this design, **not** shown in his devlogs:
 
@@ -604,4 +641,26 @@ Filled in by this design, **not** shown in his devlogs:
 - storing angular momentum instead of angular velocity;
 - the centre-of-mass pivot formula;
 - `u16` density;
-- the tick rate.
+- the tick rate;
+- **the blow as a closing speed rather than his contact impulse.** His
+  rate-independence argument is kept; `strength` being a `u16` is what his N.s
+  do not have to face, and a speed is symmetric where an impulse divided by a
+  mass has to choose one. See the Fracture section;
+- **rolling resistance at the contact.** Nothing in the devlogs has it. It is
+  not a departure but a consequence of taking his rounded corners and edges: a
+  lone voxel, or a one-voxel-wide stack, is *entirely* corner and edge and so
+  entirely rounded, which makes it a sphere or a cylinder that rolls and never
+  settles. Sliding friction cannot stop a roll, so his shapes need a force he
+  never needed to name. See `docs/concepts/rolling-needs-its-own-resistance.md`;
+- **the ambient-occlusion blend done in the shader.** His is one
+  hardware-filtered texture read, which is the reason he calls it cheap; here
+  the fullness grid rides in the distance field's storage buffer to stay under
+  wgpu's eight-storage-buffer limit, so there is no sampler and the trilinear
+  blend is eight reads and nine weights in WGSL. It measured inside drift
+  anyway. See `docs/concepts/coarse-grids-share-one-buffer.md`;
+- **a hash map of visited cells, where he uses a dense bitmap.** He names the
+  bitmap as what makes "is this node in the component" constant time and the
+  node walk worth doing;
+- **classification re-run on every edit.** He classifies once, when an object
+  spawns, which is enough for an engine whose bodies are not editable; this one
+  edits bodies with the brush and fractures them, so `recompute` relabels.

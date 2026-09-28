@@ -28,15 +28,13 @@ pub struct Material {
     pub density: u16,
     pub friction: u8,
     pub restitution: u8,
-    /// The impact this material survives, as the speed change a contact
-    /// imposes on the body that struck it, in voxels a second.
-    /// `UNBREAKABLE` survives anything.
+    /// The impact this material survives, as the speed the two surfaces met
+    /// at, in voxels a second. `UNBREAKABLE` survives anything.
     ///
-    /// A speed, not an impulse, so that a large body does not shatter under
-    /// its own weight: a contact's impulse grows with the mass resting on it,
-    /// while the speed it takes away does not. It is derived from an impulse
-    /// all the same -- never from a force, which would depend on the tick
-    /// rate. `physics::fracture` says why.
+    /// A closing speed, not an impulse: an impulse grows with the mass a
+    /// contact holds up, so in these units resting weight alone would shatter
+    /// a stack. Never a force either, which would depend on the tick rate.
+    /// `physics::fracture` says where that parts from Dwyer and why.
     pub strength: u16,
 }
 
@@ -52,11 +50,15 @@ pub const DEFAULT_RESTITUTION: u8 = 5;
 
 /// What a material takes before it cracks when its source says nothing.
 ///
-/// In voxels a second, as `Material::strength` is. A body resting under
-/// gravity changes speed by about 0.15 a tick, and a fall of twenty voxels
-/// arrives at about twenty, so forty is "survives a serious fall, breaks when
-/// thrown".
-pub const DEFAULT_STRENGTH: u16 = 40;
+/// In voxels a second, as `Material::strength` is, and read against the speed
+/// the two surfaces met at. Gravity is 98.1 voxels a second squared, so a body
+/// dropped `h` voxels arrives at `sqrt(2 * 98.1 * h)`: about 20 from two
+/// voxels, 63 from twenty, 99 from fifty, against a terminal speed of 200.
+///
+/// So 150 is "survives any fall a player builds and breaks when it is thrown
+/// or blasted" -- a drop of 115 voxels to crack it by falling alone. Default
+/// terrain should be the tough case; what is meant to shatter says so.
+pub const DEFAULT_STRENGTH: u16 = 150;
 
 /// A material that never fractures, however hard it is hit.
 pub const UNBREAKABLE: u16 = u16::MAX;

@@ -1,14 +1,25 @@
 ---
 type: Post-mortem
 title: 'Sliding friction cannot stop a roll'
-description: 'A lone voxel is a sphere, and a rolling sphere barely slips, so friction never slows it; it rolled for ever and never slept until contacts got rolling resistance.'
-tags: [physics, solver, sleeping, materials]
+description: "Dwyer's rounded corners and edges make a lone voxel a sphere, and a rolling sphere barely slips, so friction never slows it; it rolled for ever and never slept until contacts got rolling resistance."
+tags: [physics, solver, sleeping, materials, dwyer]
 generated: { by: claude-opus-5/claude-code, at: 2026-09-24T00:00:00Z }
 sources:
-  - id: dwyer
+  - id: shapes
     resource: /reference/dwyer-devlogs.md
-    title: "Douglas Dwyer's voxel engine, devlog by devlog"
+    title: "Douglas Dwyer's voxel engine, devlog by devlog — #20 and #26, for the collision shapes this follows from"
+  - id: deferred
+    resource: /superpowers/plans/2026-09-18-bevox-physics-friction-restitution.md
+    title: 'Friction and Restitution Implementation Plan — where "a ball would roll forever; nothing in the scene is a ball yet" was written down'
 ---
+
+> **Where this sits against Dwyer.** Rolling resistance appears in none of the
+> thirty devlogs, and it is still not a departure from him: it is what his own
+> collision shapes force. Taking his rounded corners and edges means a voxel
+> with no neighbours is a sphere and a one-wide column is cylinders on a
+> sphere, so his geometry produces bodies that roll. He never had to name the
+> force because his debris is trees and rubble, many voxels wide; a voxel
+> engine that detaches single voxels does.
 
 # The symptom
 
@@ -31,7 +42,11 @@ A voxel's collision shape comes from how many axes it has solid neighbours on
 | all three | `Interior` — never touched |
 
 A lone voxel has no neighbours at all, so **it is a sphere**. A one-wide tower
-is cylinders standing on a sphere.
+is cylinders standing on a sphere. Nothing about that is an approximation to be
+tightened: it is the exact shape Dwyer's scheme asks for, and rounding is what
+makes the contact rotation-invariant in the first place (his devlog 26, where
+axis-aligned boxes gave wrong normals and jitter). The roll comes with the fix
+for the jitter.
 
 And a rolling sphere has almost no slip where it touches the ground. Sliding
 friction opposes relative surface velocity, and in a true roll that velocity is
@@ -66,7 +81,10 @@ fixture, not a stronger threshold.
 # The rule
 
 **A shape that can roll needs a force that opposes rolling.** Friction is not
-that force. And when a body will not settle, look at what shape the contact
+that force. And **the shapes decide what can roll, so read them before deciding
+nothing can**: two plans deferred this with "a ball would roll forever; nothing
+in the scene is a ball yet", written while every lone voxel in the engine was
+already a ball. And when a body will not settle, look at what shape the contact
 thinks it is before looking at the sleep thresholds — see
 [terrain-only merging](terrain-only-merging.md) for what depends on bodies
 actually falling asleep.

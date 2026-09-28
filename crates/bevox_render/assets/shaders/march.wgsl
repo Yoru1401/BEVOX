@@ -10,7 +10,7 @@ struct MarchUniform {
     offset_from_clip: mat4x4<f32>,
     camera_position: vec4<f32>,
     sun_direction: vec4<f32>,
-    volume_params: vec4<u32>,  // [depth, extent, flags, 0]
+    volume_params: vec4<u32>,  // [depth, extent, flags, marched body count]
     // [field_edge, field_cell_size, shadow caster count, where the casters start]
     field_params: vec4<u32>,
     // [the word the fullness grid starts at inside `distance_field`, 0, 0, 0]
