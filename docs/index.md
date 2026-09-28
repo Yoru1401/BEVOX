@@ -14,6 +14,19 @@ Read a spec for what the engine is meant to be, a concept for a fact worth
 carrying into the next piece of work, and a plan for why one piece of it is the
 way it is and what it cost.
 
+# Start here
+
+* [The engine on one page](map/) - the four crates, the two loops, the numbers
+  everything sits inside, and where to go to change a given thing.
+* [bevox_core](map/core.md) - the voxel data structure and the algorithms over it.
+* [bevox_physics](map/physics.md) - bodies, contacts, joints, fracture, sleeping.
+  Its tunables are on [their own page](map/physics-constants.md).
+* [bevox_render](map/render.md) - the Bevy plugin, the shader, and one frame.
+
+A map page says what is true now, and its factual half is checked against the
+source by `tests/map.rs` in each crate. Everything below says how it came to be
+true, and is never rewritten to match.
+
 # Concepts
 
 Start here. Each one is a rule, a measured number, a decision or a post-mortem,

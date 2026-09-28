@@ -1,6 +1,13 @@
 # Update Log
 
 ## 2026-09-28
+* **Creation**: [the map](map/) — five one-page overviews, after Stone Librande's
+  GDC talk on one-page designs: the engine, then a page per crate, plus the
+  physics tunables. Each is capped at a page, and the half of each that is
+  derivable from the source is checked against it by `crates/bevox/tests/map.rs`,
+  so a page cannot quietly stop being true. The bundle's front door is now the
+  map; the specs and plans behind it say how it came to be true and are never
+  rewritten to match.
 * **Fix**: a fracture's blow is the speed the two surfaces met at, not the
   contact impulse divided by the owning body's mass. The owner is whichever
   body the scene lists first, so the same collision read two ways -- and a
