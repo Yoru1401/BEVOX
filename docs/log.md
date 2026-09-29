@@ -1,5 +1,13 @@
 # Update Log
 
+## 2026-09-30
+* **Update**: the static march measured rather than guessed at. **A primary ray
+  takes nine steps**, so the marcher is not step-bound and Dwyer's four
+  accelerations have already taken the walk to almost nothing — no traversal
+  work can close the gap to his 7 ms castle. Workgroup size measured for the
+  first time: 16x16 within drift, 32x32 a 2.45 ms regression, so 8 stays and the
+  question is closed — [nine steps a ray](concepts/nine-steps-a-ray.md).
+
 ## 2026-09-29
 * **Fix**: the engine stops asking for wgpu's defaults, which are the **WebGPU
   spec baseline** — eight storage buffers per stage where the GTX 1650 offers

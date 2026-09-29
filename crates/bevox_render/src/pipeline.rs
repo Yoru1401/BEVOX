@@ -87,6 +87,10 @@ pub fn device_limits() -> WgpuLimits {
         // So the 512 MB budget is reachable in a single binding.
         max_storage_buffer_binding_size: 1024 * 1024 * 1024,
         max_buffer_size: 2 * 1024 * 1024 * 1024,
+        // 8x8 is 64 today. The baseline's 256 caps a 16x16 workgroup exactly and
+        // forbids 32x32, and workgroup size is worth measuring for a
+        // memory-bound marcher: it sets occupancy and how reads coalesce.
+        max_compute_invocations_per_workgroup: 1024,
         ..WgpuLimits::default()
     }
 }

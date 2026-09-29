@@ -1188,3 +1188,126 @@ fn what_the_adapter_allows() {
         asked.max_storage_buffer_binding_size as u64 / (1024 * 1024),
         have.max_storage_buffer_binding_size as u64 / (1024 * 1024));
 }
+
+/// What the static march costs, and why — workgroup size, and how many steps a
+/// ray actually takes.
+///
+/// The static world is **13.23 ms of a 16.7 ms frame** before a body exists,
+/// against Dwyer's **7 ms for a Teardown castle on a 1660 Ti** with a primary
+/// and a shadow ray (his devlog 17). A 1650 is roughly a third down on a
+/// 1660 Ti, so the hardware explains part of a 2x gap and not all of it. This
+/// asks two questions the flag benchmarks cannot:
+///
+/// 1. **Is the marcher step-bound or bandwidth-bound?** The mean steps per ray
+///    divides the frame into "how many steps" and "what a step costs". If the
+///    mean is low and the frame is still slow, more traversal cleverness is the
+///    wrong lever.
+/// 2. **Does workgroup size matter?** `WORKGROUP` has been 8 since the shader
+///    was written, never measured. For a memory-bound kernel it sets occupancy
+///    and how neighbouring rays' reads coalesce. 16x16 is 256 invocations,
+///    exactly the WebGPU baseline's ceiling, which is one reason it was never
+///    tried; `device_limits` now asks for 1024 so 32x32 is reachable too.
+///
+/// The shader is read from disk, so the workgroup size is rewritten in the
+/// source and every variant is compiled and timed in this one invocation —
+/// cross-run drift here is routinely larger than the effect.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench static_march
+/// -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn the_static_march_is_measured() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    if !timestamps_supported(&device) {
+        eprintln!("adapter has no TIMESTAMP_QUERY, skipping");
+        return;
+    }
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let (w, h) = (1280u32, 720u32);
+    let lit = march_flags::DEFAULT;
+
+    // How many steps a ray spends. `march_steps` writes steps/64 into red,
+    // clamped, so the mean red channel times 64 is the mean step count for
+    // every ray that did not saturate, and the saturated share is reported
+    // beside it so the mean is never read as the whole story.
+    let heat = Prepared::new(
+        &device, &shader, "march_steps", &tree, offset_from_clip, eye, w, h, lit, &[],
+    );
+    let image = heat.read_back(&device, &queue);
+    let reds: Vec<u32> = image.chunks_exact(4).map(|p| u32::from(p[0])).collect();
+    let saturated = reds.iter().filter(|&&r| r == 255).count();
+    let mean_steps = reds.iter().sum::<u32>() as f64 / reds.len() as f64 / 255.0 * 64.0;
+    println!("\nsteps per ray on the bench scene, from the `march_steps` view:");
+    println!("  mean {mean_steps:.1} of a 64-step scale");
+    println!(
+        "  {} of {} rays saturated the scale ({:.2}%), so the true mean is at least this",
+        saturated,
+        reds.len(),
+        saturated as f64 / reds.len() as f64 * 100.0,
+    );
+
+    // Workgroup size, every variant compiled and timed in this run.
+    let sizes = [8u32, 16, 32];
+    let built: Vec<(u32, Prepared)> = sizes
+        .iter()
+        .map(|&n| {
+            let src = shader.replace(
+                "@workgroup_size(8, 8, 1)",
+                &format!("@workgroup_size({n}, {n}, 1)"),
+            );
+            let p = Prepared::with_workgroup(
+                &device, &src, "march", &tree, offset_from_clip, eye, w, h, lit, &[], n,
+            );
+            (n, p)
+        })
+        .collect();
+
+    // Every variant must draw the same picture: workgroup size is a scheduling
+    // choice and may not move a pixel.
+    let reference = built[0].1.read_back(&device, &queue);
+    for (n, p) in &built[1..] {
+        let got = p.read_back(&device, &queue);
+        let differing = reference
+            .chunks_exact(4)
+            .zip(got.chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(differing, 0, "{n}x{n} changed {differing} pixels; it is a scheduling choice");
+    }
+
+    let gpu_ms = |p: &Prepared| {
+        p.dispatch(&device, &queue);
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let mut t: Vec<f32> =
+            (0..7).map(|_| p.dispatch_timed(&device, &queue).expect("timestamps").total()).collect();
+        median(&mut t)
+    };
+    let mut rounds: Vec<Vec<f32>> = vec![Vec::new(); built.len()];
+    for _ in 0..3 {
+        for (i, (_, p)) in built.iter().enumerate() {
+            rounds[i].push(gpu_ms(p));
+        }
+    }
+
+    println!("\nstatic march, GPU ms, median of 3 rounds x 7, interleaved:");
+    let mut base = 0.0f32;
+    for ((n, _), samples) in built.iter().zip(&mut rounds) {
+        let spread = samples.iter().fold(0.0f32, |a, &b| a.max(b))
+            - samples.iter().fold(f32::MAX, |a, &b| a.min(b));
+        let m = median(samples);
+        if *n == 8 {
+            base = m;
+        }
+        let delta = if *n == 8 { String::new() } else { format!("  {:+.2} ms", m - base) };
+        println!("  {n:>2}x{n:<2} ({:>4} invocations): {m:6.2} ms  (spread {spread:.2}){delta}", n * n);
+    }
+    println!(
+        "\n  A difference smaller than its spread is not a result. Dwyer's reference point: 7 ms \
+         for a Teardown castle on a 1660 Ti, primary and shadow ray."
+    );
+}

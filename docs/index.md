@@ -39,6 +39,7 @@ lifted out of the plan that produced it.
 * [An inference is not an observation](concepts/an-inference-is-not-an-observation.md) - a claim about behaviour names the code that makes it true, because no gate can read prose.
 * [The body cap, and what a body costs](concepts/body-cap.md) - 0.265 ms per visible body, and why MAX_BODIES is 16.
 * [The frame budget, and where it goes](concepts/frame-budget.md) - sixteen bodies with shadows take 22.6 ms against 16.7.
+* [Nine steps a ray, so the walk is not the cost](concepts/nine-steps-a-ray.md) - a primary ray takes nine steps, so the static march is bound by what a step costs, not how many.
 * [Both coarse grids ride in one storage buffer](concepts/coarse-grids-share-one-buffer.md) *(premise corrected)* - eight was wgpu's browser baseline, not the hardware's limit; the adapter allows 524,288.
 * [Only terrain debris merges back](concepts/terrain-only-merging.md) - what may return to the world, and why it must be out of view.
 * [Sliding friction cannot stop a roll](concepts/rolling-needs-its-own-resistance.md) - a lone voxel is a sphere, and nothing was slowing it down.

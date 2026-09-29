@@ -217,6 +217,10 @@ pub fn read_texture(
 pub const BEAM_SCALE: u32 = 8;
 
 pub struct Prepared {
+    /// Threads per axis in the shader's `@workgroup_size`, so the dispatch can
+    /// match it. Eight for every caller but the workgroup bench, which rewrites
+    /// the shader source and has to dispatch the matching grid.
+    workgroup: u32,
     pipeline: wgpu::ComputePipeline,
     /// Present only when the beam flag is set, so the suite does not compile a
     /// prepass for the hundred dispatches that never run one.
@@ -275,6 +279,7 @@ impl GpuTime {
 
 impl Prepared {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         source: &str,
@@ -286,6 +291,30 @@ impl Prepared {
         height: u32,
         flags: u32,
         bodies: &[bevox_core::body::Body],
+    ) -> Self {
+        Self::with_workgroup(
+            device, source, entry_point, tree, offset_from_clip, eye, width, height, flags,
+            bodies, 8,
+        )
+    }
+
+    /// The same, for a shader whose `@workgroup_size` is not eight.
+    ///
+    /// `workgroup` must match what `source` declares, or the dispatch covers
+    /// the wrong number of pixels and the image is wrong rather than slow.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_workgroup(
+        device: &wgpu::Device,
+        source: &str,
+        entry_point: &str,
+        tree: &Contree,
+        offset_from_clip: Mat4,
+        eye: Vec3,
+        width: u32,
+        height: u32,
+        flags: u32,
+        bodies: &[bevox_core::body::Body],
+        workgroup: u32,
     ) -> Self {
         let field = bevox_core::distance_field::DistanceField::build(tree);
         // The static world packed with every body, in the same buffers and the
@@ -537,6 +566,7 @@ impl Prepared {
         });
 
         Self {
+            workgroup,
             pipeline,
             beam_pipeline,
             bind_group,
@@ -581,8 +611,8 @@ impl Prepared {
             pass.set_pipeline(beam);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(
-                self.width.div_ceil(BEAM_SCALE).max(1).div_ceil(8),
-                self.height.div_ceil(BEAM_SCALE).max(1).div_ceil(8),
+                self.width.div_ceil(BEAM_SCALE).max(1).div_ceil(self.workgroup),
+                self.height.div_ceil(BEAM_SCALE).max(1).div_ceil(self.workgroup),
                 1,
             );
         }
@@ -592,7 +622,7 @@ impl Prepared {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
+        pass.dispatch_workgroups(self.width.div_ceil(self.workgroup), self.height.div_ceil(self.workgroup), 1);
         drop(pass);
 
         if timed && let Some(t) = &self.timestamps {
