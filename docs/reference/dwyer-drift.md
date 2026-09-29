@@ -56,12 +56,31 @@ step to the next voxel, and if another object offers a shorter one, continue in
 that object instead. One interleaved traversal over every volume.
 
 BEVOX marches the static world and then **each body in turn, keeping the nearest
-hit** — `1 + N` marches per ray. That is the sorted-per-object shape he
-abandoned, and it is why cost is per-visible-body and per-pixel, and why
-`MAX_BODIES` is 16 and moves with resolution.
+hit** — the sorted-per-object shape he abandoned — and visits them in **table
+order**, so the running nearest hit tightens late and most traversals only
+narrow an answer another one already had.
 
-Nothing in the bundle records that his answer to this exact problem was not
-taken. It is the first thing to read before trying to raise the cap.
+**Corrected 2026-09-29, after reading the shader rather than the flag docs.**
+This entry first said "`1 + N` unaccelerated marches from the ray origin", and
+that overstates it. Three of the four things one would reach for are already
+built: `traverse_at` seeds its first frame at the body's **bounding-box entry**,
+not the camera; `compose_bodies`'s `limit` tightens on every hit so a body behind
+the nearest one exits on its first step; and `BODY_RECT` skips a body for pixels
+outside its screen rectangle before anything is read or transformed.
+
+What is genuinely missing is narrower, and one half of it is not Dwyer's at all:
+
+- **Ray order**, which is his devlog-2 point, and the early break that makes cost
+  sublinear in the body count.
+- **A bounding-sphere reject on the primary path.** `GpuBody::bound` exists and
+  its own comment says it is "filled in only for the shadow casters; the marched
+  table leaves it zero". So an optimisation this project built, measured at **20
+  ms a frame**, and documented is applied to one of its two ray types. That is
+  an asymmetry inside BEVOX, not a divergence from him, and it is the cheaper
+  half.
+
+Both are specified in
+[body composition in ray order](../superpowers/specs/2026-09-29-bevox-body-composition-design.md).
 
 ## 2. Sunlight costs a ray per pixel, not a ray per voxel — devlog 19
 
@@ -178,11 +197,13 @@ Three consequences for the plan:
 - **Neither fix alone gets sixteen bodies inside the frame.** Removing all the
   primary cost leaves 18.25 ms; removing all the shadow cost leaves 18.28. The
   budget is 16.7.
-- **Interleaved stepping should attack both halves, not just the primary one.** A
-  shadow ray that the static world leaves clear tests every caster in turn — the
-  same `1 + N` shape as the primary composition. One interleaved traversal serves
-  both ray types, which makes divergence 1 the better first move even though the
-  two halves are equal.
+- **Ordering helps the primary half far more than the shadow half**, contrary to
+  what this page first said. A shadow ray already rejects each caster by its
+  bounding sphere and returns on the *first* hit rather than the nearest, so any
+  occluder will do and distance is a poor proxy for which to test first. The
+  remaining shadow cost is rays that genuinely pass near bodies and must traverse
+  them; ordering does not reduce that. Divergence 1 is still the better first
+  move, because it is cheaper and lower-risk, not because it serves both halves.
 - **The static march is the real ceiling.** 13.23 ms of a 16.7 ms frame before a
   single body exists, at this camera. No work on body composition moves it, and
   any target above roughly five bodies has to face it.

@@ -51,6 +51,7 @@ lifted out of the plan that produced it.
 # Design specs
 
 * [BEVOX ray-marcher core](superpowers/specs/2026-09-13-bevox-raymarcher-core-design.md) - A sparse voxel world ray marched on the GPU, with a CPU reference the shader is held to pixel for pixel.
+* [Body composition in ray order](superpowers/specs/2026-09-29-bevox-body-composition-design.md) - cut the primary half of a body's cost by rejecting with the bounding sphere the shadow path already has, then visiting bodies in ray order.
 * [BEVOX Rigid Bodies](superpowers/specs/2026-09-15-bevox-rigid-bodies-design.md) - Voxel chunks that detach from the static world, fall, tumble and come to rest, rendered by the same ray marcher that draws everything else.
 
 # Implementation plans
