@@ -158,19 +158,139 @@ of the seven above. `scope` was never BEVOX's to build.
 | 29 | Kinematic character controller; Quake stair-stepping; damped-spring camera; immutable `CharacterMover` | Fly camera only | scope |
 | 30 | Joints as `C`, `J`, one λ; sixteen types; friction and motors; the grab as a joint; joints follow a body after a split | All of it, plus a bias per substep that he shows none of | adapted |
 
+# What the measurement says about 1 to 3
+
+`where_a_body_s_cost_goes`, 2026-09-29, GTX 1650, 1280x720, bench camera, every
+configuration interleaved in one invocation:
+
+| | GPU ms |
+|---|---|
+| static world, `DEFAULT` | 13.23 |
+| sixteen bodies | **23.30** |
+| sixteen bodies, no body shadows | 17.83 |
+
+**A body costs 0.629 ms and it splits down the middle** — 0.316 ms of primary
+march against 0.314 ms of shadow-ray caster tests. So divergence 1 and
+divergences 2-3 are worth *the same amount*, which was not knowable before.
+
+Three consequences for the plan:
+
+- **Neither fix alone gets sixteen bodies inside the frame.** Removing all the
+  primary cost leaves 18.25 ms; removing all the shadow cost leaves 18.28. The
+  budget is 16.7.
+- **Interleaved stepping should attack both halves, not just the primary one.** A
+  shadow ray that the static world leaves clear tests every caster in turn — the
+  same `1 + N` shape as the primary composition. One interleaved traversal serves
+  both ray types, which makes divergence 1 the better first move even though the
+  two halves are equal.
+- **The static march is the real ceiling.** 13.23 ms of a 16.7 ms frame before a
+  single body exists, at this camera. No work on body composition moves it, and
+  any target above roughly five bodies has to face it.
+
+Honest limits of this measurement: the per-body figures at **one** and **four**
+bodies sit inside the noise — spreads of 1.0 to 3.0 ms against effects of 0.3 —
+and the one-body shadow delta came out *negative*, which is impossible and is
+drift. Only the sixteen-body decomposition is above the noise floor, so the claim
+is the 50/50 split at sixteen, not a per-body slope.
+
+# Divergences 4 to 7, weighed
+
+Divergences 1 to 3 are the renderer's limit and are being worked on. These four
+are not blocking anything, so each is weighed rather than scheduled.
+
+**6 and 7 turn out to be one thing.** Both want the same missing primitive: a
+node-aware operation that copies one tree's region into another. His paste is
+that with a mask; a region copy is that without one. Neither exists here.
+
+| # | Impact | Better | Why |
+|---|---|---|---|
+| 4 | **High, already realised** | **His** | His validation finds instability; ours find scenarios |
+| 5 | None — ours wins | **Ours** | He rejected it for a renderer BEVOX does not have |
+| 6+7 | **Medium, and measurable** | **His** | Detachment finds nodes and then throws them away |
+
+## 4. No stress scene — his tumbler against our three cubes
+
+**Impact: high, and it has already cost something.** On 2026-09-28 a 240:1 mass
+ratio through a one-voxel plate made a stack accelerate *upward* at 23 voxels a
+second by tick 33 — four substeps of sequential impulses cannot hold that ratio.
+Nothing in the suite would have found it, because every physics gate here proves
+a **named scenario**: a cube lands, a stack of three stands, a chain holds, a
+lone voxel sleeps. His tumbler proves **stability under load**, which is a
+different property and the one that actually broke.
+
+**The change, and it is not a 2D engine.** His "build the 2D version first"
+advice only pays before the 3D solver exists, and it exists and works; taking it
+now means rebuilding what passes 117 tests. What transfers is the *scene*: some
+dozens of bodies in a closed container that can only rotate, required to settle,
+stay settled, and pass force through the pile when the container turns. No new
+engine code — a fixture and three assertions. `MAX_BODIES` does not constrain it,
+because the cap is the renderer's and this is a headless physics test.
+
+**Better: his, clearly.** Ours is not wrong, it is incomplete: named scenarios
+cannot catch a class of failure nobody named.
+
+## 5. A distance field he measured and rejected
+
+**Impact: none, and ours is the better call.** He built the field, measured it,
+and kept parallax ray marching instead. BEVOX's field is worth a measured 12.8%
+on top of the other three optimisations, because BEVOX has no rasteriser for it
+to lose to.
+
+**The change: one line in the core spec**, recording that the field is kept
+against his verdict and why. Nothing in code.
+
+**Better: ours, for this renderer.** The general lesson is worth more than the
+item: **his verdicts are tied to his architecture and do not transfer.** "Dwyer
+rejected X" is not evidence against X here, and this page should not be read as
+though it were.
+
+## 6 and 7. The missing two-tree operation
+
+**Impact: medium, and it is a speed cost today, not a missing feature.**
+Detachment was made 4.5× faster on 2026-09-24 by walking the tree's uniform
+nodes instead of single voxels — and then `walk` **expands every cell it found
+back into individual voxels**:
+
+```rust
+for cell in cells {
+    for z in .. { for y in .. { for x in .. { piece.push(..) } } }
+}
+```
+
+`detach` then calls `tree.clear_voxels(&piece)` and
+`Contree::from_voxels(extent, &local)`. So a 2,560-voxel column is found in a
+handful of cells and then handled as 2,560 entries, twice. The node structure the
+walk worked to discover is thrown away at the door.
+
+**The change:** `Contree::copy_region`, node-aware, plus a node-aware clear, and
+then detachment hands over cells rather than voxels. Measurable directly against
+the current path in `a_detach_is_timed`, which already interleaves walks.
+
+**Where it does *not* help, and this matters:** `merge` writes a body into the
+world voxel by voxel because the body is at an **arbitrary rotation** — each
+voxel snaps to the world cell under its own centre, and no node-aware copy can
+do that. Merge stays as it is. So the win is detachment and fracture, not
+everything that looks like a copy.
+
+**Better: his**, and it subsumes ours — the sphere brush becomes a paste of a
+generated sphere. But that generality is worth nothing today, since every edit
+BEVOX makes is a sphere. Build the primitive because detachment needs the speed;
+leave the brush alone until something needs the mask.
+
 # What to do with this
 
 - **Before raising `MAX_BODIES`**, read divergence 1. His answer to that exact
   cap is in devlog 2 and BEVOX never took it.
-- **Before optimising shadows**, read divergences 2 and 3. One ray per visible
-  voxel is a measured win of his that BEVOX is paying for and not collecting.
-- **Divergences 4 through 7 are cheap to resolve on paper**: each needs a line in
-  a spec saying "not taken, because —", not code. Two of them (the missing copy
-  operation, the absent 2D prototype) may be worth acting on; the other two are
-  fine as they are and only need recording.
-- The ten adaptations are settled. They are listed in the rigid-bodies spec's
-  Provenance section and in the concepts, each with the measurement or the
-  constraint that forced it.
+- **Before optimising shadows**, read 2 and 3, which are one piece of work: sun
+  visibility is per voxel, and BEVOX pays per pixel for a per-voxel result.
+- **4 is the cheapest real win on this page** — a fixture, no engine code, and it
+  covers a failure class the suite cannot currently see.
+- **5 needs a sentence, not a change.**
+- **6+7 is a `bevox_core` primitive** whose justification is detachment's speed,
+  not API completeness.
+- The ten adaptations are settled. They are in the rigid-bodies spec's Provenance
+  section and in the concepts, each with the measurement or the constraint that
+  forced it.
 
 See [Dwyer devlog by devlog](dwyer-devlogs.md) for what each episode actually
 shows; this page only compares.

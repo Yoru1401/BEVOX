@@ -984,3 +984,141 @@ fn ambient_occlusion_is_measured() {
         println!("{label:>11}: {text} | {changed:>6} px darkened | with AO: wall {:.2} ms, gpu {:.2} ms", r[0].1, r[1].1);
     }
 }
+
+/// Where a body's cost actually goes: the static march, the primary body
+/// marches, and the shadow rays' body tests, separated.
+///
+/// `MAX_BODIES` was set from a per-body figure measured on 2026-09-17, before
+/// body shadows (2026-09-18) and ambient occlusion (2026-09-24) joined
+/// `DEFAULT`. Nothing has re-measured it since, so the number the cap rests on
+/// describes a shader that no longer exists.
+///
+/// This decides what to do about it. Composition is `1 + N` marches per ray for
+/// the primary ray, and a shadow ray that the static world leaves clear tests
+/// every caster as well, so **both halves scale with the body count** — but not
+/// necessarily alike, and the fix differs:
+///
+/// - If the primary marches dominate, the answer is Dwyer's devlog 2: one
+///   interleaved traversal that steps whichever volume offers the nearest next
+///   voxel, instead of `N` separate marches compared by depth. That removes the
+///   per-body term from the primary loop.
+/// - If the shadow tests dominate, the answer is his devlogs 7 and 19: sun
+///   visibility is a property of a voxel, not a pixel, so it is computed once
+///   per visible voxel and cached, not once per pixel.
+///
+/// See `docs/reference/dwyer-drift.md`, divergences 1 to 3.
+///
+/// Every configuration is timed in the same invocation, round-robin over three
+/// rounds, because cross-run drift on this machine is routinely larger than the
+/// effects being separated. Medians of three rounds of seven readings.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench where_a_body
+/// -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn where_a_body_s_cost_goes() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    if !timestamps_supported(&device) {
+        eprintln!("adapter has no TIMESTAMP_QUERY, skipping");
+        return;
+    }
+
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let cube = body_cube();
+    let all = bench_bodies(eye, 120.0, &cube, 33.0);
+
+    let lit = march_flags::DEFAULT;
+    let unshadowed = march_flags::DEFAULT & !march_flags::BODY_SHADOWS;
+    let make = |flags: u32, bodies: &[bevox_core::body::Body]| {
+        Prepared::new(
+            &device, &shader, "march", &tree, offset_from_clip, eye, 1280, 720, flags, bodies,
+        )
+    };
+
+    // Named configurations, each built once and timed in rotation.
+    let mut configs: Vec<(String, Prepared)> = Vec::new();
+    configs.push(("static, DEFAULT".to_string(), make(lit, &[])));
+    configs.push(("static, no body shadows".to_string(), make(unshadowed, &[])));
+    for n in [1usize, 4, 16] {
+        configs.push((format!("{n:>2} bodies, DEFAULT"), make(lit, &all[..n])));
+        configs.push((format!("{n:>2} bodies, no shadows"), make(unshadowed, &all[..n])));
+    }
+
+    let gpu_ms = |p: &Prepared| {
+        p.dispatch(&device, &queue);
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let mut t: Vec<f32> =
+            (0..7).map(|_| p.dispatch_timed(&device, &queue).expect("timestamps").total()).collect();
+        median(&mut t)
+    };
+
+    let mut rounds: Vec<Vec<f32>> = vec![Vec::new(); configs.len()];
+    for _ in 0..3 {
+        for (i, (_, prepared)) in configs.iter().enumerate() {
+            rounds[i].push(gpu_ms(prepared));
+        }
+    }
+
+    println!("\nGPU ms, median of 3 rounds x 7 readings, 1280x720, bench camera:");
+    let mut medians = Vec::new();
+    for ((name, _), samples) in configs.iter().zip(&mut rounds) {
+        let spread = samples.iter().fold(0.0f32, |a, &b| a.max(b))
+            - samples.iter().fold(f32::MAX, |a, &b| a.min(b));
+        let m = median(samples);
+        medians.push(m);
+        println!("  {name:>24}: {m:6.2} ms   (spread {spread:.2})");
+    }
+
+    // medians: [static lit, static unlit, 1 lit, 1 unlit, 4 lit, 4 unlit, 16 lit, 16 unlit]
+    let (static_lit, static_unlit) = (medians[0], medians[1]);
+    println!("\nWhat each body adds, against the matching static baseline:");
+    let mut primary = Vec::new();
+    let mut shadow = Vec::new();
+    for (k, n) in [1usize, 4, 16].iter().enumerate() {
+        let (lit_n, unlit_n) = (medians[2 + k * 2], medians[3 + k * 2]);
+        let per_primary = (unlit_n - static_unlit) / *n as f32;
+        let per_shadow = ((lit_n - static_lit) - (unlit_n - static_unlit)) / *n as f32;
+        primary.push(per_primary);
+        shadow.push(per_shadow);
+        println!(
+            "  {n:>2} bodies: total {:+6.2} ms | primary {:+6.2} ({per_primary:.3}/body) | \
+             shadow {:+6.2} ({per_shadow:.3}/body)",
+            lit_n - static_lit,
+            unlit_n - static_unlit,
+            (lit_n - static_lit) - (unlit_n - static_unlit),
+        );
+    }
+
+    let at16 = (primary[2], shadow[2]);
+    let total16 = at16.0 + at16.1;
+    println!(
+        "\nAt sixteen bodies: {:.3} ms per body, of which primary {:.0}% and shadow {:.0}%.",
+        total16,
+        at16.0 / total16 * 100.0,
+        at16.1 / total16 * 100.0,
+    );
+    println!(
+        "  Frame: {:.2} ms static + {:.2} ms for sixteen = {:.2} ms against 16.7.",
+        static_lit,
+        total16 * 16.0,
+        medians[6],
+    );
+    println!(
+        "  Interleaved stepping (devlog 2) attacks the primary share; a per-voxel sun cache \
+         (devlogs 7, 19) attacks the shadow share."
+    );
+
+    // Linear in the body count is the `1 + N` signature, and the reason either
+    // rewrite is worth doing at all. If cost were sublinear something already
+    // rejects bodies and the premise is wrong.
+    let ratio = (primary[2] + shadow[2]) / (primary[0] + shadow[0]);
+    println!(
+        "\nPer-body cost at 16 against at 1: {ratio:.2}x. Near 1.0 means cost is linear in the \
+         body count, which is what `1 + N` predicts."
+    );
+}

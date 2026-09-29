@@ -21,7 +21,7 @@ GTX 1650, 1280x720, bench camera. The target is 16.7 ms.
 |---|---|---|
 | static world, no bodies | ~11.8-12.4 ms | the march itself |
 | 16 bodies in view, no shadows | 17.81 ms | already over |
-| 16 bodies in view, with shadows | **22.64 ms** | 22.88 on the GPU |
+| 16 bodies in view, with shadows | **22.64 ms** | 22.88 on the GPU; re-measured at **23.30** on 2026-09-29 |
 
 Body shadows cost **+4.85 ms** for sixteen bodies in view (88,171 pixels
 shadowed), and nothing at all for bodies the shadow rays miss — bodies behind
@@ -41,5 +41,11 @@ toggle, or optimising before shipping them. Both `BODY_SHADOWS` and `AO` are in
 
 So the standing position is: **the worst case is over budget by design.** The
 bench's worst case is a wall of cubes filling the view; a scene with sixteen
-bodies scattered is cheaper. The next optimisation, if one is wanted, is aimed
-at the per-pixel body cost — see [the body cap](body-cap.md).
+bodies scattered is cheaper.
+
+**Where the next optimisation should go, measured 2026-09-29.** A body's cost
+splits evenly — 0.316 ms of primary march against 0.314 ms of shadow-ray caster
+tests — so the per-pixel body cost is two problems of equal size, not one. And
+the static march is 13.23 ms by itself, 79% of the frame before any body exists.
+Both numbers are in [the body cap](body-cap.md), and what to do about them is in
+[the drift ledger](../reference/dwyer-drift.md).

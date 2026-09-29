@@ -37,3 +37,42 @@ see, where it removes them from the table entirely.
 
 Since this was measured, body shadows were added on top: see
 [the frame budget](frame-budget.md) for what sixteen bodies actually cost now.
+
+# Re-measured 2026-09-29, and the number above is stale
+
+`0.265 ms` describes a shader that no longer exists. `BODY_SHADOWS` joined
+`DEFAULT` the day after this was measured and `AO` six days later, and nothing
+re-measured the cap until now.
+
+`where_a_body_s_cost_goes` in `tests/gpu_bench.rs`, same GPU, same camera, same
+resolution, every configuration interleaved in one invocation, GPU medians of
+three rounds of seven:
+
+| | GPU ms |
+|---|---|
+| static world, `DEFAULT` | 13.23 |
+| sixteen bodies, `DEFAULT` | **23.30** |
+| sixteen bodies, `DEFAULT` without `BODY_SHADOWS` | 17.83 |
+
+**A visible body costs 0.629 ms, not 0.265 — 2.4 times the figure the cap rests
+on.** And it splits almost exactly in half:
+
+- **primary march: 0.316 ms a body** (+5.05 ms for sixteen)
+- **shadow-ray caster tests: 0.314 ms a body** (+5.02 ms for sixteen)
+
+Two things follow that the old number hid.
+
+**Neither half alone buys the frame back.** Removing all of the primary cost
+leaves 18.25 ms; removing all of the shadow cost leaves 18.28. Both are over
+16.7. Sixteen bodies in view needs both halves attacked, or a different target.
+
+**The static march is 13.23 ms of a 16.7 ms frame on its own** — 79% of the
+budget before a single body exists. That is the real ceiling on the body count at
+this camera, and no amount of work on body composition moves it.
+
+Read with care: the per-body figures at **one** and **four** bodies are inside
+the noise (spreads of 1.0-3.0 ms against effects of 0.3), and the one-body shadow
+delta came out negative, which is impossible and is drift. Only the sixteen-body
+decomposition is above the noise floor. `MAX_BODIES` has not been changed on the
+strength of this; what to do about it is
+[the drift ledger's](../reference/dwyer-drift.md) divergences 1 to 3.

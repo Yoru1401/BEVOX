@@ -1,6 +1,11 @@
 # Update Log
 
 ## 2026-09-29
+* **Update**: a visible body costs **0.629 ms, not 0.265** — the cap's figure
+  predated shadows and AO by a day and a week. It splits evenly between the
+  primary march and the shadow-ray caster tests, so the two renderer divergences
+  are worth the same; and the static march alone is 13.23 ms of a 16.7 ms frame —
+  [the body cap](concepts/body-cap.md).
 * **Creation**: [how far BEVOX has drifted from Dwyer](reference/dwyer-drift.md) —
   all thirty devlogs set against what the engine does. Ten deviations have a
   reason on record; **seven do not**, six of those in the renderer. The first is
