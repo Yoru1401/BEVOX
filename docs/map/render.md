@@ -78,11 +78,16 @@ be measured against each other in one session.
 
 # What the shader reads
 
-Ten bindings, of which **eight are storage buffers — wgpu's default limit for a
-compute stage.** There is no room for a ninth without narrowing the hardware
-this runs on, so anything new is packed behind an offset in a buffer that
-already exists. That is why the fullness grid rides in the distance field's
-buffer; `ao_params.x` is the word it starts at. See
+Ten bindings, of which **eight are storage buffers.** That used to be the
+ceiling, because the engine asked for `WgpuLimits::default()` — the WebGPU spec
+baseline, which allows eight. It is why the fullness grid rides packed in the
+distance field's buffer, with `ao_params.x` as the word it starts at.
+
+**Since 2026-09-29 the engine asks for sixteen** (`pipeline::device_limits`),
+because eight was a browser's baseline and this project excludes WebAssembly
+permanently — the adapter offers 524,288. A grid that wants *filtering* should
+become a sampled 3D texture rather than a ninth storage buffer, which is a
+different budget again and one nothing here uses yet. See
 [both coarse grids ride in one storage buffer](../concepts/coarse-grids-share-one-buffer.md).
 
 | # | Binding | Kind |
@@ -125,6 +130,7 @@ bit-identical — or, for a feature, once its cost has been accepted knowingly.
 | `BEAM_SCALE` | 8 | Full-resolution pixels per beam sample, per axis. Must match the shader's own copy. |
 | `BEAM_CAPACITY` | 518 400 | Coarse pixels the beam buffer holds — enough for 7680x4320, so it is sized once and never resized. |
 | `MARCH_BINDING_COUNT` | 10 | Bindings the shader declares, and so the number the layout must contain. A gate, because a mismatch is not a compile error. |
+| `STORAGE_BUFFERS_DECLARED` | 8 | How many of those are storage buffers — the one budget that has ever been binding. |
 | `SHADER_PATH` | `shaders/march.wgsl` | Loaded at run time, which is what makes A/B/A of two shader sources possible. |
 | `SUN_DIRECTION` | (0.4, 1, 0.25) | Where the sun is, shared by the renderer and the parity tests. |
 

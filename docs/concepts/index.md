@@ -18,7 +18,7 @@ the next one.
 
 # Decisions
 
-* [Both coarse grids ride in one storage buffer](coarse-grids-share-one-buffer.md) - wgpu's eight-storage-buffer limit, and what it forces.
+* [Both coarse grids ride in one storage buffer](coarse-grids-share-one-buffer.md) *(premise corrected)* - eight was wgpu's browser baseline, not the hardware's limit.
 * [Only terrain debris merges back](terrain-only-merging.md) - what may return to the world, and why it must be out of view.
 
 # Post-mortems

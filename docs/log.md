@@ -1,6 +1,16 @@
 # Update Log
 
 ## 2026-09-29
+* **Fix**: the engine stops asking for wgpu's defaults, which are the **WebGPU
+  spec baseline** — eight storage buffers per stage where the GTX 1650 offers
+  524,288, and 128 MB per binding where it offers 2,047. BEVOX excludes
+  WebAssembly permanently, so it had been paying a browser's ceiling for nothing,
+  and had written a rule telling future work to keep paying it.
+  `pipeline::device_limits` asks for what the engine needs plus a margin. It also
+  closes a latent bug: the 512 MB voxel budget was checked as a **sum** while one
+  binding capped at 128 MB, so a large scene passed the check and would have died
+  at buffer creation —
+  [both coarse grids ride in one storage buffer](concepts/coarse-grids-share-one-buffer.md).
 * **Fix**: the specs and plans swept for dead references — 89 backticked
   identifiers that appear nowhere in the code. Most are correctly historical;
   three were **gates a Breaks table names and the suite does not have**, all

@@ -1,6 +1,8 @@
 mod scenes;
 
 use bevy::prelude::*;
+use bevy::render::RenderPlugin;
+use bevy::render::settings::WgpuSettings;
 use bevox_core::distance_field::DistanceField;
 use bevox_core::material::MaterialId;
 use bevox_physics::merge::merge;
@@ -25,6 +27,19 @@ fn main() {
     App::new()
         .add_plugins(
             DefaultPlugins
+                // wgpu's defaults are the WebGPU spec baseline, chosen so a
+                // shader runs in a browser. This project excludes WebAssembly
+                // permanently, and the baseline was costing it a hardware
+                // sampler and a reachable voxel budget for nothing. See
+                // `pipeline::device_limits`.
+                .set(RenderPlugin {
+                    render_creation: WgpuSettings {
+                        limits: bevox_render::pipeline::device_limits(),
+                        ..default()
+                    }
+                    .into(),
+                    ..default()
+                })
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "BEVOX".into(),

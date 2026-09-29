@@ -132,6 +132,10 @@ pub fn gpu_device() -> Option<(wgpu::Device, wgpu::Queue)> {
                     .request_device(&wgpu::DeviceDescriptor {
                         label: Some("bevox_test_device"),
                         required_features: features,
+                        // The same limits the app asks for. Testing under
+                        // wgpu's defaults while the app runs under raised ones
+                        // would let a pipeline pass here and fail there.
+                        required_limits: bevox_render::pipeline::device_limits(),
                         ..Default::default()
                     })
                     .await

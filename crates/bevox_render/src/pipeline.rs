@@ -15,6 +15,7 @@ use bevy::material::bind_group_layout_entries::binding_types::{
 use bevy::material::descriptor::BindGroupLayoutDescriptor;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::*;
+use bevy::render::settings::WgpuLimits;
 use core::num::NonZero;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::texture::GpuImage;
@@ -39,9 +40,56 @@ pub const BEAM_CAPACITY: u32 = (7680 / BEAM_SCALE) * (4320 / BEAM_SCALE);
 /// at all. `the_layout_declares_every_binding_the_shader_uses` is the gate.
 pub const MARCH_BINDING_COUNT: usize = 10;
 
+/// How many of those bindings are storage buffers, which is the one budget that
+/// has ever been binding. Kept beside `MARCH_BINDING_COUNT` so adding a storage
+/// binding has to touch both.
+pub const STORAGE_BUFFERS_DECLARED: u32 = 8;
+
 /// Voxel data budget on the GPU. Checked at upload; exceeding it is an error,
 /// never an allocation attempt.
 pub const VOXEL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The device limits BEVOX asks for, and why they are not wgpu's defaults.
+///
+/// `wgpu::Limits::default()` is the **WebGPU spec baseline** -- the set chosen so
+/// that a shader runs everywhere, browsers included. This project excludes
+/// WebAssembly permanently and its spec says native desktop may be assumed, so
+/// the baseline was costing it for nothing. Measured on a GTX 1650 over Vulkan
+/// (`what_the_adapter_allows` in `tests/gpu_bench.rs`): the baseline asks for 8
+/// storage buffers per stage where the adapter offers 524,288, and 128 MB per
+/// storage binding where it offers 2,047.
+///
+/// Two things that cost:
+///
+/// - The eight-storage-buffer ceiling shaped a design. The ambient-occlusion
+///   fullness grid is packed behind the distance field because the compute stage
+///   was "already at the limit", which gave up the hardware-filtered texture
+///   read that is the whole reason Dwyer calls his version cheap.
+/// - `VOXEL_BUDGET_BYTES` is 512 MB and `within_budget` checks only the **sum**,
+///   while a single storage binding capped at 128 MB. A large scene passed the
+///   budget check and then failed at binding creation.
+///
+/// **What we need plus a margin, not the adapter's maximum.** Asking for what
+/// this machine happens to offer would encode a GTX 1650's capabilities as the
+/// engine's requirement, and nothing would catch that until someone else ran it.
+/// These numbers clear every discrete desktop GPU of the last decade and current
+/// integrated parts too, so the hardware floor barely moves.
+pub fn device_limits() -> WgpuLimits {
+    WgpuLimits {
+        // Ten are declared today; sixteen leaves room for the grids that would
+        // otherwise be packed behind an offset.
+        max_storage_buffers_per_shader_stage: 16,
+        // None are used yet. The fullness grid wants to become one, sampled,
+        // so the texture unit does the trilinear blend.
+        max_sampled_textures_per_shader_stage: 16,
+        max_samplers_per_shader_stage: 16,
+        max_storage_textures_per_shader_stage: 8,
+        // So the 512 MB budget is reachable in a single binding.
+        max_storage_buffer_binding_size: 1024 * 1024 * 1024,
+        max_buffer_size: 2 * 1024 * 1024 * 1024,
+        ..WgpuLimits::default()
+    }
+}
 
 /// Bodies the march composes. Past this, bodies are still packed and uploaded
 /// but not marched: the count the shader loops over is clamped to it, after the
@@ -872,5 +920,43 @@ mod tests {
         assert!(within_budget(nodes, 1, 0, 0));
         assert!(within_budget(1, words, 0, 0));
         assert!(!within_budget(nodes + 1, words + 1, 0, 0));
+    }
+
+    /// The voxel budget has to fit in one storage binding, or `within_budget`
+    /// says yes to a scene that then fails at buffer creation.
+    ///
+    /// `within_budget` checks the **sum** across the node arena, the voxel
+    /// bytes, the field and the bodies, and says nothing about any single one.
+    /// Under `WgpuLimits::default()` a binding caps at 128 MB while the budget
+    /// is 512, so a big enough scene passed the check and died at the driver.
+    /// Nothing caught it because no scene has been that large yet.
+    ///
+    /// Break that must fail this: put `max_storage_buffer_binding_size` back to
+    /// `WgpuLimits::default()`'s 128 MB.
+    #[test]
+    fn the_voxel_budget_fits_in_one_storage_binding() {
+        let binding = u64::from(device_limits().max_storage_buffer_binding_size);
+        assert!(
+            VOXEL_BUDGET_BYTES <= binding,
+            "the budget is {} MB and one storage binding holds {} MB, so a scene can pass \
+             `within_budget` and still fail at buffer creation",
+            VOXEL_BUDGET_BYTES / (1024 * 1024),
+            binding / (1024 * 1024),
+        );
+    }
+
+    /// Every storage buffer the layout declares has to fit the limit we ask for,
+    /// with room for the grids that are currently packed behind an offset.
+    ///
+    /// Break that must fail this: put `max_storage_buffers_per_shader_stage`
+    /// back to `WgpuLimits::default()`'s 8, which is what forced the packing.
+    #[test]
+    fn the_layout_has_room_for_another_storage_buffer() {
+        let asked = device_limits().max_storage_buffers_per_shader_stage;
+        assert!(
+            asked > STORAGE_BUFFERS_DECLARED,
+            "the layout declares {STORAGE_BUFFERS_DECLARED} storage buffers and we ask for \
+             {asked}; with no spare, the next grid gets packed behind an offset again"
+        );
     }
 }

@@ -1130,3 +1130,61 @@ fn where_a_body_s_cost_goes() {
          body count, which is what `1 + N` predicts."
     );
 }
+
+/// What this machine's adapter actually allows, against what the engine asks
+/// for.
+///
+/// `gpu_device` requests `wgpu::Limits::default()`, which is the WebGPU *spec
+/// baseline* -- the set chosen so that code runs everywhere, browsers included.
+/// BEVOX's core spec excludes WebAssembly permanently and says native desktop
+/// may be assumed everywhere, so any gap between the baseline and the hardware
+/// is headroom the engine is declining for no reason.
+///
+/// The eight-storage-buffer ceiling is the one that has shaped a design
+/// decision: the ambient-occlusion fullness grid rides packed behind the
+/// distance field because the compute stage was "already at the limit". This
+/// prints whether that limit was the hardware's or the baseline's.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench what_the_adapter
+/// -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn what_the_adapter_allows() {
+    let instance = wgpu::Instance::default();
+    let Some(adapter) = pollster::block_on(
+        instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+    )
+    .ok() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let info = adapter.get_info();
+    let have = adapter.limits();
+    let asked = wgpu::Limits::default();
+
+    println!("\n{} ({:?}, {:?})", info.name, info.device_type, info.backend);
+    println!("\n{:<44} {:>14} {:>14}", "limit", "engine asks", "adapter allows");
+    let rows: [(&str, u32, u32); 6] = [
+        ("max_storage_buffers_per_shader_stage",
+         asked.max_storage_buffers_per_shader_stage, have.max_storage_buffers_per_shader_stage),
+        ("max_sampled_textures_per_shader_stage",
+         asked.max_sampled_textures_per_shader_stage, have.max_sampled_textures_per_shader_stage),
+        ("max_samplers_per_shader_stage",
+         asked.max_samplers_per_shader_stage, have.max_samplers_per_shader_stage),
+        ("max_storage_textures_per_shader_stage",
+         asked.max_storage_textures_per_shader_stage, have.max_storage_textures_per_shader_stage),
+        ("max_compute_invocations_per_workgroup",
+         asked.max_compute_invocations_per_workgroup, have.max_compute_invocations_per_workgroup),
+        ("max_compute_workgroup_storage_size",
+         asked.max_compute_workgroup_storage_size, have.max_compute_workgroup_storage_size),
+    ];
+    for (name, a, h) in rows {
+        let note = if h > a { "  <-- headroom" } else { "" };
+        println!("{name:<44} {a:>14} {h:>14}{note}");
+    }
+    println!("\n{:<44} {:>14} {:>14}", "max_buffer_size (MB)",
+        asked.max_buffer_size / (1024 * 1024), have.max_buffer_size / (1024 * 1024));
+    println!("{:<44} {:>14} {:>14}", "max_storage_buffer_binding_size (MB)",
+        asked.max_storage_buffer_binding_size as u64 / (1024 * 1024),
+        have.max_storage_buffer_binding_size as u64 / (1024 * 1024));
+}
