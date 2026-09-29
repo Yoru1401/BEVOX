@@ -9,6 +9,7 @@ the next one.
 * [Every gate is proven by a deliberate break](deliberate-breaks.md) - a test that has never failed is not known to test anything.
 * [No safe stale direction](stale-direction.md) - the distance field may lag, fullness may not, so every editing path recounts it.
 * [The GPU codegen cliff](gpu-codegen-cliff.md) - code the shader never runs can still cost tens of percent; re-bench every march.wgsl edit.
+* [An inference is not an observation](an-inference-is-not-an-observation.md) - five of six doc errors in one audit were true premises with unchecked conclusions; the gates cannot read prose.
 
 # Measurements
 

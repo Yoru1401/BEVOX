@@ -36,6 +36,7 @@ lifted out of the plan that produced it.
 * [Every gate is proven by a deliberate break](concepts/deliberate-breaks.md) - a test that has never failed is not known to test anything.
 * [No safe stale direction](concepts/stale-direction.md) - the distance field may lag, fullness may not, so every editing path recounts it.
 * [The GPU codegen cliff](concepts/gpu-codegen-cliff.md) - code the shader never runs can still cost tens of percent; re-bench every march.wgsl edit.
+* [An inference is not an observation](concepts/an-inference-is-not-an-observation.md) - a claim about behaviour names the code that makes it true, because no gate can read prose.
 * [The body cap, and what a body costs](concepts/body-cap.md) - 0.265 ms per visible body, and why MAX_BODIES is 16.
 * [The frame budget, and where it goes](concepts/frame-budget.md) - sixteen bodies with shadows take 22.6 ms against 16.7.
 * [Both coarse grids ride in one storage buffer](concepts/coarse-grids-share-one-buffer.md) - wgpu's eight-storage-buffer limit, and what it forces.
@@ -73,7 +74,7 @@ lifted out of the plan that produced it.
 * [Friction and Restitution](superpowers/plans/2026-09-18-bevox-physics-friction-restitution.md) - A body slides to a stop on stone, keeps sliding on ice, and bounces on rubber, with friction and restitution taken per voxel from the materials that touch.
 * [Joints](superpowers/plans/2026-09-18-bevox-physics-joints.md) *(deprecated)* - Join bodies to each other or to the world with ball and hinge joints, made by clicking in the app: a door hinged to a wall, a chain hanging from a beam.
 * [Rigid-Body Physics Milestone 2](superpowers/plans/2026-09-18-bevox-physics-milestone-2.md) - A voxel body dropped into the scene lands on the static voxel world, tumbles if it lands off balance, and comes to rest without jitter.
-* [Mouse Grab](superpowers/plans/2026-09-18-bevox-physics-mouse-grab.md) - Pick up a body with the mouse.
+* [Mouse Grab](superpowers/plans/2026-09-18-bevox-physics-mouse-grab.md) *(superseded)* - Pick up a body with the mouse, as a damped spring. Milestone 7 rebuilt the grab as a joint; its constants and gates are gone.
 * [Sleeping and Merging Debris](superpowers/plans/2026-09-19-bevox-sleep-and-merge.md) - Bodies at rest stop costing physics time, and a body that came out of the terrain and settled out of view goes back into it and frees its slot, as in Dwyer's devlog #13.
 * [A Physics Crate, Forces, and a Tick-Free Ceiling](superpowers/plans/2026-09-24-bevox-physics-crate.md) - physics moves to its own crate, bodies take forces and impulses from outside, and the speed ceiling stops depending on the tick rate.
 * [Fracture](superpowers/plans/2026-09-24-bevox-fracture.md) - Bodies and terrain crack where a collision is too hard for the material; cracks are drawn as empty voxels and detachment produces the pieces.

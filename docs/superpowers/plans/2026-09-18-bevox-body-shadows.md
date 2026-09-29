@@ -114,3 +114,13 @@ verified: { by: human:Flori, at: 2026-09-24T00:00:00Z }
    - the sphere too small;
    - the old per-pixel body origin, which splits 47 voxel faces;
    - the voxel-centre offset cut to 0.25, which is inside the voxel: 1544 pixels disagree.
+## Names as shipped
+
+This plan's gate names were written before execution and some were renamed on the
+way in. A Breaks table is an index into the test suite, so a name that no longer
+resolves is worthless; the planned names stay in the text above as the record of
+what was intended, and this is the map to what exists.
+
+| Planned | Shipped |
+|---|---|
+| `body_shadows_off_leave_every_entry_bit_identical_to_no_bodies_casting` | `body_shadows_off_leave_the_image_as_with_no_caster` |

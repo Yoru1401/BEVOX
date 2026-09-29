@@ -840,3 +840,16 @@ Cutting a column's base leaves the column falling as a body, landing and settlin
 - **No node-level search.** The budget is what makes the voxel walk safe; the node walk waits for a measurement.
 - **No merging a settled body back into the terrain.** Dwyer does this to stop paying for debris; it is its own milestone.
 - **No fracture on impact.**
+## Names as shipped
+
+This plan's gate names were written before execution and some were renamed on the
+way in. A Breaks table is an index into the test suite, so a name that no longer
+resolves is worthless; the planned names stay in the text above as the record of
+what was intended, and this is the map to what exists.
+
+| Planned | Shipped |
+|---|---|
+| `a_notch_frees_nothing` | `a_notch_frees_only_what_it_cuts_off` |
+
+The shipped name is the better one: the notch does free something, and what the
+gate holds is that it frees *only* the part the cut disconnects.

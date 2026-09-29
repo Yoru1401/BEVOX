@@ -1,6 +1,19 @@
 # Update Log
 
 ## 2026-09-29
+* **Fix**: the specs and plans swept for dead references — 89 backticked
+  identifiers that appear nowhere in the code. Most are correctly historical;
+  three were **gates a Breaks table names and the suite does not have**, all
+  renamed on the way in, and one had changed its claim as well as its name. Each
+  plan now maps planned names to shipped ones, and the Mouse Grab plan is marked
+  superseded, which it has been since milestone 7 without saying so.
+* **Fix**: an audit of the map pages against the code, prompted by a day of work
+  planned on a false sentence. Six errors, five of them a day old and in the map
+  pages: `camera` did not own the clip matrix, `fracture` runs every tick and not
+  only on an edit, staging is main-world and not render-world, `edit` is more
+  than the brush, the body cost was stale, and a body march does **not** walk the
+  whole ray. All six were a true premise with an unchecked conclusion attached —
+  [an inference is not an observation](concepts/an-inference-is-not-an-observation.md).
 * **Update**: a visible body costs **0.629 ms, not 0.265** — the cap's figure
   predated shadows and AO by a day and a week. It splits evenly between the
   primary march and the shadow-ray caster tests, so the two renderer divergences

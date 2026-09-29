@@ -8,6 +8,13 @@ generated: { by: claude-opus-5/claude-code, at: 2026-09-17T00:00:00Z }
 
 # Body Against Body Implementation Plan
 
+> **`MAX_TRAVEL` no longer exists.** It was a distance per tick, which made the
+> speed ceiling a different speed at every tick rate. The physics-crate plan
+> (2026-09-24) replaced it with `MAX_SPEED`, in voxels per **second**, and made
+> what limits a fall drag rather than a clamp. Read `MAX_TRAVEL` below as the
+> constant of its day. Noted 2026-09-29.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Flori prefers inline execution for this project.**
 
 **Goal:** Bodies collide with each other as they do with the world: a thrown cube knocks another along, and a stack of cubes stands still instead of sinking into itself.
@@ -721,3 +728,20 @@ A cube thrown at another knocks it along and stops, momentum conserved. Three cu
 - **No rolling resistance, no spinning friction.** **Wrong, and corrected 2026-09-24:** a lone voxel is a `Corner`, which is a sphere, so bodies that roll were already reachable. See [Sliding friction cannot stop a roll](../../concepts/rolling-needs-its-own-resistance.md).
 - **No fracture.** Dwyer has it; it needs a damage model this project has not specified.
 - **No joints.** That is milestone 5, and it is what the mouse grab is built on.
+## Names as shipped
+
+This plan's gate names were written before execution and some were renamed on the
+way in. A Breaks table is an index into the test suite, so a name that no longer
+resolves is worthless; the planned names stay in the text above as the record of
+what was intended, and this is the map to what exists.
+
+| Planned | Shipped |
+|---|---|
+| `a_cube_resting_on_a_cube_touches_at_four_corners` | `a_cube_resting_on_a_cube_touches_across_its_bottom_face` |
+
+**The claim changed with the name**, which is the part worth knowing: the plan
+expected **four** contacts, one per corner of the resting cube's bottom face. The
+gate as shipped asserts **twelve**. A cube resting squarely on another meets it
+across the whole face, so the four corner spheres are joined by the eight edge
+pairs along the face's rim — the planned number was wrong about the geometry, not
+about the test.

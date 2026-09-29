@@ -22,7 +22,7 @@ This crate is what computes and advances it.
 
 # Where it lives
 
-**Five modules run on every tick.** They are the simulation proper.
+**Six modules run on every tick.** They are the simulation proper.
 
 |            |                                                                                                                                 |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------- |
@@ -31,15 +31,15 @@ This crate is what computes and advances it.
 | `classify` | Decides which voxels can be touched at all, and in what shape. Runs on a body's own voxels, and on the world's on demand.       |
 | `joint`    | Sixteen joint types, their friction and motors, and the mouse grab. Solved before contacts, so contacts have the last word.     |
 | `sleep`    | Wakes anything that something awake could move, then puts still groups to sleep. A sleeper costs the tick nothing.              |
+| `fracture` | Asked on every contact whether the blow was too hard for the material, and where the cracks would fall. Cuts nothing itself — `solver` raises the event and the caller applies it. |
 
-**Five run when something changes the voxels**, not on a clock.
+**Four run when something changes the voxels**, not on a clock.
 
 | | |
 |---|---|
 | `mass` | Mass, centre of mass and inertia, summed per voxel from material density. Re-run on every edit, never only at creation. |
 | `detach` | Walks the tree for terrain an edit cut loose from the ground, and turns each piece into a body. |
 | `sculpt` | The brush on a body. Painting grows it; an erase that cuts it in two leaves two bodies. |
-| `fracture` | Decides whether a blow was too hard for the material, and where the cracks fall. Cuts nothing itself. |
 | `merge` | Writes a settled body back into the world and frees its slot. |
 
 # One tick

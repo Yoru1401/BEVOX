@@ -32,7 +32,7 @@ plumbing rather than the engine. That split is the reason this crate exists.
 
 | | |
 |---|---|
-| `edit` | The sphere brush. Rebuilds the subtrees it touches and marks the arena ranges dirty. |
+| `edit` | Changing a built tree: the sphere brush, and the voxel-list fill and clear that detachment, merging and fracture are built on. Rebuilds only the subtrees it touches and marks the arena ranges dirty. |
 | `march` | The CPU reference ray marcher — the ground truth the WGSL shader is held to, pixel for pixel. |
 | `normal` | Per-voxel normals generated from neighbour occupancy. Never stored: see below. |
 | `dense` | A plain 3D array, for building a tree and for checking one. Test and import scaffolding, not a runtime structure. |

@@ -8,6 +8,21 @@ generated: { by: claude-opus-5/claude-code, at: 2026-09-18T00:00:00Z }
 
 # Mouse Grab Implementation Plan
 
+> **Superseded 2026-09-18 by milestone 7**, and marked as such on 2026-09-29.
+> The grab this plan builds is a damped spring at the clicked point, after Joe
+> Binns' *Get Me Out*. Dwyer's devlog 30 replaced his own explicit-Euler spring
+> with a joint, and
+> [Dwyer's Joints](2026-09-18-bevox-physics-dwyer-joints.md) did the same here:
+> the grab is now a Point plus Locked joint with capped force and torque.
+>
+> **Nothing in this plan still exists in the code.** `GRAB_DAMPING`,
+> `GRAB_FREQUENCY`, `GRAB_MAX_ACCEL` and `GRAB_SPIN_DAMPING` are gone, replaced
+> by `GRAB_MAX_FORCE` and `GRAB_MAX_TORQUE`; and its three gates —
+> `a_grabbed_body_settles_at_the_target`,
+> `a_body_held_by_its_corner_hangs_below_it` and
+> `a_far_target_cannot_yank_a_body` — went with them. Read this for why a spring
+> was tried and what it cost, not for how the grab works.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Flori prefers inline execution for this project.**
 
 **Goal:** Pick up a body with the mouse. A damped spring pulls the exact point you clicked toward the cursor, and the body keeps simulating: it swings, collides, and flies off with its own momentum when released.

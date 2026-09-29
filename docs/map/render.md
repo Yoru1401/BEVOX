@@ -27,7 +27,7 @@ everything that would break lives here rather than in the core.
 | `upload` | Owns `VoxelScene` — the tree, its materials, the two coarse grids and the bodies — and stages what changed into the GPU buffers. Also where the brush enters. |
 | `pipeline` | The bind group layout, one compute pipeline per debug view, and the dispatch that runs them. Holds the body cap and the memory budget. |
 | `cull` | Drops bodies the camera cannot see, and gives the survivors a screen rectangle so a pixel outside it pays nothing. |
-| `camera` | The fly camera, and the clip-to-world matrix the shader takes rays from. |
+| `camera` | The fly camera: keys and mouse to a `Transform`. The clip-to-world matrix the shader takes rays from is **not** here — it is `upload::offset_from_clip`, beside the uniform that carries it. |
 | `pick` | What is under the cursor, marched against the same tree the shader draws, so a click lands on what was seen. |
 | `debug` | The ten views and the whole table behind them — entry point, name and key — so a view cannot be added in one place and forgotten in another. |
 
@@ -38,12 +38,14 @@ be measured against each other in one session.
 # One frame
 
 ```text
-  PREPARE, on the CPU
+  MAIN WORLD, in `Update`
     1  stage whatever changed: dirty arena ranges, the lowered field cells,
        the recounted fullness cells                     -- a body that only
                                                            MOVED needs none of
                                                            this; its table entry
                                                            is rebuilt anyway
+
+  RENDER WORLD, in `Prepare` -- past the extract boundary
     2  cull bodies the camera cannot see, and give the rest a screen rectangle
     3  build the uniform: camera, sun, extents, flags, body count
 
@@ -117,7 +119,7 @@ bit-identical — or, for a feature, once its cost has been accepted knowingly.
 
 | | | |
 |---|---|---|
-| `MAX_BODIES` | 16 | Bodies the shader will march. Measured, not chosen: a visible body cost 0.265 ms at 1280x720 on a GTX 1650 when this was set. **Resolution-dependent**, because most of a body's cost is per pixel. |
+| `MAX_BODIES` | 16 | Bodies the shader will march. Measured, not chosen — but the figure it was set from is stale: 0.265 ms a body in 2026-09-17, **0.629 ms re-measured on 2026-09-29** once shadows and AO had joined `DEFAULT`. **Resolution-dependent**, because most of a body's cost is per pixel. |
 | `VOXEL_BUDGET_BYTES` | 512 MB | Voxel data on the GPU. Checked at upload; exceeding it is an error, never an allocation attempt. |
 | `WORKGROUP` | 8 | Compute threads per axis. |
 | `BEAM_SCALE` | 8 | Full-resolution pixels per beam sample, per axis. Must match the shader's own copy. |

@@ -8,6 +8,13 @@ generated: { by: claude-opus-5/claude-code, at: 2026-09-17T00:00:00Z }
 
 # Rigid-Body Physics Milestone 2 Implementation Plan
 
+> **`MAX_TRAVEL` no longer exists.** It was a distance per tick, which made the
+> speed ceiling a different speed at every tick rate. The physics-crate plan
+> (2026-09-24) replaced it with `MAX_SPEED`, in voxels per **second**, and made
+> what limits a fall drag rather than a clamp. Read `MAX_TRAVEL` below as the
+> constant of its day. Noted 2026-09-29.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Flori prefers inline execution for this project.**
 
 **Goal:** A voxel body dropped into the scene lands on the static voxel world, tumbles if it lands off balance, and comes to rest without jitter.

@@ -722,8 +722,16 @@ fn row_text(r: [(f32, f32, f32); 2]) -> (String, f32, f32) {
 ///
 /// Composition is `1 + N` marches per ray, and a body march gets neither the
 /// beam seed nor the distance-field skip -- both know only the static world --
-/// so each is an unaccelerated march over the whole ray. The static world's
+/// so inside a body's box nothing accelerates the walk. The static world's
 /// accelerated cost says nothing about that, so it is measured.
+///
+/// This said "an unaccelerated march over the whole ray" until 2026-09-29, and
+/// that conclusion was wrong and cost a day: `traverse_at` seeds its first
+/// frame at `max(root_slab.t_enter, t_start)`, so a body march starts at the
+/// body's bounding box and never walks the empty space in front of it. The
+/// premise about the beam and the field was true; the conclusion drawn from it
+/// was never checked against the traversal. See
+/// `docs/concepts/an-inference-is-not-an-observation.md`.
 ///
 /// Every count is A/B/A against the zero-body scene, on the wall clock and the
 /// GPU's own. The zero-body row is a second, separately built zero-body
