@@ -22,7 +22,7 @@ sources:
 # The verdict
 
 **BEVOX is not a reimplementation of his engine, and most of what looks like
-drift is not.** Thirty-one differences, sorted by *why* rather than by devlog,
+drift is not.** Thirty-two differences, sorted by *why* rather than by devlog,
 because the cause is what says whether a difference needs fixing.
 
 | Cause | Count | Verdict |
@@ -32,10 +32,10 @@ because the cause is what says whether a difference needs fixing.
 | **C — different constraints.** A `u16`, an extent of 4096, eight storage buffers | 5 | Forced, and correct under the constraint |
 | **D — not reached yet.** Deferred, not rejected | 6 | Fine, except one |
 | **E — improvements on him** | 5 | Ours is better, mostly because he taught us the problem |
-| **F — oversight.** Nobody decided | 6 | **This is the drift.** Four are worth fixing |
+| **F — oversight.** Nobody decided | 7 | **This is the drift.** Five are worth fixing |
 
-**Six real problems out of thirty-one differences**, and four of those are in the
-renderer.
+**Seven real problems out of thirty-two differences**, five of them worth fixing.
+Four are in the renderer; the seventh is a solver setting nobody knew existed.
 
 # A — Different product
 
@@ -69,7 +69,7 @@ Each is forced by something his engine does not face. None is a preference.
 
 | Difference | Devlog | Why | Good idea? |
 |---|---|---|---|
-| Fracture threshold is a **closing speed**, not his contact impulse | 28 | His thresholds are in N·s; `Material::strength` is a `u16`. His rule fails `resting_weight_breaks_nothing` **by 61,134 fractures, peak blow 400,088 against a strength of 20** | **Yes, and forced.** It keeps the property his argument is *for* — independence from the tick rate — and adds a symmetry he never needed |
+| Fracture threshold is a **closing speed**, not his contact impulse | 28 | Chosen because `Material::strength` is a `u16` and his rule failed a resting-stack gate by 61,134 fractures | **No — reverting.** His `breaking_impulse` is an `f32` and his threshold is scaled by object size. **The units were the problem and the physics was changed to fix them.** It cost crush fracture: a mouse grab presses with 2e8 of force at nearly no speed, so nothing breaks. See [rigid_pixels](rigid-pixels.md) and [the respec](../superpowers/specs/2026-09-30-bevox-fracture-and-detection-design.md) |
 | Cracks are random planes, not authored boolean pattern volumes | 28 | His patterns are a data format for a modding API. BEVOX has no modders to author them | **Yes for now**, and reversible: the generator is one function behind one call |
 | The ambient-occlusion blend runs in the shader, not through a hardware sampler | 15 | The fullness grid rides in the distance field's buffer because the compute stage is at **wgpu's default of eight storage buffers**. No sampler, so eight reads and nine weights in WGSL | **Neutral.** It measured inside drift, so nothing was lost — but the sampler is exactly what he calls the reason his version is "cheap as dirt", and giving it up went unrecorded until 2026-09-28 |
 | Visited cells are a hash map, not his **dense bitmap** | 12 | He names constant-time membership as what makes walking nodes worth doing. His world is chunked; this tree reaches **4096**, so a dense array is 6.9×10¹⁰ entries and a walk may roam anywhere within `BUDGET` | **Forced, and handled**: a cheap integer hasher recovered 17-26% of it on 2026-09-28 |
@@ -95,7 +95,7 @@ Places BEVOX is better, usually because he documented the problem first.
 | Difference | Devlog | Why | Good idea? |
 |---|---|---|---|
 | Voxel classification re-runs on **every edit** | 20 | He classifies once, when an object spawns — enough for an engine whose bodies were not yet editable. BEVOX edits bodies with a brush and fractures them | **Yes**, and forced by having features he did not yet have |
-| The speed ceiling is a speed, not a distance per tick | — | Not in his devlogs. BEVOX's own `MAX_TRAVEL` was per-tick, so it meant a different speed at 64 Hz and at 128 | **Yes** — a bug we made and fixed ourselves, not a divergence from him |
+| The speed ceiling is a speed, not a distance per tick | — | Our own `MAX_TRAVEL` was per-tick, so it meant a different speed at 64 Hz and 128 | **Half right, and being replaced.** Per-second was the right fix to a bug we made. But **he has no ceiling at all**: he bounds tunnelling by substepping *detection* per pair on a fixed distance margin, so cost is linear in speed where BEVOX's margin-widened lookup is cubic. [The respec](../superpowers/specs/2026-09-30-bevox-fracture-and-detection-design.md) removes the cap |
 | Angular **momentum** stored, not angular velocity | — | With no torque it is exactly constant, so the conservation gate can demand exact equality rather than a tolerance | **Yes** |
 | A bias term on joints | 30 | His `λ = −(J M⁻¹ Jᵀ)⁻¹ (J·V)` shows no drift correction at all | **Yes**, and it is left out of the relax pass, after Box2D v3 |
 | Every gate proven by a deliberate break | — | He debugs by disabling axes and printing between stages — effective, and not a standing discipline. BEVOX has found **six blind gates** this way | **Yes**, and it is the practice most responsible for the physics being trustworthy |
@@ -176,6 +176,22 @@ The 2D-first half is no longer actionable — the 3D solver exists and passes. T
 **scene** transfers, and it is the cheapest item on this page: a fixture and three
 assertions, no engine code, and `MAX_BODIES` does not constrain it because the cap
 is the renderer's.
+
+## F7. One velocity pass per substep, where his is a count — **newly found**
+
+**What differs.** His solver config carries `velocity_iterations` and
+`relaxation_iterations` as *counts*. BEVOX runs exactly one biased pass and one
+relax pass per substep.
+
+**Why it drifted.** BEVOX's solver was ported from what devlog 26 describes, and
+he describes the *structure* — detect, substep, integrate last — not the iteration
+counts inside it. They were only visible once `rigid_pixels` could be read.
+
+**Good idea?** No. More velocity iterations per substep is the standard lever for
+stacking stability, and stacking stability is exactly what broke on 2026-09-28
+when a 240:1 mass ratio diverged. BEVOX has been running the solver at its least
+stable setting without knowing there was a setting. Cheap to expose, and it wants
+measuring against the stress scene of F4 rather than on its own.
 
 ## F5. Shadows are recomputed every frame — **too early to say**
 

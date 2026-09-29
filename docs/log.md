@@ -1,6 +1,24 @@
 # Update Log
 
 ## 2026-09-30
+* **Creation**: [Dwyer's rigid_pixels, read from source](reference/rigid-pixels.md) —
+  his open-source 2D prototype settles three things the devlogs leave open. **He
+  has no speed cap at all**: tunnelling is bounded by substepping *detection* per
+  pair against a fixed 0.4 distance, so cost is linear in speed where BEVOX's
+  margin-widened lookup is cubic. His fracture threshold is an **impulse scaled
+  by object size**, tested **per side**, handing back **exactly the excess**. And
+  his solver exposes `velocity_iterations` and `relaxation_iterations` as counts
+  where BEVOX runs one of each — the standard lever for stacking stability, which
+  is what broke on 2026-09-28.
+* **Creation**: [fracture and detection, as he built them](superpowers/specs/2026-09-30-bevox-fracture-and-detection-design.md) —
+  the respec. The closing-speed threshold goes back to an impulse: **the units
+  were the problem and the physics was changed to fix them**, and it cost crush
+  fracture, which is the symptom Flori found with the mouse grab.
+* **Update**: devlog 17 checked line by line against the reference file — date,
+  id, the 64 children, the brick-tree name, the 64-bit mask, eight-or-more reads
+  per octree step, ten ray steps without a memory read, 7 ms, primary and shadow
+  ray, 1660 Ti, compute-bound, and the 11,000 lines removed. **Every checkable
+  claim holds.**
 * **Update**: the static march measured rather than guessed at. **A primary ray
   takes nine steps**, so the marcher is not step-bound and Dwyer's four
   accelerations have already taken the walk to almost nothing — no traversal

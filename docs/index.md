@@ -48,12 +48,14 @@ lifted out of the plan that produced it.
 # Reference
 
 * [Douglas Dwyer's voxel engine, devlog by devlog](reference/dwyer-devlogs.md) - what he built in each of his thirty Voxel Devlogs, dated, and what each changed from the ones before.
+* [Dwyer's rigid_pixels, read from source](reference/rigid-pixels.md) - the 2D prototype behind devlog 26, which settles what the devlogs leave open.
 * [How far BEVOX has drifted from Dwyer](reference/dwyer-drift.md) - thirty-one differences sorted by why each happened and whether it was a good idea. Six causes; only one is drift.
 
 # Design specs
 
 * [BEVOX ray-marcher core](superpowers/specs/2026-09-13-bevox-raymarcher-core-design.md) - A sparse voxel world ray marched on the GPU, with a CPU reference the shader is held to pixel for pixel.
 * [Body composition in ray order](superpowers/specs/2026-09-29-bevox-body-composition-design.md) - cut the primary half of a body's cost by rejecting with the bounding sphere the shadow path already has, then visiting bodies in ray order.
+* [Fracture and detection, as he built them](superpowers/specs/2026-09-30-bevox-fracture-and-detection-design.md) - revert the closing-speed threshold to a size-scaled impulse, and replace the speed cap with substepped detection.
 * [BEVOX Rigid Bodies](superpowers/specs/2026-09-15-bevox-rigid-bodies-design.md) - Voxel chunks that detach from the static world, fall, tumble and come to rest, rendered by the same ray marcher that draws everything else.
 
 # Implementation plans
