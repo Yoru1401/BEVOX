@@ -19,6 +19,12 @@
   primary march and the shadow-ray caster tests, so the two renderer divergences
   are worth the same; and the static march alone is 13.23 ms of a 16.7 ms frame —
   [the body cap](concepts/body-cap.md).
+* **Update**: the drift ledger rebuilt around **why** each difference happened and
+  whether it was a good idea. Thirty-one differences, six causes, and only one of
+  them is drift: six oversights, four worth fixing, four of those in the renderer.
+  Everything else is a different product, a different renderer, a forced
+  constraint, something not reached yet, or a place BEVOX is better —
+  [the ledger](reference/dwyer-drift.md).
 * **Creation**: [how far BEVOX has drifted from Dwyer](reference/dwyer-drift.md) —
   all thirty devlogs set against what the engine does. Ten deviations have a
   reason on record; **seven do not**, six of those in the renderer. The first is
