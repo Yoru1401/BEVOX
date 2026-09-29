@@ -1,5 +1,12 @@
 # Update Log
 
+## 2026-09-29
+* **Creation**: [how far BEVOX has drifted from Dwyer](reference/dwyer-drift.md) —
+  all thirty devlogs set against what the engine does. Ten deviations have a
+  reason on record; **seven do not**, six of those in the renderer. The first is
+  that his answer to the many-objects cap (devlog 2's interleaved stepping) was
+  never taken, which is why `MAX_BODIES` is 16.
+
 ## 2026-09-28
 * **Creation**: [the map](map/) — five one-page overviews, after Stone Librande's
   GDC talk on one-page designs: the engine, then a page per crate, plus the

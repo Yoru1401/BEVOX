@@ -1121,7 +1121,9 @@ hung; cut the hinge out of the door itself and the two become separate objects.
 
 Pointers only, so a reader of this bundle can get from a devlog to the thing it
 produced here. No comparison is intended; see the plan behind each for what was
-actually built and measured.
+actually built and measured, and
+[how far BEVOX has drifted](dwyer-drift.md) for all thirty set against what the
+engine does.
 
 | Devlog | Taken up in |
 |---|---|

@@ -46,6 +46,7 @@ lifted out of the plan that produced it.
 # Reference
 
 * [Douglas Dwyer's voxel engine, devlog by devlog](reference/dwyer-devlogs.md) - what he built in each of his thirty Voxel Devlogs, dated, and what each changed from the ones before.
+* [How far BEVOX has drifted from Dwyer](reference/dwyer-drift.md) - the same thirty against what this engine does, and the seven divergences with no reason on record.
 
 # Design specs
 
