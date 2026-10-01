@@ -1036,8 +1036,13 @@ mod tests {
                 .collect()
         };
 
-        // How far the bottom cube sits below the 10.0 it settles at in
+        // How far the bottom cube sits from the 10.0 it settles at in
         // `a_stack_of_three_stands_still`, after the same 2000 ticks.
+        //
+        // `.abs()`, not `.max(0.0)`: clamping at zero reads a body floating
+        // *above* its reference as a perfect contact, and the thing this gate
+        // watches for is a mis-scaled push-out bias, which shows up as travel
+        // in either direction.
         let settle = |tuning: crate::Tuning| -> f32 {
             let mut bodies = fixture();
             for _ in 0..2000 {
@@ -1053,7 +1058,7 @@ mod tests {
                     tuning,
                 );
             }
-            (10.0 - bodies[0].position.y).max(0.0)
+            (10.0 - bodies[0].position.y).abs()
         };
 
         let one = settle(crate::Tuning::default());
@@ -1975,58 +1980,192 @@ mod tests {
         println!("16 bodies, median ms/tick: falling {fall:.4}, resting {rest:.4}, stacked {pile:.4}");
     }
 
+    /// An arbitrary box of voxels. `cube`/`cube_of` from the shared fixtures
+    /// can only build actual cubes, and the 240:1 load needs a one-voxel-thick
+    /// plate.
+    fn block(nx: u32, ny: u32, nz: u32, extent: u32, material: MaterialId) -> Contree {
+        let mut voxels = Vec::new();
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    voxels.push((UVec3::new(x, y, z), material));
+                }
+            }
+        }
+        Contree::from_voxels(extent, &voxels)
+    }
+
+    /// `placed`, with the material table passed explicitly. `fixtures::placed`
+    /// calls `fixtures::materials()` itself, whose fixed densities cannot
+    /// reach a 240:1 ratio inside `u16`.
+    fn placed_with(volume: Contree, centre: Vec3, orientation: Quat, materials: &MaterialTable) -> Body {
+        let mut body = Body::new(volume, Vec3::ZERO, orientation);
+        assert!(recompute(&mut body, materials), "a fixture body must have mass");
+        body.position = centre;
+        body
+    }
+
+    /// The 240:1 load's two materials: density 200 for the base cube and the
+    /// plate, 48,000 for the heavy body -- exactly 240x, and inside `u16`. The
+    /// ratio comes from density alone, at equal volume, not from extra voxels.
+    fn load_materials() -> MaterialTable {
+        use bevox_core::material::{DEFAULT_STRENGTH, Material};
+        let mut table = MaterialTable::new();
+        table
+            .push(Material { color: [160, 160, 160, 255], density: 200, friction: 60, restitution: 0, strength: DEFAULT_STRENGTH })
+            .unwrap();
+        table
+            .push(Material { color: [120, 40, 40, 255], density: 48_000, friction: 60, restitution: 0, strength: DEFAULT_STRENGTH })
+            .unwrap();
+        table
+    }
+
+    /// The 240:1 load fixture, on `slab(64, 0..8)`: a `cube(4, 4)` at
+    /// `y = 10.2`, a 4x1x4 one-voxel plate at `y = 12.2`, and a 4x1x4 heavy
+    /// body at `y = 13.2` whose density gives it 240 times the plate's mass.
+    ///
+    /// Not a gate fixture -- the original was deleted on 2026-09-28 when it
+    /// was found to diverge -- so it is rebuilt here from the description of
+    /// what it was. Shared by `what_the_iteration_counts_cost` and
+    /// `the_240_to_1_load_collapses_through_the_floor`.
+    fn load_fixture(materials: &MaterialTable) -> Vec<Body> {
+        vec![
+            placed_with(block(4, 4, 4, 4, MaterialId(1)), Vec3::new(32.0, 10.2, 32.0), Quat::IDENTITY, materials),
+            placed_with(block(4, 1, 4, 4, MaterialId(1)), Vec3::new(32.0, 12.2, 32.0), Quat::IDENTITY, materials),
+            placed_with(block(4, 1, 4, 4, MaterialId(2)), Vec3::new(32.0, 13.2, 32.0), Quat::IDENTITY, materials),
+        ]
+    }
+
+    /// How low a body's `world_box` may bottom out while it is still standing
+    /// on `slab(64, 0..8)`.
+    ///
+    /// The slab's voxels fill 0..8, so its top surface is y = 8.0, and
+    /// `world_box` is a corner-to-corner box around voxel extents: a body
+    /// resting on the slab reads **7.5**, half a voxel low, and wobbles to
+    /// about 7.31 while still standing. One voxel of it inside the slab is
+    /// 7.0, which is 250x `SLOP` below the resting figure and well clear of
+    /// that wobble -- a resting contact's own penetration (0.0017) cannot
+    /// reach it, and a collapse passes straight through it.
+    const FLOOR_BREACH: f32 = 7.0;
+
+    /// Whether the load fixture has left the regime a stability number can be
+    /// read from: any body a voxel into the slab, or any body gone --
+    /// `step_with`'s first statement deletes anything whose world box falls
+    /// below `y = 0`.
+    fn breached_the_slab(bodies: &[Body], expected: usize) -> bool {
+        bodies.len() != expected
+            || bodies
+                .iter()
+                .any(|b| world_box(b, 0.0).is_some_and(|(min, _)| min.y < FLOOR_BREACH))
+    }
+
+    /// **A characterisation of a known defect, not a property anyone wants.**
+    /// The 240:1 load does not settle: it falls through `slab(64, 0..8)`.
+    /// This test asserts *today's* behaviour so the defect survives a clone
+    /// and is reproducible from the repository rather than from a deleted
+    /// trace -- the number in the write-up was previously only recorded in
+    /// `.superpowers/`, which is git-ignored.
+    ///
+    /// **It is expected to fail the day the collapse is fixed**, and the fix
+    /// is to invert it: assert that the fixture is still standing after 200
+    /// ticks and delete the breach numbers. A failure here means the
+    /// behaviour moved -- read the new numbers it prints before deciding
+    /// whether that is the fix or a different regression.
+    ///
+    /// `#[ignore]`d: it runs 55 ticks of a three-body stack, which is cheap,
+    /// but it is a record of a bug and not a gate the suite should enforce.
+    ///
+    /// Measured 2026-10-02 at `Tuning::default()`: the breach is at **tick
+    /// 55**, with the heavy body falling at **about -22.1 v/s** and the lowest
+    /// world box bottomed at **6.59**, a voxel and a half into a slab whose
+    /// top surface is 8.0. See
+    /// `docs/concepts/solver-convergence-is-a-setting.md`.
+    #[test]
+    #[ignore]
+    fn the_240_to_1_load_collapses_through_the_floor() {
+        let materials = load_materials();
+        let world = slab(64, 0..8);
+        let field = DistanceField::build(&world);
+        let mut bodies = load_fixture(&materials);
+        let expected = bodies.len();
+
+        let mut breach = None;
+        for tick in 1..=200u32 {
+            step_with(&mut bodies, &world, &field, &materials, Air::vacuum(GRAVITY), DT, None, &mut [], crate::Tuning::default());
+            if breached_the_slab(&bodies, expected) {
+                let down = bodies.iter().map(|b| b.velocity.y).fold(f32::INFINITY, f32::min);
+                let low = bodies
+                    .iter()
+                    .filter_map(|b| world_box(b, 0.0))
+                    .map(|(min, _)| min.y)
+                    .fold(f32::INFINITY, f32::min);
+                breach = Some((tick, down, low));
+                break;
+            }
+        }
+
+        let Some((tick, down, low)) = breach else {
+            panic!(
+                "the 240:1 load stood for 200 ticks: the collapse this test characterises is gone. \
+                 If that is the fix, invert this test -- see its doc comment."
+            );
+        };
+        println!("the 240:1 load breached the slab at tick {tick}, falling at {down:.4} v/s, lowest box bottom {low:.4}");
+
+        // A window, not an equality: this is a characterisation, so it pins
+        // the behaviour closely enough to notice a change and loosely enough
+        // that a float's last bit is not the gate.
+        assert!(
+            (50..=60).contains(&tick),
+            "the collapse moved to tick {tick}, from the 55 recorded on 2026-10-02"
+        );
+        assert!(
+            down <= -20.0,
+            "the collapse is at {down} v/s, not the -22.1 recorded on 2026-10-02: it got gentler, which may be a partial fix"
+        );
+        assert!(
+            low < FLOOR_BREACH,
+            "breach reported with the lowest box at {low}, which is not below {FLOOR_BREACH}"
+        );
+    }
+
+    /// The two iteration counts are **1 by measurement**, and something must
+    /// fail if that changes.
+    ///
+    /// `peak[at]`, the accumulated normal impulse `break_what_gave_way` reads,
+    /// is taken inside both solve loops, so the counts are an input to every
+    /// `strength` in the material table. Raising either one silently rescales
+    /// what a fracture threshold means, which is why this is pinned rather
+    /// than left to a comment.
+    #[test]
+    fn the_solver_iteration_counts_are_one() {
+        assert_eq!(
+            (crate::VELOCITY_ITERATIONS, crate::RELAXATION_ITERATIONS),
+            (1, 1),
+            "the solver's iteration counts are 1 by measurement, not by default: \
+             raising either rescales `peak`, which the fracture threshold reads, \
+             so Part 2's `strength` calibration goes with it. \
+             Read docs/concepts/solver-convergence-is-a-setting.md before changing this."
+        );
+    }
+
     /// What raising the solver's two per-substep sweep counts costs, and what
     /// they do to a known divergence, interleaved across one invocation so
     /// cross-run drift cannot be mistaken for a tuning's effect. Not a gate:
-    /// it prints a table for Task 3 to pick counts from.
+    /// it prints a table.
     ///
-    /// The load fixture is not in the suite -- it was deleted on 2026-09-28
-    /// when it was found to diverge -- so it is rebuilt here from the
-    /// description of what it was: a `cube(4, 4)` on the floor, a one-voxel
-    /// plate on top, and a body 240 times the plate's mass on the plate. The
-    /// ratio comes from material density alone, at equal volume, not from
-    /// extra voxels: material 1 (density 200) is the base and the plate,
-    /// material 2 (density 48,000, exactly 240x) is the heavy body, built at
-    /// the plate's own 4x1x4 volume.
+    /// **The design does not separate the two counts.** Four of the seven
+    /// variants raise `velocity_iterations` while holding
+    /// `relaxation_iterations` at 1, so they vary the *ratio* of biased to
+    /// unbiased sweeps and not the biased count alone -- the relax pass exists
+    /// to remove the velocity the bias added. `(2,2)` and `(4,4)` are the
+    /// balanced rows and the only ones that speak about convergence alone.
+    /// Read the two axes separately; see
+    /// `docs/concepts/solver-convergence-is-a-setting.md`.
     #[test]
     #[ignore]
     fn what_the_iteration_counts_cost() {
-        use bevox_core::material::{DEFAULT_STRENGTH, Material, MaterialTable};
-
-        fn block(nx: u32, ny: u32, nz: u32, extent: u32, material: MaterialId) -> Contree {
-            let mut voxels = Vec::new();
-            for z in 0..nz {
-                for y in 0..ny {
-                    for x in 0..nx {
-                        voxels.push((UVec3::new(x, y, z), material));
-                    }
-                }
-            }
-            Contree::from_voxels(extent, &voxels)
-        }
-
-        fn placed_with(volume: Contree, centre: Vec3, orientation: Quat, materials: &MaterialTable) -> Body {
-            let mut body = Body::new(volume, Vec3::ZERO, orientation);
-            assert!(recompute(&mut body, materials), "a fixture body must have mass");
-            body.position = centre;
-            body
-        }
-
-        let mut load_materials = MaterialTable::new();
-        load_materials
-            .push(Material { color: [160, 160, 160, 255], density: 200, friction: 60, restitution: 0, strength: DEFAULT_STRENGTH })
-            .unwrap();
-        load_materials
-            .push(Material { color: [120, 40, 40, 255], density: 48_000, friction: 60, restitution: 0, strength: DEFAULT_STRENGTH })
-            .unwrap();
-
-        let load_fixture = |mats: &MaterialTable| -> Vec<Body> {
-            vec![
-                placed_with(block(4, 4, 4, 4, MaterialId(1)), Vec3::new(32.0, 10.2, 32.0), Quat::IDENTITY, mats),
-                placed_with(block(4, 1, 4, 4, MaterialId(1)), Vec3::new(32.0, 12.2, 32.0), Quat::IDENTITY, mats),
-                placed_with(block(4, 1, 4, 4, MaterialId(2)), Vec3::new(32.0, 13.2, 32.0), Quat::IDENTITY, mats),
-            ]
-        };
+        let load_materials = load_materials();
 
         // The ratio the brief asks for, checked against what the engine's own
         // mass computation produced, not hand arithmetic.
@@ -2050,11 +2189,18 @@ mod tests {
         let world = slab(64, 0..8);
         let field = DistanceField::build(&world);
 
+        // Two axes, not one. The (n,1) rows hold the relax count at 1 while
+        // the biased count rises, so what they vary is the bias:relax ratio:
+        // `solve`'s bias is a *velocity* target and positions are not
+        // integrated inside the velocity loop, so more biased sweeps converge
+        // toward delivering more push-out velocity. The balanced rows raise
+        // both together.
         let tunings = [
             crate::Tuning { velocity_iterations: 1, relaxation_iterations: 1 },
             crate::Tuning { velocity_iterations: 2, relaxation_iterations: 1 },
             crate::Tuning { velocity_iterations: 4, relaxation_iterations: 1 },
             crate::Tuning { velocity_iterations: 8, relaxation_iterations: 1 },
+            crate::Tuning { velocity_iterations: 2, relaxation_iterations: 2 },
             crate::Tuning { velocity_iterations: 4, relaxation_iterations: 4 },
             // Repeated last: if this does not land within 15% of the first
             // (1,1), the run is drift and none of its numbers may be used.
@@ -2069,6 +2215,12 @@ mod tests {
         // Median-of-seven ms/tick against both fixtures, variants interleaved
         // round by round so a slow round lands on every variant equally
         // rather than being read as one tuning's cost.
+        //
+        // **No warmup.** These are ticks 1..=SAMPLES of fresh fixtures, so the
+        // "resting" column is a stack still settling, not a settled one --
+        // `the_cost_of_sixteen_bodies` in this same file warms 300 ticks first
+        // and this does not. The columns compare variants against each other on
+        // identical state; neither is a resting-cost figure.
         let mut load_states: Vec<Vec<Body>> = tunings.iter().map(|_| load_fixture(&load_materials)).collect();
         let mut resting_states: Vec<Vec<Body>> = tunings.iter().map(|_| resting_fixture()).collect();
         let mut load_times: Vec<Vec<f64>> = (0..tunings.len()).map(|_| Vec::new()).collect();
@@ -2107,24 +2259,43 @@ mod tests {
         }
 
         // The load fixture's divergence: the worst upward velocity any body
-        // reaches over 200 ticks, each variant from a fresh copy of the
-        // fixture. Timed too, for Review Focus 5: a count must not make a
-        // tick unbounded.
+        // reaches, each variant from a fresh copy of the fixture.
+        //
+        // **The scan stops at the first breach.** This fixture collapses, and
+        // `step_with`'s first statement deletes any body whose world box falls
+        // below y = 0, so ticks past the collapse measure a shrinking scene
+        // rather than a stack: a maximum over the whole 200 is a maximum over
+        // an invalid regime. The peak's tick and the breach tick are printed
+        // so the window each number came from is visible.
+        let bodies_expected = load_fixture(&load_materials).len();
         let mut worst_up: Vec<f32> = Vec::new();
+        let mut peak_tick: Vec<u32> = Vec::new();
+        let mut breach_tick: Vec<Option<u32>> = Vec::new();
         for tuning in &tunings {
             let mut bodies = load_fixture(&load_materials);
             let mut worst = f32::NEG_INFINITY;
+            let (mut at, mut breach) = (0u32, None);
             let start = std::time::Instant::now();
-            for _ in 0..200 {
+            for tick in 1..=200u32 {
                 step_with(&mut bodies, &world, &field, &load_materials, Air::vacuum(GRAVITY), DT, None, &mut [], *tuning);
-                worst = worst.max(bodies.iter().map(|b| b.velocity.y).fold(f32::NEG_INFINITY, f32::max));
+                if breached_the_slab(&bodies, bodies_expected) {
+                    breach = Some(tick);
+                    break;
+                }
+                let up = bodies.iter().map(|b| b.velocity.y).fold(f32::NEG_INFINITY, f32::max);
+                if up > worst {
+                    worst = up;
+                    at = tick;
+                }
             }
             let elapsed = start.elapsed().as_secs_f64();
             assert!(
                 elapsed < 2.0,
-                "tuning {tuning:?} took {elapsed:.3}s for 200 ticks of the load fixture, over the 2s bound"
+                "tuning {tuning:?} took {elapsed:.3}s for the load fixture's scan, over the 2s bound"
             );
             worst_up.push(worst);
+            peak_tick.push(at);
+            breach_tick.push(breach);
         }
 
         // The resting fixture's penetration after 2000 ticks: how far the
@@ -2136,28 +2307,35 @@ mod tests {
             for _ in 0..2000 {
                 step_with(&mut bodies, &world, &field, &resting_materials, Air::vacuum(GRAVITY), DT, None, &mut [], *tuning);
             }
-            penetration.push((10.0 - bodies[0].position.y).max(0.0));
+            // `.abs()`, as in `more_iterations_do_not_deepen_a_resting_contact`:
+            // a clamp at zero would read a body floating above its reference
+            // as a perfect contact.
+            penetration.push((10.0 - bodies[0].position.y).abs());
         }
 
         println!(
             "load fixture masses: plate {plate_mass:.1}, heavy {heavy_mass:.1}, ratio {:.2}",
             heavy_mass / plate_mass
         );
-        println!("tuning       load ms/tick   resting ms/tick   worst upward v/s   resting penetration");
+        println!(
+            "tuning       load ms/tick   resting ms/tick   worst upward v/s   at tick   breach tick   resting penetration"
+        );
         for (i, tuning) in tunings.iter().enumerate() {
             println!(
-                "({:>2},{:>2})     {:>10.4}   {:>13.4}     {:>14.4}   {:>18.4}",
+                "({:>2},{:>2})     {:>10.4}   {:>13.4}     {:>14.4}   {:>7}   {:>11}   {:>18.4}",
                 tuning.velocity_iterations,
                 tuning.relaxation_iterations,
                 median(load_times[i].clone()),
                 median(resting_times[i].clone()),
                 worst_up[i],
+                peak_tick[i],
+                breach_tick[i].map_or_else(|| "none".to_string(), |t| t.to_string()),
                 penetration[i]
             );
         }
 
         let first = median(load_times[0].clone());
-        let repeat = median(load_times[5].clone());
+        let repeat = median(load_times[tunings.len() - 1].clone());
         let drift = (repeat - first).abs() / first;
         println!("drift check: first (1,1) {first:.4} ms, repeat (1,1) {repeat:.4} ms, drift {:.1}%", drift * 100.0);
         assert!(
