@@ -10,3 +10,8 @@
 # Per-machine Claude Code permissions, not project configuration. A shared
 # .claude/settings.json would still be tracked.
 .claude/settings.local.json
+
+# A knowledge graph built from this repository, so every byte of it is derived.
+# 7 MB of JSON and a self-contained HTML viewer, rebuilt by `/graphify .` from
+# the code and the bundle it already tracks.
+graphify-out/

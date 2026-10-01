@@ -172,10 +172,18 @@ lone voxel sleeps — all named scenarios.
 a stack accelerate **upward at 23 voxels a second** by tick 33. Nothing in 117
 tests would have caught it, because stability under load is not a scenario.
 
-The 2D-first half is no longer actionable — the 3D solver exists and passes. The
-**scene** transfers, and it is the cheapest item on this page: a fixture and three
-assertions, no engine code, and `MAX_BODIES` does not constrain it because the cap
-is the renderer's.
+**Two pieces, and Flori wants both** — my "the 2D half is no longer actionable"
+was overruled on 2026-09-30 and the shape settled on 2026-10-01.
+
+- **The stress scene** stays here: his tumbler, a fixture and three assertions,
+  no engine code, and `MAX_BODIES` does not constrain it because the cap is the
+  renderer's. The cheapest item on this page.
+- **The 2D simulation gets its own repository.** It is a *bench*, not a feature —
+  somewhere detectors and solvers can be swapped and compared the way
+  `rigid_pixels` is, which is the whole reason he built one. Keeping it out of
+  this tree means it can carry throwaway solvers without them becoming BEVOX's
+  API, and it never pays this repo's gate discipline for code that exists to be
+  deleted.
 
 ## F7. One velocity pass per substep, where his is a count — **newly found**
 
