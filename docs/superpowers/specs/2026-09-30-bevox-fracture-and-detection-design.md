@@ -51,6 +51,14 @@ stacking stability is what failed on 2026-09-28, when a 240:1 mass ratio
 **BEVOX has been running its solver at the least converged setting there is,
 without knowing there was a setting.**
 
+> **Measured, and this premise did not hold.** The counts were exposed and
+> measured on 2026-10-01 and re-run on 2026-10-02. Raising the biased count
+> alone bought no stability, and the 2026-09-28 divergence above **did not
+> reproduce** — the rebuilt fixture collapses *downward* through the floor at
+> tick 55 instead. Both counts stay at 1. The paragraph above is left as the
+> premise this part was written on; what it actually found is in
+> [solver convergence is a setting, and the spec reached for the wrong one](../../concepts/solver-convergence-is-a-setting.md).
+
 ## Why this must come first
 
 `peak[at]`, the accumulated normal impulse that Part 2 thresholds fracture on, is

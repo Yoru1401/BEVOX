@@ -35,21 +35,40 @@ pub const SUBSTEPS: u32 = 4;
 /// Sweeps of the biased contact/joint pass per substep, the one that pushes
 /// penetration out.
 ///
-/// **1 by measurement, not by default.** Measured 2026-10-01 by
-/// `solver::tests::what_the_iteration_counts_cost`: raising this count made a
-/// 240:1 mass-ratio load *less* stable, not more (worst upward velocity
-/// 12.83 v/s at 1, 18.02 v/s at 8), while costing 2.8x a tick. The one thing
-/// it did buy is shallower resting penetration, held by
-/// `solver::tests::more_iterations_do_not_deepen_a_resting_contact`. See
+/// **1 by measurement, not by default.** Measured by
+/// `solver::tests::what_the_iteration_counts_cost` (2026-10-01, re-run
+/// 2026-10-02): raising this count **while holding `RELAXATION_ITERATIONS` at
+/// 1** made a 240:1 mass-ratio load no more stable -- worst upward velocity
+/// 12.83 v/s at `(1,1)` against 15.75, 14.81 and 18.02 at `(2,1)`, `(4,1)`
+/// and `(8,1)`, and the fixture breached the floor at tick 55, 88, 67 and 55 --
+/// for up to 2.6x a tick.
+///
+/// **What that does not settle.** Those variants change the *ratio* of biased
+/// to unbiased sweeps, not the biased count alone: the relax pass exists to
+/// remove the velocity this pass's bias added, so an unexcluded explanation is
+/// the ratio rather than convergence. Raising both together **does** hold the
+/// fixture up longer (tick 105 at `(2,2)`, 123 at `(4,4)`), at 1.9x and 3.0x
+/// the tick. 1 is kept because the cheap setting is the one that was measured
+/// and because this count rescales `peak`, which the fracture threshold reads.
+///
+/// Shallower resting penetration is monotonic in it and is held by
+/// `solver::tests::more_iterations_do_not_deepen_a_resting_contact`. Read
 /// `docs/concepts/solver-convergence-is-a-setting.md` before raising it.
 pub const VELOCITY_ITERATIONS: u32 = 1;
 
 /// Sweeps of the unbiased relax pass per substep, the one that removes the
 /// velocity the bias added.
 ///
-/// **1 by measurement, not by default.** The only variant that beat `(1, 1)`
-/// on the load fixture at all was `(4, 4)`, by 0.9 v/s for 3.2x the tick
-/// cost. Same measurement and same concept page as `VELOCITY_ITERATIONS`.
+/// **1 by measurement, not by default.** This is the count the 2026-10-01
+/// design failed to vary: four of its six variants held it at 1 while the
+/// biased count rose, so they measured the bias:relax ratio. The two balanced
+/// variants -- `(2,2)` and `(4,4)`, the second added on 2026-10-02 -- are the
+/// ones that kept the 240:1 load standing longer, to tick 105 and 123 against
+/// `(1,1)`'s 55, for 1.9x and 3.0x the tick.
+///
+/// **So the balanced axis is not a closed question**, and 1 is a cost
+/// decision on a fixture that collapses either way, not a measured optimum.
+/// Same measurement and same concept page as `VELOCITY_ITERATIONS`.
 pub const RELAXATION_ITERATIONS: u32 = 1;
 
 /// How many times the solver sweeps its two passes per substep. Both default

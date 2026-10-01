@@ -1,32 +1,50 @@
 # Update Log
 
 ## 2026-10-01
+* **Correction, 2026-10-02**: the negative result below was stated wider than
+  its experiment could carry, and is **narrowed**. Four of the six variants
+  raised `velocity_iterations` while holding `relaxation_iterations` at 1, so
+  they vary the **bias:relax ratio** and not the biased count alone — the relax
+  pass exists to remove the velocity the bias added. Three sentences are
+  withdrawn in that form: "made a 240:1 load *less* stable", "no setting on this
+  axis", "the question is closed". `(2,2)` was added and the measurement re-run:
+  on the **balanced** axis the fixture stands **roughly twice and three times as
+  long** (breach at tick 105 at (2,2) and 123 at (4,4), against 55 at (1,1)), so
+  the balanced axis is **open**, pointing the other way. The stability scan also
+  took its maximum over 200 unconditional ticks of a fixture that breaches at 55
+  and a `step_with` that deletes fallen bodies — it now stops at the first breach
+  and prints the peak and breach ticks. The headline survives: **the lever F7
+  reached for — the biased count alone — did not deliver.**
 * **Measurement, and a negative result**: the solver's two iteration counts are
-  exposed, measured, and **staying at 1**. F7 called raising the velocity count
+  exposed, measured, and **staying at 1**, pinned by
+  `the_solver_iteration_counts_are_one`. F7 called raising the velocity count
   "the standard lever for stacking stability"; `what_the_iteration_counts_cost`
-  says it is **not that in this engine** — a 240:1 load's worst upward velocity
-  goes **12.83 v/s at (1,1) to 18.02 v/s at (8,1)**, for 2.8x the tick cost, and
-  the only variant that beats the default at all is (4,4), by 0.9 v/s for 3.2x.
-  **Less stable under more work, not more.** The one monotonic gain is resting
-  penetration, 0.0017 → 0.0003, now gated by
-  `more_iterations_do_not_deepen_a_resting_contact`. The loops themselves are
-  free: bit-identical at the default, proven by
+  says it is **not that in this engine, on the axis the spec named** — a 240:1
+  load's worst upward velocity goes **12.83 v/s at (1,1) to 18.02 v/s at (8,1)**
+  for 2.6x the tick cost, and (8,1) breaches the floor on the same tick 55 that
+  (1,1) does. The one monotonic gain is resting penetration, 0.0017 → 0.0003, now
+  gated by `more_iterations_do_not_deepen_a_resting_contact`. The loops
+  themselves are free: bit-identical at the default, proven by
   `a_tick_is_unchanged_by_the_default_tuning`. F7 is **resolved, not fixed**, and
   the claim about what raising the counts buys is withdrawn —
-  [solver convergence is a setting, and more of it is worse](concepts/solver-convergence-is-a-setting.md).
+  [solver convergence is a setting, and the spec reached for the wrong one](concepts/solver-convergence-is-a-setting.md).
   Also recorded there, because it was found on the way: **zeroing
   `velocity_iterations` does not drop a body through the floor.** The unbiased
   relax pass calls the same `solve`/`solve_friction`/`solve_rolling`, so
   non-penetration survives; what breaks is eleven tests, mostly joints. The
   biased pass is not what holds a stack up.
-* **Open defect**: the rebuilt 240:1 fixture **collapses through the floor by
-  tick 55** — peaking at 12.83 v/s *upward* around tick 9-10, then falling at
-  about −23.6 v/s. The 2026-09-28 record ("23 v/s upward by tick 33") **does not
+* **Open defect, now characterised**: the rebuilt 240:1 fixture **collapses
+  through the floor at tick 55** — peaking at 12.83 v/s *upward* at tick 11, then
+  a voxel and a half into the slab and falling at **−22.08 v/s**. Reproducible
+  from a clone by `the_240_to_1_load_collapses_through_the_floor` (`#[ignore]`d),
+  which **passes today** and is written to be inverted the day the collapse is
+  fixed. The 2026-09-28 record ("23 v/s upward by tick 33") **does not
   reproduce**: different magnitude, direction and timing, and at tick 33 the
   fixture is settling. This is independent of the iteration counts, nothing was
-  adjusted to chase the recorded number, and **no cause is offered** — only body
-  velocities were instrumented. Runnable from
-  `what_the_iteration_counts_cost`.
+  adjusted to chase the recorded number, and **no cause is established** — two
+  hypotheses are recorded and marked as hypotheses (`MAX_PUSH` being a
+  mass-independent velocity clamp, `[Likely]`; contacts reused across four
+  substeps against a one-voxel plate, `[Guessing]`), neither tested.
 * **Update**: [the fracture and detection spec](superpowers/specs/2026-09-30-bevox-fracture-and-detection-design.md)
   revised, and **reordered**. F7 — the solver's iteration counts — was listed out
   of scope and is now **Part 1**, because `peak[at]`, the accumulated normal

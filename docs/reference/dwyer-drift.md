@@ -35,9 +35,16 @@ because the cause is what says whether a difference needs fixing.
 | **F — oversight.** Nobody decided | 7 | **This is the drift.** Five looked worth fixing; F7 is measured and resolved, leaving four |
 
 **Seven real problems out of thirty-two differences**, five of which looked worth
-fixing. Four are in the renderer; the seventh was a solver setting nobody knew
-existed, and **F7 is now resolved rather than fixed** — the setting was exposed,
-measured, and left where it was, which leaves **four** worth fixing.
+fixing. **F7 is now resolved rather than fixed** — the setting was exposed,
+measured, and left where it was — which leaves **F1 to F4** worth fixing. Of
+those four, **three are in the renderer** (F1 the missing bounding-sphere reject,
+F2 and F3); **F4 is the stress scene**, which is physics. The seventh, F7, was a
+solver setting nobody knew existed.
+
+(The sentence here used to read "Four are in the renderer … leaves four worth
+fixing", which equated two different fours: the four renderer items as counted
+before F7 existed, and the four that remain after F7. They are not the same
+set.)
 
 # A — Different product
 
@@ -202,20 +209,35 @@ counts inside it. They were only visible once `rigid_pixels` could be read.
 **Good idea?** The difference was worth closing; **the reason given for closing
 it was wrong.** This entry said more velocity iterations per substep is "the
 standard lever for stacking stability" and that BEVOX "has been running the
-solver at its least stable setting". Measured on 2026-10-01 by
-`solver::tests::what_the_iteration_counts_cost`: **raising the velocity count
-made a 240:1 load less stable**, worst upward velocity 12.83 v/s at one
-iteration against 18.02 v/s at eight, for 2.8x the tick cost. The one gain was
-shallower resting penetration, 0.0017 → 0.0003.
+solver at its least stable setting". Measured by
+`solver::tests::what_the_iteration_counts_cost` (2026-10-01, re-run 2026-10-02):
+**raising the velocity count while holding the relax count at 1 bought no
+stability on a 240:1 load** — worst upward velocity 12.83 v/s at `(1,1)` against
+18.02 at `(8,1)`, and `(8,1)` breached the floor on the same tick 55 that
+`(1,1)` did, for 2.6x the tick cost. The one gain on that axis was shallower
+resting penetration, 0.0017 → 0.0003.
 
-So **the counts stay at 1 by measurement**, and the claim about what raising
-them buys is withdrawn —
-[solver convergence is a setting, and more of it is worse](../concepts/solver-convergence-is-a-setting.md).
+**What the measurement cannot say.** Those four variants hold
+`relaxation_iterations` at 1, so they vary the **bias:relax ratio** and not the
+biased count alone — the relax pass exists to remove the velocity the bias
+added, and the ratio is an unexcluded explanation of every number in them. The
+two **balanced** variants point the other way: `(2,2)` and `(4,4)` keep the
+fixture standing to tick **105** and **123** against `(1,1)`'s 55, for 1.9x and
+3.0x the tick. So the balanced axis is **not** closed, and the earlier claims
+that this axis offered nothing and that the question was closed are withdrawn.
+
+So **the counts stay at 1** — a cost decision on a fixture that collapses at
+every setting measured, plus the fact that the counts rescale `peak` and
+therefore Part 2's `strength` calibration, pinned by
+`solver::tests::the_solver_iteration_counts_are_one`. Full write-up:
+[solver convergence is a setting, and the spec reached for the wrong one](../concepts/solver-convergence-is-a-setting.md).
 Two things it left behind: the 2026-09-28 divergence **did not reproduce** as
-recorded, and the rebuilt fixture instead collapses through the floor by tick
-55, which is an open defect recorded on that page. F4's stress scene is still
-wanted — not to measure the counts, which is done, but because what makes an
-extreme mass ratio collapse is still unmeasured.
+recorded, and the rebuilt fixture instead collapses through the floor at tick
+55 — an open defect, now characterised by the `#[ignore]`d
+`solver::tests::the_240_to_1_load_collapses_through_the_floor`, which passes
+today and is written to be inverted when the collapse is fixed. F4's stress
+scene is still wanted — not to measure the counts, which is done, but because
+what makes an extreme mass ratio collapse is still unmeasured.
 
 ## F5. Shadows are recomputed every frame — **too early to say**
 

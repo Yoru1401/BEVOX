@@ -213,6 +213,8 @@ git commit -m "test(physics): measure what the solver's iteration counts cost"
 
 ### Task 3: choose the counts, and gate what the choice bought
 
+**Superseded — see "What actually happened".**
+
 **Files:**
 - Modify: `crates/bevox_physics/src/lib.rs` — the two constants take their measured values
 - Modify: `docs/map/physics-constants.md` — the values and their one-line reasons
@@ -316,7 +318,7 @@ result, gate the one property worth holding
 (`more_iterations_do_not_deepen_a_resting_contact`), and resolve F7 against its
 own reasoning. The tasks above are left as written — they are the record of what
 was intended. What came true is in
-[solver convergence is a setting, and more of it is worse](../../concepts/solver-convergence-is-a-setting.md),
+[solver convergence is a setting, and the spec reached for the wrong one](../../concepts/solver-convergence-is-a-setting.md),
 including the one thing this work found that nobody was looking for: the
 rebuilt 240:1 fixture **collapses through the floor by tick 55**, which is an
 open defect and not an iteration-count problem.
@@ -324,3 +326,16 @@ open defect and not an iteration-count problem.
 The plan's Step 8 commit message, "converge the solver, and say what it cost",
 describes work that did not happen. What shipped is
 `perf(physics): measure the solver's iteration counts, and leave them at one`.
+
+**Correction, 2026-10-02.** The sentence above — "raising the velocity count
+made the load fixture *less* stable" — is **wider than the experiment can
+carry** and is withdrawn in that form. Four of the six variants held
+`relaxation_iterations` at 1 while the biased count rose, so they vary the
+bias:relax ratio and not the biased count alone. `(2,2)` was added and the
+measurement re-run: on the **balanced** axis the fixture stands roughly twice
+and three times as long (breach at tick 105 and 123 against 55). What stands is
+that **the lever this plan reached for — the biased count on its own — did not
+deliver**. The narrowed write-up, the corrected stability metric and the
+characterisation test for the collapse are on the concept page linked above.
+This note is left otherwise as written: it is the record of what was concluded
+on 2026-10-01.
