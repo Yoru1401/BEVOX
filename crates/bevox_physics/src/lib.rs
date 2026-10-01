@@ -32,6 +32,29 @@ pub const GRAVITY: Vec3 = Vec3::new(0.0, -9.81 / VOXEL_METRES, 0.0);
 /// reused by every substep.
 pub const SUBSTEPS: u32 = 4;
 
+/// Sweeps of the biased contact/joint pass per substep, the one that pushes
+/// penetration out. 1 until Task 3's measurement says otherwise.
+pub const VELOCITY_ITERATIONS: u32 = 1;
+
+/// Sweeps of the unbiased relax pass per substep, the one that removes the
+/// velocity the bias added. 1 until Task 3's measurement says otherwise.
+pub const RELAXATION_ITERATIONS: u32 = 1;
+
+/// How many times the solver sweeps its two passes per substep. Both default
+/// to 1, which is what makes `step` and `step_with(.., Tuning::default())`
+/// bit for bit identical.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tuning {
+    pub velocity_iterations: u32,
+    pub relaxation_iterations: u32,
+}
+
+impl Default for Tuning {
+    fn default() -> Tuning {
+        Tuning { velocity_iterations: VELOCITY_ITERATIONS, relaxation_iterations: RELAXATION_ITERATIONS }
+    }
+}
+
 /// Penetration left alone, in voxels, so a resting contact is not pushed out
 /// and fallen back into every substep.
 pub const SLOP: f32 = 0.02;

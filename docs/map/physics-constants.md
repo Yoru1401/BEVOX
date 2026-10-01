@@ -31,6 +31,8 @@ from gameplay does not.
 | | | |
 |---|---|---|
 | `SUBSTEPS` | 4 | Velocity solves per tick. Contacts are found once and reused by all of them. |
+| `VELOCITY_ITERATIONS` | 1 | Sweeps of the biased pass per substep, the one that pushes penetration out. |
+| `RELAXATION_ITERATIONS` | 1 | Sweeps of the unbiased relax pass per substep, the one that removes the velocity the bias added. |
 | `contact::RADIUS` | 0.5 | The radius a voxel's corners and edges are rounded to. |
 | `BASE_MARGIN` | 0.1 | How far ahead of itself a body looks for contacts even at rest, so one arrives before it is needed rather than after. |
 | `SLOP` | 0.02 | Penetration left alone, in voxels, so a resting contact is not pushed out and dropped back every substep. |

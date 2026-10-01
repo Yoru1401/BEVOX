@@ -16,7 +16,7 @@ use super::fracture::{self, Fracture};
 use super::joint::{self, Joint};
 use super::sleep;
 use super::{
-    Air, BASE_MARGIN, BIAS, MAX_PUSH, MAX_SPEED, RESTITUTION_SWEEPS, ROLLING, SLOP, SUBSTEPS,
+    Air, BASE_MARGIN, BIAS, MAX_PUSH, MAX_SPEED, RESTITUTION_SWEEPS, ROLLING, SLOP, SUBSTEPS, Tuning,
 };
 use bevox_core::body::{Body, BodyId, occupied_bounds};
 use bevox_core::contree::Contree;
@@ -61,6 +61,24 @@ pub fn step(
     dt: f32,
     grab: Option<&mut Joint>,
     joints: &mut [Joint],
+) -> StepOutcome {
+    step_with(bodies, tree, field, materials, air, dt, grab, joints, Tuning::default())
+}
+
+/// `step`, with the solver's sweep counts exposed. `step` is this with
+/// `Tuning::default()`, which is 1 and 1 -- bit for bit what `step` has always
+/// done.
+#[allow(clippy::too_many_arguments)]
+pub fn step_with(
+    bodies: &mut Vec<Body>,
+    tree: &Contree,
+    field: &DistanceField,
+    materials: &MaterialTable,
+    air: Air,
+    dt: f32,
+    grab: Option<&mut Joint>,
+    joints: &mut [Joint],
+    tuning: Tuning,
 ) -> StepOutcome {
     let before = bodies.len();
     bodies.retain(|b| world_box(b, 0.0).is_none_or(|(_, max)| max.y >= 0.0));
@@ -153,13 +171,15 @@ pub fn step(
                 joint::warm_start(a, b, joint);
             }
         }
-        solve_joints(bodies, &mut joints, &links, inv_h, true);
-        for ((j, impulse), peak) in joined.iter().zip(impulses.iter_mut()).zip(peak.iter_mut()) {
-            let (a, mut b) = pair_mut(bodies, j.body, j.other);
-            solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, true);
-            solve_friction(a, b.as_deref_mut(), &j.contact, impulse);
-            solve_rolling(a, b, &j.contact, *impulse);
-            *peak = peak.max(impulse.normal);
+        for _ in 0..tuning.velocity_iterations {
+            solve_joints(bodies, &mut joints, &links, inv_h, true);
+            for ((j, impulse), peak) in joined.iter().zip(impulses.iter_mut()).zip(peak.iter_mut()) {
+                let (a, mut b) = pair_mut(bodies, j.body, j.other);
+                solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, true);
+                solve_friction(a, b.as_deref_mut(), &j.contact, impulse);
+                solve_rolling(a, b, &j.contact, *impulse);
+                *peak = peak.max(impulse.normal);
+            }
         }
 
         for b in bodies.iter_mut().filter(|b| b.mass.mass > 0.0 && !b.asleep) {
@@ -169,13 +189,15 @@ pub fn step(
         // The grab is not relaxed. Its target moves, and the bias is how that
         // motion reaches the body: relaxing it would stop the body dead every
         // substep, and letting go would throw nothing.
-        solve_joints(bodies, &mut joints[..scene_joints], &links[..scene_joints], inv_h, false);
-        for ((j, impulse), peak) in joined.iter().zip(impulses.iter_mut()).zip(peak.iter_mut()) {
-            let (a, mut b) = pair_mut(bodies, j.body, j.other);
-            solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, false);
-            solve_friction(a, b.as_deref_mut(), &j.contact, impulse);
-            solve_rolling(a, b, &j.contact, *impulse);
-            *peak = peak.max(impulse.normal);
+        for _ in 0..tuning.relaxation_iterations {
+            solve_joints(bodies, &mut joints[..scene_joints], &links[..scene_joints], inv_h, false);
+            for ((j, impulse), peak) in joined.iter().zip(impulses.iter_mut()).zip(peak.iter_mut()) {
+                let (a, mut b) = pair_mut(bodies, j.body, j.other);
+                solve(a, b.as_deref_mut(), &j.contact, impulse, inv_h, false);
+                solve_friction(a, b.as_deref_mut(), &j.contact, impulse);
+                solve_rolling(a, b, &j.contact, *impulse);
+                *peak = peak.max(impulse.normal);
+            }
         }
     }
 
@@ -944,6 +966,51 @@ mod tests {
                 b.position.y
             );
             assert!(b.velocity.length() < 2e-2, "body {i} still moving at {:?}", b.velocity);
+        }
+    }
+
+    /// `step` and `step_with(.., Tuning::default())` are the same function:
+    /// the three-body stack, run 2000 ticks through each from identical
+    /// starting state, ends bit for bit identical. Not a tolerance -- the
+    /// default tuning must change nothing, because the loops it adds run
+    /// exactly once.
+    #[test]
+    fn a_tick_is_unchanged_by_the_default_tuning() {
+        let materials = materials();
+        let world = slab(64, 0..8);
+        let field = DistanceField::build(&world);
+        let start: Vec<Body> = (0..3)
+            .map(|i| placed(cube(4, 4), Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0), Quat::IDENTITY))
+            .collect();
+
+        let mut via_step = start.clone();
+        for _ in 0..2000 {
+            step(&mut via_step, &world, &field, &materials, Air::vacuum(GRAVITY), DT, None, &mut []);
+        }
+
+        let mut via_step_with = start.clone();
+        for _ in 0..2000 {
+            step_with(
+                &mut via_step_with,
+                &world,
+                &field,
+                &materials,
+                Air::vacuum(GRAVITY),
+                DT,
+                None,
+                &mut [],
+                crate::Tuning::default(),
+            );
+        }
+
+        for (a, b) in via_step.iter().zip(&via_step_with) {
+            assert_eq!(a.position, b.position, "position diverged under the default tuning");
+            assert_eq!(a.orientation, b.orientation, "orientation diverged under the default tuning");
+            assert_eq!(a.velocity, b.velocity, "velocity diverged under the default tuning");
+            assert_eq!(
+                a.angular_momentum, b.angular_momentum,
+                "angular_momentum diverged under the default tuning"
+            );
         }
     }
 
