@@ -36,8 +36,9 @@ lifted out of the plan that produced it.
 * [Every gate is proven by a deliberate break](concepts/deliberate-breaks.md) - a test that has never failed is not known to test anything.
 * [No safe stale direction](concepts/stale-direction.md) - the distance field may lag, fullness may not, so every editing path recounts it.
 * [The GPU codegen cliff](concepts/gpu-codegen-cliff.md) - code the shader never runs can still cost tens of percent; re-bench every march.wgsl edit.
+* [One canonical tree, and a derived view for each job](concepts/derived-view-per-job.md) - six representations are derived from the Contree, each shaped for one job and each declaring where it may be stale.
 * [An inference is not an observation](concepts/an-inference-is-not-an-observation.md) - a claim about behaviour names the code that makes it true, because no gate can read prose.
-* [The body cap, and what a body costs](concepts/body-cap.md) - 0.265 ms per visible body, and why MAX_BODIES is 16.
+* [The body cap, and what a body costs](concepts/body-cap.md) - 0.629 ms per visible body, and why MAX_BODIES is 16.
 * [The frame budget, and where it goes](concepts/frame-budget.md) - sixteen bodies with shadows take 22.6 ms against 16.7.
 * [Nine steps a ray, so the walk is not the cost](concepts/nine-steps-a-ray.md) - a primary ray takes nine steps, so the static march is bound by what a step costs, not how many.
 * [Both coarse grids ride in one storage buffer](concepts/coarse-grids-share-one-buffer.md) *(premise corrected)* - eight was wgpu's browser baseline, not the hardware's limit; the adapter allows 524,288.
@@ -49,6 +50,7 @@ lifted out of the plan that produced it.
 
 * [Douglas Dwyer's voxel engine, devlog by devlog](reference/dwyer-devlogs.md) - what he built in each of his thirty Voxel Devlogs, dated, and what each changed from the ones before.
 * [Dwyer's rigid_pixels, read from source](reference/rigid-pixels.md) - the 2D prototype behind devlog 26, which settles what the devlogs leave open.
+* [John Lin's voxel engine, read from his blog](reference/john-lin.md) - a second developer, unrelated to Dwyer, whose objection to sparse voxel octrees names a pattern BEVOX already follows.
 * [How far BEVOX has drifted from Dwyer](reference/dwyer-drift.md) - thirty-one differences sorted by why each happened and whether it was a good idea. Six causes; only one is drift.
 
 # Design specs

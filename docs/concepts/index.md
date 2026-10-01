@@ -9,11 +9,12 @@ the next one.
 * [Every gate is proven by a deliberate break](deliberate-breaks.md) - a test that has never failed is not known to test anything.
 * [No safe stale direction](stale-direction.md) - the distance field may lag, fullness may not, so every editing path recounts it.
 * [The GPU codegen cliff](gpu-codegen-cliff.md) - code the shader never runs can still cost tens of percent; re-bench every march.wgsl edit.
+* [One canonical tree, and a derived view for each job](derived-view-per-job.md) - six views are derived from the Contree and each declares its own staleness; the next job gets a view, not a wider node.
 * [An inference is not an observation](an-inference-is-not-an-observation.md) - five of six doc errors in one audit were true premises with unchecked conclusions; the gates cannot read prose.
 
 # Measurements
 
-* [The body cap, and what a body costs](body-cap.md) - 0.265 ms per visible body, and why MAX_BODIES is 16.
+* [The body cap, and what a body costs](body-cap.md) - 0.629 ms per visible body, and why MAX_BODIES is 16.
 * [The frame budget, and where it goes](frame-budget.md) - sixteen bodies with shadows take 22.6 ms against 16.7.
 * [Nine steps a ray, so the walk is not the cost](nine-steps-a-ray.md) - the traversal has nothing left to give; workgroup size is not the lever either.
 

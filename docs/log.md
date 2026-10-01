@@ -1,5 +1,30 @@
 # Update Log
 
+## 2026-10-01
+* **Creation**: [John Lin's voxel engine, read from his blog](reference/john-lin.md) —
+  a second voxel developer, **unrelated to Dwyer**, whose argument is that one
+  format chosen for the renderer poisons every other system: sparse voxel octrees
+  are *"acceptable (not even great)"* at storage and rendering and bad at
+  collision, lighting, path finding and new attributes. His answer is a canonical
+  minimum format plus conversion operators registered by name. **No source, no
+  measurements, and the renderer post he promised was never written** — the
+  project has been silent since 2021, so this is a design argument and is sourced
+  nothing like the rest of this bundle.
+* **Creation**: [one canonical tree, and a derived view for each job](concepts/derived-view-per-job.md) —
+  the pattern BEVOX was already following, now named. **Six** representations are
+  derived from the `Contree` — `Features`, `MassProperties`, `DistanceField`,
+  `Fullness`, `GpuVolume`, and normals that are never stored at all — each shaped
+  for one job and each declaring its own staleness. The rule: the next job gets a
+  view, not a wider `Node`. It also explains why two grids over the same cells in
+  the same struct have opposite dirty policies.
+* **Fix**: the body cap read **0.265 ms per visible body** in both
+  [the bundle index](index.md) and [the concepts index](concepts/index.md), while
+  `body-cap.md` itself and `map/render.md` carry the 0.629 ms re-measured on
+  2026-09-29. This is the sixth row of the
+  [inference audit](concepts/an-inference-is-not-an-observation.md)'s own table
+  surviving in the two files that audit did not re-read — found by a knowledge-graph
+  pass, not by a gate, because `tests/map.rs` checks names and not numbers.
+
 ## 2026-09-30
 * **Creation**: [Dwyer's rigid_pixels, read from source](reference/rigid-pixels.md) —
   his open-source 2D prototype settles three things the devlogs leave open. **He
