@@ -17,12 +17,14 @@ impl MaterialId {
 /// behaves on contact.
 ///
 /// Density is relative: only ratios between voxels, and later a joint's force
-/// against them, are observable. The contact columns are hundredths. Every
-/// column is an integer so `Material` stays `Eq`: `friction` 60 is a
+/// against them, are observable. The contact columns are hundredths, kept as
+/// integers because that is the precision any source for them actually has —
+/// a palette entry's friction and bounce are picked from a small discrete
+/// range, never measured to a fraction of a percent: `friction` 60 is a
 /// coefficient of 0.6, `restitution` 80 is 0.8. Friction may exceed 1;
 /// restitution above 1 would add energy on every bounce, so it is clamped
 /// where it is used.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Material {
     pub color: [u8; 4],
     pub density: u16,
@@ -35,7 +37,7 @@ pub struct Material {
     /// contact holds up, so in these units resting weight alone would shatter
     /// a stack. Never a force either, which would depend on the tick rate.
     /// `physics::fracture` says where that parts from Dwyer and why.
-    pub strength: u16,
+    pub strength: f32,
 }
 
 /// The density a material gets when its source says nothing about mass, such
@@ -58,10 +60,10 @@ pub const DEFAULT_RESTITUTION: u8 = 5;
 /// So 150 is "survives any fall a player builds and breaks when it is thrown
 /// or blasted" -- a drop of 115 voxels to crack it by falling alone. Default
 /// terrain should be the tough case; what is meant to shatter says so.
-pub const DEFAULT_STRENGTH: u16 = 150;
+pub const DEFAULT_STRENGTH: f32 = 150.0;
 
 /// A material that never fractures, however hard it is hit.
-pub const UNBREAKABLE: u16 = u16::MAX;
+pub const UNBREAKABLE: f32 = f32::INFINITY;
 
 /// The friction between two surfaces: the geometric mean, so the slipperier one
 /// dominates and anything against a frictionless surface slides free.
@@ -150,17 +152,35 @@ mod tests {
                 density: 900,
                 friction: 5,
                 restitution: 80,
-                strength: 25,
+                strength: 25.0,
             })
             .unwrap();
         assert_eq!(table.get(id).friction, 5);
         assert_eq!(table.get(id).restitution, 80);
-        assert_eq!(table.get(id).strength, 25);
+        assert_eq!(table.get(id).strength, 25.0);
         assert_eq!(
             table.get(MaterialId::EMPTY).strength,
             UNBREAKABLE,
             "empty space must not be breakable; there is nothing there to break"
         );
+    }
+
+    /// `strength` is a float, not hundredths like the contact columns: it is
+    /// read directly against a closing speed, which has no reason to land on
+    /// an integer.
+    #[test]
+    fn a_material_keeps_its_strength_as_a_float() {
+        let mut table = MaterialTable::new();
+        let id = table
+            .push(Material {
+                color: [1, 2, 3, 255],
+                density: 900,
+                friction: DEFAULT_FRICTION,
+                restitution: DEFAULT_RESTITUTION,
+                strength: 150.5,
+            })
+            .unwrap();
+        assert_eq!(table.get(id).strength, 150.5);
     }
 
     /// Friction combines as the geometric mean, so ice against stone is

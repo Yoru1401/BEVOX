@@ -255,8 +255,9 @@ fn break_what_gave_way(
         // his units do not have to face here.
         //
         // An impulse grows with the mass a contact holds up, so resting weight
-        // alone would break things: `strength` is a u16, and a 20,000-voxel
-        // piece leans on its contacts with some 1e7 of impulse. And an impulse
+        // alone would break things: a 20,000-voxel piece leans on its contacts
+        // with some 1e7 of impulse, dwarfing the tens-to-hundreds range
+        // `strength` lives in. And an impulse
         // divided by a mass has to pick a mass, which the owning body is not:
         // a contact belongs to whichever body the scene lists first, so the
         // same collision read two different ways depending on the list order.
@@ -273,7 +274,7 @@ fn break_what_gave_way(
         if peak[at] <= 0.0 {
             continue;
         }
-        let mut side = |voxel: [u32; 3], body: Option<BodyId>, strength: u16| {
+        let mut side = |voxel: [u32; 3], body: Option<BodyId>, strength: f32| {
             if let Some(over) = fracture::over_strength(blow, strength) {
                 broke = true;
                 fractures.push(Fracture {
@@ -1398,7 +1399,7 @@ mod tests {
         let mut gives = MaterialTable::new();
         for i in 1..=7u8 {
             let mut m = holds.get(MaterialId(i));
-            m.strength = 0;
+            m.strength = 0.0;
             gives.push(m).unwrap();
         }
 
@@ -1867,7 +1868,7 @@ mod tests {
     /// This is what rules out Dwyer's own threshold, which is on the contact
     /// impulse (devlog 28). An impulse grows with the mass a contact holds up:
     /// each of these cubes leans on the one below with some 2e4 of it per tick,
-    /// against a `u16` strength where glass is 20. His materials are in N.s and
+    /// against a strength where glass is 20. His materials are in N.s and
     /// do not meet this; ours would shatter a stack for standing there.
     #[test]
     fn resting_weight_breaks_nothing() {

@@ -230,7 +230,7 @@ pub(crate) mod fixtures {
     /// you drop it", which is what a test wants of glass. It has to sit above
     /// the 8 that `the_same_collision_breaks_at_any_tick_rate` requires to
     /// survive and below the 60 it requires to break.
-    pub const GLASS_STRENGTH: u16 = 20;
+    pub const GLASS_STRENGTH: f32 = 20.0;
 
     /// Material 1 weighs 1000 and grips; 2 weighs 3000 and grips; 3 is
     /// frictionless ice; 4 is bouncy; 5 is nearly elastic; 6 is brittle; 7

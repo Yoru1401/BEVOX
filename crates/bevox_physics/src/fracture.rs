@@ -19,10 +19,10 @@
 //! do not have to face.
 //!
 //! - An impulse grows with the mass a contact holds up. `Material::strength` is
-//!   a `u16`, and a resting stack leans on its contacts with impulses in the
-//!   hundreds of thousands, so an impulse threshold in these units shatters
-//!   anything for standing still. `resting_weight_breaks_nothing` is that gate,
-//!   and against an impulse it fails by 61,134 fractures.
+//!   in the tens to hundreds, and a resting stack leans on its contacts with
+//!   impulses in the hundreds of thousands, so an impulse threshold at that
+//!   scale shatters anything for standing still. `resting_weight_breaks_nothing`
+//!   is that gate, and against an impulse it fails by 61,134 fractures.
 //! - Dividing an impulse by a mass to recover a speed has to choose a mass, and
 //!   a contact's owner is not it: a contact belongs to whichever body the scene
 //!   lists first. The same collision then read two ways.
@@ -67,12 +67,15 @@ pub const REBOUND: f32 = 0.6;
 
 /// Whether a blow of this speed breaks that material, and by how much.
 ///
-/// `None` for a material that holds, and for `UNBREAKABLE` whatever the blow.
-pub fn over_strength(blow: f32, strength: u16) -> Option<f32> {
-    if strength == bevox_core::material::UNBREAKABLE || blow <= strength as f32 {
+/// `None` for a material that holds, for `UNBREAKABLE` whatever the blow, and
+/// for a non-finite blow: a NaN compares false against everything, so
+/// `blow <= strength` would silently let it through as "did not break" rather
+/// than raising the error it actually is.
+pub fn over_strength(blow: f32, strength: f32) -> Option<f32> {
+    if !blow.is_finite() || strength == bevox_core::material::UNBREAKABLE || blow <= strength {
         return None;
     }
-    Some(blow / strength as f32)
+    Some(blow / strength)
 }
 
 /// Voxels to clear around `at` so that what was solid there comes apart.
@@ -175,10 +178,24 @@ mod tests {
     /// impulse at all breaks an unbreakable material.
     #[test]
     fn a_material_breaks_only_past_its_strength() {
-        assert_eq!(over_strength(39.0, 40), None);
-        assert_eq!(over_strength(40.0, 40), None, "exactly at strength is not past it");
-        assert_eq!(over_strength(80.0, 40), Some(2.0));
+        assert_eq!(over_strength(39.0, 40.0), None);
+        assert_eq!(over_strength(40.0, 40.0), None, "exactly at strength is not past it");
+        assert_eq!(over_strength(80.0, 40.0), Some(2.0));
         assert_eq!(over_strength(1e30, UNBREAKABLE), None, "unbreakable broke");
+    }
+
+    /// A NaN blow compares false against everything, so without an explicit
+    /// guard `blow <= strength` would read as "did not break" instead of the
+    /// error it is.
+    #[test]
+    fn a_non_finite_blow_never_breaks_anything() {
+        assert_eq!(over_strength(f32::NAN, 40.0), None, "a NaN blow slipped through as a break");
+        assert_eq!(over_strength(f32::INFINITY, 40.0), None, "an infinite blow slipped through");
+        assert_eq!(
+            over_strength(f32::NEG_INFINITY, 40.0),
+            None,
+            "a negative-infinite blow slipped through"
+        );
     }
 
     /// Cracks stay inside the reach they claim, and the same seed gives the
