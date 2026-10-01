@@ -1,6 +1,21 @@
 # Update Log
 
 ## 2026-10-01
+* **Update**: [the fracture and detection spec](superpowers/specs/2026-09-30-bevox-fracture-and-detection-design.md)
+  revised, and **reordered**. F7 — the solver's iteration counts — was listed out
+  of scope and is now **Part 1**, because `peak[at]`, the accumulated normal
+  impulse the fracture threshold reads, is taken **inside** the two solve loops
+  F7 turns into loops. A sequential-impulse solver converges its accumulated
+  impulse upward, so a lower iteration count means a smaller impulse and a
+  fracture that fires late. The count is therefore an input to every `strength`
+  in the material table: calibrate first and change the count after, and the
+  whole table is wrong. Both counts default to 1 so the first commit is
+  bit-identical.
+* **Update**: Part 3's provenance firmed up. His 2026-02-20 sneak peek calls the
+  TGS engine's detection *"continuous collision detection"*, the same phrase
+  devlog 11 earns from SAT projection gaps — so substepped speculative detection
+  is what **he** calls CCD, and Part 3 implements his design rather than
+  diverging from it.
 * **Update**: every Dwyer video **description** swept, and the record checked a
   second time. All **thirty upload dates compared mechanically** against the
   channel metadata — **all thirty match** — and the descriptions **contradicted

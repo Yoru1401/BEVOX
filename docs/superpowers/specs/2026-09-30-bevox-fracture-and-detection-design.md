@@ -1,13 +1,16 @@
 ---
 type: Design Spec
 title: 'Fracture and detection, as he built them'
-description: "Replace the closing-speed fracture threshold with his size-scaled impulse, and the velocity cap with his substepped detection, now that rigid_pixels can be read."
-tags: [physics, fracture, detection, dwyer, respec]
+description: "Expose the solver's iteration counts, replace the closing-speed fracture threshold with his size-scaled impulse, and replace the velocity cap with his substepped detection, now that rigid_pixels can be read."
+tags: [physics, fracture, detection, solver, dwyer, respec]
 generated: { by: claude-opus-5/claude-code, at: 2026-09-30T00:00:00Z }
 sources:
   - id: rigid_pixels
     resource: /reference/rigid-pixels.md
     title: "Dwyer's rigid_pixels, read from source"
+  - id: devlogs
+    resource: /reference/dwyer-devlogs.md
+    title: "Douglas Dwyer's voxel engine, devlog by devlog"
   - id: drift
     resource: /reference/dwyer-drift.md
     title: How far BEVOX has drifted from Dwyer
@@ -15,7 +18,7 @@ sources:
 
 # Fracture and detection, as he built them — design
 
-**Date:** 2026-09-30
+**Date:** 2026-09-30, **revised 2026-10-01**
 **Status:** awaiting review
 
 # Why this exists
@@ -24,9 +27,68 @@ Two of BEVOX's inventions were built because his design was unknown. It is known
 now: his 2D prototype `rigid_pixels` is public, and both inventions turn out to
 be worse than what they replaced.
 
-Both changes are **replacements, not additions.** Neither adds a feature.
+A third difference was found on the way: his solver exposes two iteration counts
+where BEVOX hardcodes one of each (drift **F7**).
 
-# Part 1 — Fracture: a size-scaled impulse, not a closing speed
+**All three are replacements, not additions.** None adds a feature.
+
+**What the 2026-10-01 revision changed.** F7 was listed as out of scope and is
+now Part 1, because the quantity Part 2 thresholds on is produced by the loops
+F7 changes — see below. Part 2's provenance also firmed up: his own name for
+substepped detection is *continuous collision detection*.
+
+# Part 1 — The solver's iteration counts
+
+## What is here now, and why it is wrong
+
+`solver.rs` runs, per substep, **exactly one** biased velocity pass and **exactly
+one** unbiased relax pass. Neither is a loop; neither count has a name. His
+solver exposes `velocity_iterations` and `relaxation_iterations` as settings.
+
+More velocity iterations is the standard lever for stacking stability, and
+stacking stability is what failed on 2026-09-28, when a 240:1 mass ratio
+*diverged* — a stack accelerating upward at 23 voxels a second by tick 33.
+**BEVOX has been running its solver at the least converged setting there is,
+without knowing there was a setting.**
+
+## Why this must come first
+
+`peak[at]`, the accumulated normal impulse that Part 2 thresholds fracture on, is
+`peak.max(impulse.normal)` taken **inside** both solve loops. A sequential-impulse
+solver converges its accumulated impulse upward, so **fewer iterations means a
+smaller accumulated impulse**, which means fracture fires later than it should.
+
+So the iteration count is an input to every `strength` value in the material
+table. Calibrating strengths first and changing the count afterwards would
+invalidate the whole table. Doing it the other way round costs nothing.
+
+## The design
+
+Two constants beside `SUBSTEPS`, and two loops:
+
+```text
+VELOCITY_ITERATIONS    wraps the biased pass   (joints, contacts, friction, rolling)
+RELAXATION_ITERATIONS  wraps the unbiased pass (the same, after integration)
+```
+
+Both default to **1**, so the first commit is bit-identical to today and the gate
+below proves it. Then they are *measured*: raise each, and report what it costs a
+tick and what it does to the 240:1 case.
+
+**The count is chosen on the measurement, not on the argument.** This project has
+twice lost time to a change that ought to have been faster.
+
+## Gates
+
+| Gate | What it proves |
+|---|---|
+| Every existing solver gate passes unchanged at 1 and 1 | The loops are a refactor before they are a change |
+| A new convergence gate: the 240:1 stack **does not accelerate upward** | The divergence is a convergence failure, or it is not — either way it is now known rather than assumed |
+| A new monotonicity gate: raising `VELOCITY_ITERATIONS` does not raise the resting penetration | More work does not make resting worse, which is the failure mode of a mis-scaled bias |
+
+Break required: set `VELOCITY_ITERATIONS` to 0 — every contact gate must fail.
+
+# Part 2 — Fracture: a size-scaled impulse, not a closing speed
 
 ## What is here now, and why it is wrong
 
@@ -73,6 +135,9 @@ have been made instead of moving to a speed. `Material` stops deriving `Eq`; the
 material table's round-trip gate is the only thing that wanted it, and
 `PartialEq` serves that.
 
+**Every strength in the table is recalibrated against the iteration counts fixed
+in Part 1**, and the table records which counts it was calibrated at.
+
 ## Gates
 
 | Gate | What it proves |
@@ -88,7 +153,7 @@ Breaks required: revert to one shared blow (the asymmetry gate must fail); drop
 the size term (the size gate must fail); hand back a fixed fraction (the
 momentum gate must fail on the fraction that is wrong for the collision).
 
-# Part 2 — Detection: substepped in time, not widened in space
+# Part 3 — Detection: substepped in time, not widened in space
 
 ## What is here now, and why it is wrong
 
@@ -102,6 +167,12 @@ as the **cube** of speed. One impulse at 10,000 voxels a second asks for
 31 million lookups per corner and the tick never returns.
 
 **He has no cap, and does not need one**, because he does not widen the search.
+
+**And this is not a departure from him.** His 2026-02-20 sneak peek says the TGS
+engine *"features continuous collision detection"*, which is the same phrase
+devlog 11 earns from separating-axis projection gaps. Substepped speculative
+detection is what he calls CCD, so Part 3 implements his design rather than
+diverging from it.
 
 ## The design
 
@@ -138,17 +209,24 @@ Break required: fix the substep count at 1, and the tunnelling gate must fail.
 
 # Order, and what is not in scope
 
-**Part 1 first.** It is smaller, it fixes a symptom Flori can see, and it does
-not touch detection. Part 2 changes the cost model of the hottest CPU path in
-the physics and wants its own measurement.
+**1, then 2, then 3.**
 
-Not in scope: the stress scene (drift F4), the `velocity_iterations` knob his
-solver has and BEVOX lacks, and anything in the renderer. All three are recorded
-in [the ledger](../../reference/dwyer-drift.md) and wait their turn.
+- **Part 1 first** because it is a refactor that starts bit-identical, and because
+  it fixes the units of the number Part 2 thresholds on. Doing it after Part 2
+  would invalidate every strength in the material table.
+- **Part 2 second.** It is small, it fixes a symptom Flori can see, and it does
+  not touch detection.
+- **Part 3 last.** It changes the cost model of the hottest CPU path in the
+  physics and wants its own measurement.
+
+Not in scope: the stress scene (drift F4) and anything in the renderer. Both are
+recorded in [the ledger](../../reference/dwyer-drift.md) and wait their turn.
 
 # Provenance
 
-Both designs are read from `rigid_pixels`, which carries **no licence** — no
+Parts 2 and 3 are read from `rigid_pixels`, which carries **no licence** — no
 `LICENSE` file and no `license` field — so it is all rights reserved however
 public it is. This spec describes mechanisms and constants so that both parts can
-be implemented without reference to his source. Nothing is to be copied.
+be implemented without reference to his source. Nothing is to be copied. Part 1
+is read from the same repository's public API shape and from devlog 26, and is
+in any case the standard structure of a sequential-impulse solver.
