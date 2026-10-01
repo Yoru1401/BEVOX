@@ -1,5 +1,24 @@
 # Update Log
 
+## 2026-10-02
+* **Fix**: two overclaims the review wave's own fix introduced, both in
+  [the convergence page](concepts/solver-convergence-is-a-setting.md), one
+  mirrored into `lib.rs`. The page had blamed the non-monotone wander
+  (12.83 → 15.75 → 14.81 → 18.02) on the invalid 200-tick window, then said
+  seven lines later that correcting the window left every figure unchanged —
+  **which refutes the first claim**. The wander is real inside the valid window.
+  And "the one place a convergence reading is not confounded" was false: the
+  balanced rows raise **total work** as well as the ratio, so numerical damping
+  is an unexcluded reason for a later breach. Time-to-collapse cannot separate
+  "better conditioned" from "bleeding energy faster".
+* **Update**: the sharpest comparison in the table, which the original write-up
+  missed. `(2,2)` is four sweeps a substep and `(4,1)` is five — **roughly
+  matched total work** — and they breach at **105 against 67**. Nearly the same
+  solving, nearly twice the standing time, with only the bias:relax ratio
+  between them. That argues the ratio better than "monotone in the count" did,
+  and it argues against damping being the whole story, since the row doing *more*
+  total work collapses sooner.
+
 ## 2026-10-01
 * **Correction, 2026-10-02**: the negative result below was stated wider than
   its experiment could carry, and is **narrowed**. Four of the six variants

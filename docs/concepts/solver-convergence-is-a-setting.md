@@ -112,16 +112,21 @@ bodies.retain(|b| world_box(b, 0.0).is_none_or(|(_, max)| max.y >= 0.0));
 ```
 
 — so roughly three quarters of that window measured **a collapsing,
-body-deleting scene** rather than a stack. The deterministic
-non-monotonicity in the old numbers (12.83 → 15.75 → 14.81 → 18.02) is the
-symptom: a convergence parameter should not make a monotone sequence wander.
+body-deleting scene** rather than a stack.
 
 The scan now **stops at the first tick any body is a voxel into the slab or is
 removed** (`breached_the_slab`), takes its maximum only over that valid window,
-and prints the peak's tick and the breach tick per variant. Every peak above
-turned out to fall inside its valid window, so the five velocity figures are
-unchanged — what is new is that the window they came from is now stated, and
-that the breach tick is a stability number in its own right.
+and prints the peak's tick and the breach tick per variant.
+
+**And correcting it changed nothing**: every peak turned out to already fall
+inside its valid window, so the five velocity figures are unchanged. That is
+worth stating plainly, because an earlier draft of this page blamed the
+non-monotone wander (12.83 → 15.75 → 14.81 → 18.02) on the invalid window. It
+cannot be that — if the window had caused it, correcting the window would have
+moved the numbers. **The wander is real inside the valid window**, and reading 1
+is where it is accounted for. What the fix bought is that the window is now
+stated rather than assumed, and that the breach tick is a stability number in
+its own right.
 
 # Four readings
 
@@ -137,10 +142,28 @@ because these four rows vary the bias:relax ratio too, they cannot distinguish
 tick **105** and `(4,4)` to tick **123**, against `(1,1)`'s **55** — roughly
 double and triple, monotone in the count, for 1.9x and 3.0x the tick. On worst
 upward velocity the same two rows are 13.36 and 11.95 against 12.83, which is
-flat. **Two samples is two samples**, and the fixture collapses at every setting
-measured, so this is not a fix and the counts are not raised on it. But it is the
-one place a convergence reading is not confounded, and it points the opposite way
-from the headline this page originally carried.
+flat, so **breach tick is the column carrying this reading** and worst upward
+velocity is not.
+
+**The sharpest comparison in the table is not the one above.** `(2,2)` is four
+sweeps a substep and `(4,1)` is five — **roughly matched total work** — and they
+breach at **105 against 67**. Nearly the same amount of solving, nearly twice
+the standing time, with only the bias:relax ratio separating them. That is a
+better argument for the ratio than "monotone in the count", which is three
+points one of which is the shared baseline.
+
+**What it still does not settle.** The balanced rows raise **total work** as well
+as the ratio, so added numerical damping — the relax pass exists to remove
+velocity, and more sweeps of it plausibly remove more — is an unexcluded
+explanation for a later breach. Time-to-collapse is exactly the statistic that
+cannot separate "better conditioned" from "bleeding energy faster". The matched-
+work pair above argues against damping being the whole story, since the row doing
+*more* total work collapses sooner, but it does not exclude it.
+
+**Two samples is two samples**, the fixture collapses at every setting measured,
+and the cause is unidentified — convergence, ratio, or dissipation. So this is
+not a fix, the counts are not raised on it, and the only thing this reading
+settles is that the headline this page originally carried pointed the wrong way.
 
 **2. Resting penetration is the one real gain, and it is monotonic.**
 0.0017 → 0.0012 → 0.0009 → 0.0003 as the velocity count rises. That is the

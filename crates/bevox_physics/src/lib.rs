@@ -46,10 +46,13 @@ pub const SUBSTEPS: u32 = 4;
 /// **What that does not settle.** Those variants change the *ratio* of biased
 /// to unbiased sweeps, not the biased count alone: the relax pass exists to
 /// remove the velocity this pass's bias added, so an unexcluded explanation is
-/// the ratio rather than convergence. Raising both together **does** hold the
-/// fixture up longer (tick 105 at `(2,2)`, 123 at `(4,4)`), at 1.9x and 3.0x
-/// the tick. 1 is kept because the cheap setting is the one that was measured
-/// and because this count rescales `peak`, which the fracture threshold reads.
+/// the ratio rather than convergence. Raising both together held the fixture up
+/// longer on the two balanced rows measured -- tick 105 at `(2,2)`, 123 at
+/// `(4,4)`, against 55 -- but at 1.9x and 3.0x the tick, from two samples on one
+/// fixture, and with added numerical damping unexcluded as the reason. 1 is kept
+/// because the fixture collapses at every setting measured, because the cheap
+/// setting is the one that was measured, and because this count rescales `peak`,
+/// which the fracture threshold reads.
 ///
 /// Shallower resting penetration is monotonic in it and is held by
 /// `solver::tests::more_iterations_do_not_deepen_a_resting_contact`. Read
