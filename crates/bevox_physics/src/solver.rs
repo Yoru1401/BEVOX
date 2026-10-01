@@ -1924,4 +1924,196 @@ mod tests {
         let pile = median(time(&mut piled, 1000));
         println!("16 bodies, median ms/tick: falling {fall:.4}, resting {rest:.4}, stacked {pile:.4}");
     }
+
+    /// What raising the solver's two per-substep sweep counts costs, and what
+    /// they do to a known divergence, interleaved across one invocation so
+    /// cross-run drift cannot be mistaken for a tuning's effect. Not a gate:
+    /// it prints a table for Task 3 to pick counts from.
+    ///
+    /// The load fixture is not in the suite -- it was deleted on 2026-09-28
+    /// when it was found to diverge -- so it is rebuilt here from the
+    /// description of what it was: a `cube(4, 4)` on the floor, a one-voxel
+    /// plate on top, and a body 240 times the plate's mass on the plate. The
+    /// ratio comes from material density alone, at equal volume, not from
+    /// extra voxels: material 1 (density 200) is the base and the plate,
+    /// material 2 (density 48,000, exactly 240x) is the heavy body, built at
+    /// the plate's own 4x1x4 volume.
+    #[test]
+    #[ignore]
+    fn what_the_iteration_counts_cost() {
+        use bevox_core::material::{DEFAULT_STRENGTH, Material, MaterialTable};
+
+        fn block(nx: u32, ny: u32, nz: u32, extent: u32, material: MaterialId) -> Contree {
+            let mut voxels = Vec::new();
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        voxels.push((UVec3::new(x, y, z), material));
+                    }
+                }
+            }
+            Contree::from_voxels(extent, &voxels)
+        }
+
+        fn placed_with(volume: Contree, centre: Vec3, orientation: Quat, materials: &MaterialTable) -> Body {
+            let mut body = Body::new(volume, Vec3::ZERO, orientation);
+            assert!(recompute(&mut body, materials), "a fixture body must have mass");
+            body.position = centre;
+            body
+        }
+
+        let mut load_materials = MaterialTable::new();
+        load_materials
+            .push(Material { color: [160, 160, 160, 255], density: 200, friction: 60, restitution: 0, strength: DEFAULT_STRENGTH })
+            .unwrap();
+        load_materials
+            .push(Material { color: [120, 40, 40, 255], density: 48_000, friction: 60, restitution: 0, strength: DEFAULT_STRENGTH })
+            .unwrap();
+
+        let load_fixture = |mats: &MaterialTable| -> Vec<Body> {
+            vec![
+                placed_with(block(4, 4, 4, 4, MaterialId(1)), Vec3::new(32.0, 10.2, 32.0), Quat::IDENTITY, mats),
+                placed_with(block(4, 1, 4, 4, MaterialId(1)), Vec3::new(32.0, 12.2, 32.0), Quat::IDENTITY, mats),
+                placed_with(block(4, 1, 4, 4, MaterialId(2)), Vec3::new(32.0, 13.2, 32.0), Quat::IDENTITY, mats),
+            ]
+        };
+
+        // The ratio the brief asks for, checked against what the engine's own
+        // mass computation produced, not hand arithmetic.
+        let sample = load_fixture(&load_materials);
+        let (plate_mass, heavy_mass) = (sample[1].mass.mass, sample[2].mass.mass);
+        assert!(
+            (heavy_mass / plate_mass - 240.0).abs() < 1e-3,
+            "the load fixture's mass ratio is {} / {} = {}, not 240",
+            heavy_mass,
+            plate_mass,
+            heavy_mass / plate_mass
+        );
+
+        let resting_materials = materials();
+        let resting_fixture = || -> Vec<Body> {
+            (0..3)
+                .map(|i| placed(cube(4, 4), Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0), Quat::IDENTITY))
+                .collect()
+        };
+
+        let world = slab(64, 0..8);
+        let field = DistanceField::build(&world);
+
+        let tunings = [
+            crate::Tuning { velocity_iterations: 1, relaxation_iterations: 1 },
+            crate::Tuning { velocity_iterations: 2, relaxation_iterations: 1 },
+            crate::Tuning { velocity_iterations: 4, relaxation_iterations: 1 },
+            crate::Tuning { velocity_iterations: 8, relaxation_iterations: 1 },
+            crate::Tuning { velocity_iterations: 4, relaxation_iterations: 4 },
+            // Repeated last: if this does not land within 15% of the first
+            // (1,1), the run is drift and none of its numbers may be used.
+            crate::Tuning { velocity_iterations: 1, relaxation_iterations: 1 },
+        ];
+
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+
+        // Median-of-seven ms/tick against both fixtures, variants interleaved
+        // round by round so a slow round lands on every variant equally
+        // rather than being read as one tuning's cost.
+        let mut load_states: Vec<Vec<Body>> = tunings.iter().map(|_| load_fixture(&load_materials)).collect();
+        let mut resting_states: Vec<Vec<Body>> = tunings.iter().map(|_| resting_fixture()).collect();
+        let mut load_times: Vec<Vec<f64>> = (0..tunings.len()).map(|_| Vec::new()).collect();
+        let mut resting_times: Vec<Vec<f64>> = (0..tunings.len()).map(|_| Vec::new()).collect();
+        const SAMPLES: u32 = 7;
+        for _round in 0..SAMPLES {
+            for (i, tuning) in tunings.iter().enumerate() {
+                let start = std::time::Instant::now();
+                step_with(
+                    &mut load_states[i],
+                    &world,
+                    &field,
+                    &load_materials,
+                    Air::vacuum(GRAVITY),
+                    DT,
+                    None,
+                    &mut [],
+                    *tuning,
+                );
+                load_times[i].push(start.elapsed().as_secs_f64() * 1000.0);
+
+                let start = std::time::Instant::now();
+                step_with(
+                    &mut resting_states[i],
+                    &world,
+                    &field,
+                    &resting_materials,
+                    Air::vacuum(GRAVITY),
+                    DT,
+                    None,
+                    &mut [],
+                    *tuning,
+                );
+                resting_times[i].push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+
+        // The load fixture's divergence: the worst upward velocity any body
+        // reaches over 200 ticks, each variant from a fresh copy of the
+        // fixture. Timed too, for Review Focus 5: a count must not make a
+        // tick unbounded.
+        let mut worst_up: Vec<f32> = Vec::new();
+        for tuning in &tunings {
+            let mut bodies = load_fixture(&load_materials);
+            let mut worst = f32::NEG_INFINITY;
+            let start = std::time::Instant::now();
+            for _ in 0..200 {
+                step_with(&mut bodies, &world, &field, &load_materials, Air::vacuum(GRAVITY), DT, None, &mut [], *tuning);
+                worst = worst.max(bodies.iter().map(|b| b.velocity.y).fold(f32::NEG_INFINITY, f32::max));
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+            assert!(
+                elapsed < 2.0,
+                "tuning {tuning:?} took {elapsed:.3}s for 200 ticks of the load fixture, over the 2s bound"
+            );
+            worst_up.push(worst);
+        }
+
+        // The resting fixture's penetration after 2000 ticks: how far the
+        // bottom cube sits below its settled reference of 10.0, from
+        // `a_stack_of_three_stands_still`.
+        let mut penetration: Vec<f32> = Vec::new();
+        for tuning in &tunings {
+            let mut bodies = resting_fixture();
+            for _ in 0..2000 {
+                step_with(&mut bodies, &world, &field, &resting_materials, Air::vacuum(GRAVITY), DT, None, &mut [], *tuning);
+            }
+            penetration.push((10.0 - bodies[0].position.y).max(0.0));
+        }
+
+        println!(
+            "load fixture masses: plate {plate_mass:.1}, heavy {heavy_mass:.1}, ratio {:.2}",
+            heavy_mass / plate_mass
+        );
+        println!("tuning       load ms/tick   resting ms/tick   worst upward v/s   resting penetration");
+        for (i, tuning) in tunings.iter().enumerate() {
+            println!(
+                "({:>2},{:>2})     {:>10.4}   {:>13.4}     {:>14.4}   {:>18.4}",
+                tuning.velocity_iterations,
+                tuning.relaxation_iterations,
+                median(load_times[i].clone()),
+                median(resting_times[i].clone()),
+                worst_up[i],
+                penetration[i]
+            );
+        }
+
+        let first = median(load_times[0].clone());
+        let repeat = median(load_times[5].clone());
+        let drift = (repeat - first).abs() / first;
+        println!("drift check: first (1,1) {first:.4} ms, repeat (1,1) {repeat:.4} ms, drift {:.1}%", drift * 100.0);
+        assert!(
+            drift < 0.15,
+            "the repeated (1,1) differs from the first by {:.1}%: this run is drift, its numbers may not be used",
+            drift * 100.0
+        );
+    }
 }
