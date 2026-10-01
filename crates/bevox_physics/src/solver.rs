@@ -221,7 +221,7 @@ pub fn step_with(
     }
 
     apply_restitution(bodies, &joined, &mut impulses, &approach);
-    let fractures = break_what_gave_way(bodies, tree, materials, &joined, &approach, &peak);
+    let fractures = break_what_gave_way(bodies, tree, materials, &joined, &peak);
     sleep::settle(bodies, &joints, &radii, dt);
     StepOutcome { rebuild: bodies.len() != before, fractures }
 }
@@ -236,7 +236,6 @@ fn break_what_gave_way(
     tree: &Contree,
     materials: &MaterialTable,
     joined: &[Joined],
-    approach: &[f32],
     peak: &[f32],
 ) -> Vec<Fracture> {
     let mut fractures = Vec::new();
@@ -244,28 +243,34 @@ fn break_what_gave_way(
     for (at, j) in joined.iter().enumerate() {
         let c = &j.contact;
         let mut broke = false;
-        // How fast the two surfaces met, which is what a material's strength is
-        // written in.
+        // The most the contact carried at any point in the tick, which is what
+        // a material's strength is written in.
         //
-        // Dwyer's devlog 28 thresholds the contact impulse and argues the case
-        // against a force: a collision resolves inside one tick, so the force
-        // it reports depends on the tick rate and the impulse does not. A
-        // closing speed keeps that -- it is read before the substeps touch it,
-        // so it is the same number at 64 Hz and at 128 -- and fixes two things
-        // his units do not have to face here.
+        // Dwyer's devlog 28, and his argument against a force is kept: a
+        // collision resolves inside one tick, so the force it reports depends
+        // on the tick rate, and the impulse it exchanges does not.
+        // `the_same_collision_breaks_at_any_tick_rate` holds that.
         //
-        // An impulse grows with the mass a contact holds up, so resting weight
-        // alone would break things: a 20,000-voxel piece leans on its contacts
-        // with some 1e7 of impulse, dwarfing the tens-to-hundreds range
-        // `strength` lives in. And an impulse
-        // divided by a mass has to pick a mass, which the owning body is not:
-        // a contact belongs to whichever body the scene lists first, so the
-        // same collision read two different ways depending on the list order.
+        // The impulse rather than the closing speed, which this used to be,
+        // because a closing speed cannot see a crush. The grab is a joint with
+        // an enormous force limit driving toward a velocity goal, so a body
+        // pressed into something leans on it with up to `GRAB_MAX_FORCE` while
+        // the contact holds both surfaces still: the approach speed is ~0
+        // however hard the press. `a_slow_crush_breaks_what_it_presses` is
+        // that gate.
         //
-        // A closing speed has neither problem. It is symmetric, so one
-        // collision has one blow whichever side is asked about, and at rest it
-        // is nothing however heavy the load.
-        let blow = -approach[at];
+        // The units are why the first attempt at this failed. An impulse grows
+        // with the mass a contact holds up, so a settled stack carries a large
+        // one for standing there -- warm starting even seeds each tick from the
+        // last -- and `strength` in the tens broke everything.
+        // `resting_weight_breaks_nothing` is that gate, and every strength in
+        // the tables is now calibrated above the resting load it measures.
+        // It is read as the impulse itself, never divided by a mass: a contact
+        // belongs to whichever body the scene lists first, so a quotient would
+        // read one collision two ways, which
+        // `a_collision_breaks_the_same_things_whichever_body_is_listed_first`
+        // holds against.
+        let blow = peak[at];
         // A contact that never carried anything is one the surfaces never
         // reached: a speculative contact holds the full approach speed for the
         // tick before they touch, and nothing has struck anything yet. The
@@ -1771,12 +1776,14 @@ mod tests {
     /// collision look sixty-four times worse at 64 Hz and a hundred and
     /// twenty-eight times at 128, so it shatters everything at every rate.
     ///
-    /// The blow is now exactly rate-independent, where the impulse it used to
-    /// be derived from was not -- that read 16.4 at 64 Hz against 10.4 at 128
-    /// on this scene, because a collision the detector sees coming is spread
-    /// over more ticks at a finer rate. A closing speed is read once, before
-    /// the substeps touch it, so both rates see the same arrival. The gate
-    /// still asks only that the outcome match, which is the thing that matters.
+    /// The blow is the accumulated contact impulse, and the gate asks only that
+    /// the *outcome* match, not the number: the peak impulse of one collision
+    /// is close at the two rates but not equal -- 1,047,814 at 64 Hz against
+    /// 968,836 at 128 for the 60-voxel slam, because a collision the detector
+    /// sees coming is spread over more ticks at a finer rate. Both land on the
+    /// same side of every strength in the table, which is what matters. A
+    /// force would not: dividing by the tick moves it by the ratio of the
+    /// rates.
     #[test]
     fn the_same_collision_breaks_at_any_tick_rate() {
         let broke = |speed: f32, dt: f32| !slam(MaterialId(6), speed, dt).0.is_empty();
@@ -1808,14 +1815,14 @@ mod tests {
     ///
     /// A contact belongs to whichever body the scene lists first, which has
     /// nothing to do with which of them struck the other. Reading the blow as
-    /// the contact's impulse divided by *that* body's mass therefore made the
-    /// answer depend on the list order: the impulse two bodies exchange is set
-    /// by their reduced mass, so naming the light one reports nearly the whole
-    /// closing speed and naming the heavy one reports a twenty-fourth of it.
-    /// The same glass cube then shatters or survives according to where in a
+    /// the contact's impulse divided by *that* body's mass would therefore make
+    /// the answer depend on the list order: the impulse two bodies exchange is
+    /// set by their reduced mass, so naming the light one reports nearly the
+    /// whole closing speed and naming the heavy one a twenty-fourth of it. The
+    /// same glass cube would then shatter or survive according to where in a
     /// `Vec` it sat.
     ///
-    /// A closing speed is symmetric, so there is no owner to pick.
+    /// The raw impulse is symmetric, so there is no owner to pick.
     #[test]
     fn a_collision_breaks_the_same_things_whichever_body_is_listed_first() {
         let materials = materials();
@@ -1850,26 +1857,34 @@ mod tests {
              blow is being divided by that body's mass"
         );
         assert!(!light_first.is_empty(), "it broke nothing with the light body listed first");
+        // Relative, because the blow is an impulse in the hundreds of
+        // thousands: one part in a thousand of it is the same statement that an
+        // absolute voxel a second was of a speed.
+        let (a, b) = (hardest(&heavy_first), hardest(&light_first));
         assert!(
-            (hardest(&heavy_first) - hardest(&light_first)).abs() < 1.0,
-            "the same collision read as {:.1} one way round and {:.1} the other",
-            hardest(&heavy_first),
-            hardest(&light_first)
+            (a - b).abs() < 1e-3 * a.max(b),
+            "the same collision read as {a:.1} one way round and {b:.1} the other"
         );
         assert!(
-            hardest(&heavy_first) > 50.0,
-            "the blow came out at {:.1} for a collision closing at 100, so it is not a speed",
-            hardest(&heavy_first)
+            a > crate::fixtures::GLASS_STRENGTH,
+            "the blow came out at {a:.1}, at or under the {} it had to exceed to be reported \
+             at all, so this is reading something other than the impulse",
+            crate::fixtures::GLASS_STRENGTH
         );
     }
 
     /// Weight alone breaks nothing, however long it leans.
     ///
-    /// This is what rules out Dwyer's own threshold, which is on the contact
-    /// impulse (devlog 28). An impulse grows with the mass a contact holds up:
-    /// each of these cubes leans on the one below with some 2e4 of it per tick,
-    /// against a strength where glass is 20. His materials are in N.s and
-    /// do not meet this; ours would shatter a stack for standing there.
+    /// The binding constraint on every strength in the table, because the blow
+    /// is an impulse and an impulse grows with the mass a contact holds up:
+    /// warm starting seeds each tick from the last, so a settled stack carries
+    /// a large one while doing nothing at all. This stack's bottom contact
+    /// carries a measured 331,306, which is why `GLASS_STRENGTH` -- the
+    /// weakest material in the fixture table -- is 350,000 and not the 20 it
+    /// was when the blow was a closing speed. At 20 this fails by 61,134
+    /// fractures.
+    ///
+    /// Glass deliberately: the weakest material makes this the binding case.
     #[test]
     fn resting_weight_breaks_nothing() {
         let materials = materials();
@@ -1899,6 +1914,70 @@ mod tests {
             broke.len(),
             broke.iter().map(|f| f.blow).fold(0.0f32, f32::max),
             crate::fixtures::GLASS_STRENGTH,
+        );
+    }
+
+    /// Pressing a held body into brittle material breaks it, however slowly it
+    /// is pressed.
+    ///
+    /// The symptom this whole rule change exists for. The mouse grab is a joint
+    /// with an enormous force limit driving toward a *velocity* goal, so a
+    /// grabbed body leaning on something presses with up to `GRAB_MAX_FORCE`
+    /// while the contact holds it still: the two surfaces are closing at
+    /// essentially nothing. A threshold on closing speed therefore reads a
+    /// slow crush as no blow at all, and a player can lean a rock through a
+    /// window without marking it.
+    #[test]
+    fn a_slow_crush_breaks_what_it_presses() {
+        let materials = materials();
+        // Glass floor, unbreakable body: only one of the two can give way, so
+        // what breaks is not in question.
+        let world = slab_of(64, 0..8, MaterialId(6));
+        let field = DistanceField::build(&world);
+        let centre = Vec3::new(32.0, 10.0, 32.0);
+        let mut bodies = vec![placed(cube_of(4, 4, MaterialId(7)), centre, Quat::IDENTITY)];
+        assert!(recompute(&mut bodies[0], &materials));
+        let mut grab = Joint::grab(&bodies[0], centre);
+
+        let mut broke = Vec::new();
+        let mut fastest = 0.0f32;
+        for tick in 0..400 {
+            // The target creeps down into the floor: 0.002 a tick is an eighth
+            // of a voxel a second, far below anything that reads as an impact.
+            grab.anchor_b = centre - Vec3::Y * (tick as f32 * 0.002);
+            // Before the step, and only while nothing has broken: the tick
+            // that breaks the floor hands impulse back and drops the body into
+            // the hole, and neither says how gently it was pressing.
+            if broke.is_empty() {
+                fastest = fastest.max(bodies[0].velocity.length());
+            }
+            let out = step(
+                &mut bodies,
+                &world,
+                &field,
+                &materials,
+                Air::VACUUM,
+                DT,
+                Some(&mut grab),
+                &mut [],
+            );
+            broke.extend(out.fractures);
+        }
+
+        assert!(
+            fastest < 1.0,
+            "the body moved at {fastest} voxels a second before anything broke, so this is an \
+             impact and not a crush"
+        );
+        assert!(
+            !broke.is_empty(),
+            "a body pressed into glass with up to {} of force, at under {fastest:.3} voxels a \
+             second, broke nothing",
+            crate::GRAB_MAX_FORCE
+        );
+        assert!(
+            broke.iter().any(|f| f.body.is_none()),
+            "something broke, but not the glass floor being pressed on"
         );
     }
 

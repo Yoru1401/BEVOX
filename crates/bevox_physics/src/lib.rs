@@ -224,13 +224,22 @@ pub(crate) mod fixtures {
     use bevox_core::material::{Material, MaterialId, MaterialTable};
     use glam::{Quat, UVec3, Vec3};
 
-    /// What the brittle fixture material takes, in voxels a second.
+    /// What the brittle fixture material takes, as the impulse a contact on it
+    /// may carry.
     ///
-    /// A body dropped two voxels arrives at about twenty, so this is "breaks if
-    /// you drop it", which is what a test wants of glass. It has to sit above
-    /// the 8 that `the_same_collision_breaks_at_any_tick_rate` requires to
-    /// survive and below the 60 it requires to break.
-    pub const GLASS_STRENGTH: f32 = 20.0;
+    /// Calibrated by measurement, and the window is narrow because an impulse
+    /// threshold has to separate a crush from a lean. It sits above the
+    /// 331,306 a three-cube glass stack carries for standing still
+    /// (`resting_weight_breaks_nothing`) and above the 190,512 a body arriving
+    /// at 8 lands (`the_same_collision_breaks_at_any_tick_rate` requires that
+    /// to survive). It sits below the 365,906 a grab presses with
+    /// (`a_slow_crush_breaks_what_it_presses`), the 375,223 of the two-body
+    /// collision gate, and the 968,836 that arriving at 60 lands.
+    ///
+    /// 350,000 is the geometric middle of the binding pair, 331,306 and
+    /// 365,906 -- five per cent of headroom either way. See
+    /// `fracture`'s module docs for what that tightness costs.
+    pub const GLASS_STRENGTH: f32 = 350_000.0;
 
     /// Material 1 weighs 1000 and grips; 2 weighs 3000 and grips; 3 is
     /// frictionless ice; 4 is bouncy; 5 is nearly elastic; 6 is brittle; 7
@@ -282,7 +291,8 @@ pub(crate) mod fixtures {
                 strength: bevox_core::material::DEFAULT_STRENGTH,
             })
             .unwrap();
-        // 6: glass. Breaks at a speed a body reaches falling a voxel or two.
+        // 6: glass. Breaks under a load a little past what a short stack of
+        // it leans with: see `GLASS_STRENGTH`.
         table
             .push(Material {
                 color: [200, 230, 255, 255],

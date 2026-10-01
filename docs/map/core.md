@@ -109,8 +109,8 @@ than each caller remembering. See
 | `DEFAULT_DENSITY` | 1000 | Mass per voxel when the source says nothing, as a MagicaVoxel palette does not. |
 | `DEFAULT_FRICTION` | 60 | Hundredths, so 0.6: about dry stone. |
 | `DEFAULT_RESTITUTION` | 5 | Hundredths. Barely bouncy, which is what most solids are. |
-| `DEFAULT_STRENGTH` | 150 | The closing speed, in voxels a second, a material survives. A 115-voxel fall to crack it. |
-| `UNBREAKABLE` | `u16::MAX` | A material that never fractures, however hard it is hit. |
+| `DEFAULT_STRENGTH` | 2 800 000 | The largest contact impulse a material survives. An impulse, so it is read against a body: a four-voxel stone cube cracks terrain at about 150 voxels a second. Well clear of the 331 306 a three-cube stack leans with. |
+| `UNBREAKABLE` | `f32::INFINITY` | A material that never fractures, however hard it is hit. |
 
 # Read next
 

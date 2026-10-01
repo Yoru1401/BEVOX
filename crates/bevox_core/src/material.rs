@@ -30,13 +30,21 @@ pub struct Material {
     pub density: u16,
     pub friction: u8,
     pub restitution: u8,
-    /// The impact this material survives, as the speed the two surfaces met
-    /// at, in voxels a second. `UNBREAKABLE` survives anything.
+    /// The impact this material survives, as the largest normal impulse a
+    /// contact on it may carry, in the solver's own units.
+    /// `UNBREAKABLE` survives anything.
     ///
-    /// A closing speed, not an impulse: an impulse grows with the mass a
-    /// contact holds up, so in these units resting weight alone would shatter
-    /// a stack. Never a force either, which would depend on the tick rate.
-    /// `physics::fracture` says where that parts from Dwyer and why.
+    /// An impulse, as Dwyer's devlog 28 has it, and never a force: a collision
+    /// resolves inside one tick, so the force it reports depends on the tick
+    /// rate and the impulse it exchanges does not.
+    ///
+    /// Two consequences of the units, and both matter when choosing a number.
+    /// An impulse grows with the mass a contact holds up, so **every strength
+    /// here is calibrated against resting load** -- a settled stack carries a
+    /// large impulse for standing still. And it grows with the striking body's
+    /// mass, so this is not a speed a material survives: a bigger body breaks
+    /// the same material at a lower speed, which is what an impulse means.
+    /// `physics::fracture` has the measurements.
     pub strength: f32,
 }
 
@@ -52,15 +60,19 @@ pub const DEFAULT_RESTITUTION: u8 = 5;
 
 /// What a material takes before it cracks when its source says nothing.
 ///
-/// In voxels a second, as `Material::strength` is, and read against the speed
-/// the two surfaces met at. Gravity is 98.1 voxels a second squared, so a body
-/// dropped `h` voxels arrives at `sqrt(2 * 98.1 * h)`: about 20 from two
-/// voxels, 63 from twenty, 99 from fifty, against a terminal speed of 200.
+/// An impulse, as `Material::strength` is, so it has to be read against a body:
+/// a four-voxel cube of ordinary stone weighs 64,000 in these units, and
+/// driven into terrain it lands a measured peak of 2.48e6 at 120 voxels a
+/// second and 3.43e6 at 200. 2.8e6 is where that body arrives at about 150,
+/// which keeps the meaning the old closing-speed threshold had: "survives any
+/// fall a player builds and breaks when it is thrown or blasted", a terminal
+/// speed being 200. Default terrain should be the tough case; what is meant to
+/// shatter says so.
 ///
-/// So 150 is "survives any fall a player builds and breaks when it is thrown
-/// or blasted" -- a drop of 115 voxels to crack it by falling alone. Default
-/// terrain should be the tough case; what is meant to shatter says so.
-pub const DEFAULT_STRENGTH: f32 = 150.0;
+/// Well clear of resting load, which is the constraint an impulse threshold
+/// has and a speed does not: a three-cube stack of that same body leans on its
+/// bottom contact with a measured 331,306, so this leaves a factor of eight.
+pub const DEFAULT_STRENGTH: f32 = 2_800_000.0;
 
 /// A material that never fractures, however hard it is hit.
 pub const UNBREAKABLE: f32 = f32::INFINITY;
@@ -166,8 +178,8 @@ mod tests {
     }
 
     /// `strength` is a float, not hundredths like the contact columns: it is
-    /// read directly against a closing speed, which has no reason to land on
-    /// an integer.
+    /// read directly against an accumulated impulse, which runs to the
+    /// millions and has no reason to land on an integer.
     #[test]
     fn a_material_keeps_its_strength_as_a_float() {
         let mut table = MaterialTable::new();

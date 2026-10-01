@@ -13,21 +13,43 @@
 //! frames a second, which is a physics bug that looks like a gameplay feature.
 //! `the_same_collision_breaks_at_any_tick_rate` holds that.
 //!
-//! **Where this parts from him: he thresholds the contact impulse, and this
-//! thresholds the speed the two surfaces met at.** Both are rate-independent,
-//! so his argument is kept; the closing speed answers two things his N.s units
-//! do not have to face.
+//! **The blow is the accumulated contact impulse**, which is his, and never a
+//! quotient of it: dividing by a mass to recover a speed has to choose a mass,
+//! and a contact's owner is not it -- a contact belongs to whichever body the
+//! scene lists first, so the same collision would read two ways.
+//! `a_collision_breaks_the_same_things_whichever_body_is_listed_first` is that
+//! gate. The raw impulse is symmetric and needs no owner.
 //!
-//! - An impulse grows with the mass a contact holds up. `Material::strength` is
-//!   in the tens to hundreds, and a resting stack leans on its contacts with
-//!   impulses in the hundreds of thousands, so an impulse threshold at that
-//!   scale shatters anything for standing still. `resting_weight_breaks_nothing`
-//!   is that gate, and against an impulse it fails by 61,134 fractures.
-//! - Dividing an impulse by a mass to recover a speed has to choose a mass, and
-//!   a contact's owner is not it: a contact belongs to whichever body the scene
-//!   lists first. The same collision then read two ways.
-//!   `a_collision_breaks_the_same_things_whichever_body_is_listed_first` is that
-//!   gate. A closing speed is symmetric and needs no owner.
+//! This was a closing speed until 2026-10-02, and what killed that is the
+//! crush: the mouse grab is a joint with an enormous force limit driving toward
+//! a velocity goal, so a grabbed body leaning on a wall presses with up to
+//! `GRAB_MAX_FORCE` while the contact holds both surfaces still. The approach
+//! speed is then ~0 however hard the press, and a player could lean a rock
+//! through a window without marking it.
+//! `a_slow_crush_breaks_what_it_presses` is that gate.
+//!
+//! **What the units cost, measured 2026-10-02.** An impulse grows with the mass
+//! a contact holds up, so a settled stack carries a large one for standing
+//! still -- warm starting seeds each tick's impulse from the last.
+//! `resting_weight_breaks_nothing` is that gate, and the first attempt at this
+//! rule failed it by 61,134 fractures. Every strength is now calibrated above
+//! the resting load, and the window that leaves is narrow:
+//!
+//! - A three-cube glass stack carries 331,306 at its bottom contact, and the
+//!   load grows with the stack: 126,129 for one cube, 246,227 for two, 356,751
+//!   for four, 391,195 for six.
+//! - A grab pressing that same glass saturates at about 365,906 -- and it
+//!   *saturates*, near-flat in the pressed body's mass (588,636 for a
+//!   two-voxel cube, 343,399 for an eight), because the press settles into a
+//!   penetration equilibrium rather than running up to the force limit.
+//!
+//! **So the two bound each other at about 1.1x, and past four cubes the
+//! ordering inverts**: no single strength both survives a six-high stack and
+//! gives way under a slow crush. `GLASS_STRENGTH` fits between them for the
+//! fixtures the suite uses, with five per cent of headroom either way. Raising
+//! the impulse a contact can carry before it is held in equilibrium -- or
+//! reading the load a contact has carried *steadily* apart from the load it
+//! just took -- is what would widen it. Neither is done.
 
 use bevox_core::body::BodyId;
 use glam::{IVec3, UVec3, Vec3};
@@ -48,9 +70,10 @@ pub struct Fracture {
     /// units. The peak rather than what it ended with: a collision that
     /// resolved and let go is back at zero by the end of the tick.
     pub impulse: f32,
-    /// How fast the two surfaces met, in voxels a second, which is what was
-    /// tested against the material's strength. The same number whichever side
-    /// of the contact is asked about.
+    /// What was tested against the material's strength, which is that same
+    /// peak impulse: the two are equal, and both are kept because `impulse`
+    /// says what the contact carried and `blow` says what the rule read. The
+    /// same number whichever side of the contact is asked about.
     pub blow: f32,
     /// How far past that strength it went: 1.0 exactly at the threshold, 3.0
     /// for three times what the material could take. What sizes the cracks.
@@ -65,7 +88,7 @@ pub struct Fracture {
 /// out of a hole nothing went through.
 pub const REBOUND: f32 = 0.6;
 
-/// Whether a blow of this speed breaks that material, and by how much.
+/// Whether a blow of this impulse breaks that material, and by how much.
 ///
 /// `None` for a material that holds, for `UNBREAKABLE` whatever the blow, and
 /// for a non-finite blow: a NaN compares false against everything, so

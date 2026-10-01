@@ -17,6 +17,7 @@ the next one.
 * [The body cap, and what a body costs](body-cap.md) - 0.629 ms per visible body, and why MAX_BODIES is 16.
 * [The frame budget, and where it goes](frame-budget.md) - sixteen bodies with shadows take 22.6 ms against 16.7.
 * [Nine steps a ray, so the walk is not the cost](nine-steps-a-ray.md) - the traversal has nothing left to give; workgroup size is not the lever either.
+* [The impulse threshold separates a crush from a lean by ten per cent](fracture-load-window.md) - fracture reads the accumulated impulse so it can see a crush; resting load 331,306 against a crush load that saturates at 365,906, and past four cubes the ordering inverts.
 * [Solver convergence is a setting, and the spec reached for the wrong one](solver-convergence-is-a-setting.md) - raising the biased count alone bought no stability on a 240:1 load, the balanced axis is open, and that fixture's collapse is a characterised open defect.
 
 # Decisions
