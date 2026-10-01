@@ -1014,6 +1014,56 @@ mod tests {
         }
     }
 
+    /// Spending more velocity iterations may not make a resting contact
+    /// *worse*. The three-cube stack of `a_stack_of_three_stands_still`,
+    /// settled 2000 ticks at 8 velocity iterations, sits no deeper below its
+    /// settled reference than the same stack at `Tuning::default()`.
+    ///
+    /// This is the one monotonic property the 2026-10-01 measurement found
+    /// (0.0003 against 0.0017 -- see
+    /// `docs/concepts/solver-convergence-is-a-setting.md`). Deeper
+    /// penetration under more work would be the signature of a mis-scaled
+    /// push-out bias, and nothing else in the suite looks at penetration as a
+    /// function of the iteration count.
+    #[test]
+    fn more_iterations_do_not_deepen_a_resting_contact() {
+        let materials = materials();
+        let world = slab(64, 0..8);
+        let field = DistanceField::build(&world);
+        let fixture = || -> Vec<Body> {
+            (0..3)
+                .map(|i| placed(cube(4, 4), Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0), Quat::IDENTITY))
+                .collect()
+        };
+
+        // How far the bottom cube sits below the 10.0 it settles at in
+        // `a_stack_of_three_stands_still`, after the same 2000 ticks.
+        let settle = |tuning: crate::Tuning| -> f32 {
+            let mut bodies = fixture();
+            for _ in 0..2000 {
+                step_with(
+                    &mut bodies,
+                    &world,
+                    &field,
+                    &materials,
+                    Air::vacuum(GRAVITY),
+                    DT,
+                    None,
+                    &mut [],
+                    tuning,
+                );
+            }
+            (10.0 - bodies[0].position.y).max(0.0)
+        };
+
+        let one = settle(crate::Tuning::default());
+        let eight = settle(crate::Tuning { velocity_iterations: 8, relaxation_iterations: 1 });
+        assert!(
+            eight <= one + 1e-4,
+            "eight velocity iterations penetrate {eight} against the default's {one}: more work made the resting contact worse"
+        );
+    }
+
     /// A body resting on another is held up by it, not by the floor: take the
     /// lower one away and the upper one falls.
     #[test]

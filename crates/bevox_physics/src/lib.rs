@@ -33,11 +33,23 @@ pub const GRAVITY: Vec3 = Vec3::new(0.0, -9.81 / VOXEL_METRES, 0.0);
 pub const SUBSTEPS: u32 = 4;
 
 /// Sweeps of the biased contact/joint pass per substep, the one that pushes
-/// penetration out. 1 until Task 3's measurement says otherwise.
+/// penetration out.
+///
+/// **1 by measurement, not by default.** Measured 2026-10-01 by
+/// `solver::tests::what_the_iteration_counts_cost`: raising this count made a
+/// 240:1 mass-ratio load *less* stable, not more (worst upward velocity
+/// 12.83 v/s at 1, 18.02 v/s at 8), while costing 2.8x a tick. The one thing
+/// it did buy is shallower resting penetration, held by
+/// `solver::tests::more_iterations_do_not_deepen_a_resting_contact`. See
+/// `docs/concepts/solver-convergence-is-a-setting.md` before raising it.
 pub const VELOCITY_ITERATIONS: u32 = 1;
 
 /// Sweeps of the unbiased relax pass per substep, the one that removes the
-/// velocity the bias added. 1 until Task 3's measurement says otherwise.
+/// velocity the bias added.
+///
+/// **1 by measurement, not by default.** The only variant that beat `(1, 1)`
+/// on the load fixture at all was `(4, 4)`, by 0.9 v/s for 3.2x the tick
+/// cost. Same measurement and same concept page as `VELOCITY_ITERATIONS`.
 pub const RELAXATION_ITERATIONS: u32 = 1;
 
 /// How many times the solver sweeps its two passes per substep. Both default

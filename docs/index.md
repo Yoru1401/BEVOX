@@ -41,6 +41,7 @@ lifted out of the plan that produced it.
 * [The body cap, and what a body costs](concepts/body-cap.md) - 0.629 ms per visible body, and why MAX_BODIES is 16.
 * [The frame budget, and where it goes](concepts/frame-budget.md) - sixteen bodies with shadows take 22.6 ms against 16.7.
 * [Nine steps a ray, so the walk is not the cost](concepts/nine-steps-a-ray.md) - a primary ray takes nine steps, so the static march is bound by what a step costs, not how many.
+* [Solver convergence is a setting, and more of it is worse](concepts/solver-convergence-is-a-setting.md) - more velocity iterations made a 240:1 load less stable, not more, so both counts stay at 1.
 * [Both coarse grids ride in one storage buffer](concepts/coarse-grids-share-one-buffer.md) *(premise corrected)* - eight was wgpu's browser baseline, not the hardware's limit; the adapter allows 524,288.
 * [Only terrain debris merges back](concepts/terrain-only-merging.md) - what may return to the world, and why it must be out of view.
 * [Sliding friction cannot stop a roll](concepts/rolling-needs-its-own-resistance.md) - a lone voxel is a sphere, and nothing was slowing it down.

@@ -32,10 +32,12 @@ because the cause is what says whether a difference needs fixing.
 | **C — different constraints.** A `u16`, an extent of 4096, eight storage buffers | 5 | Forced, and correct under the constraint |
 | **D — not reached yet.** Deferred, not rejected | 6 | Fine, except one |
 | **E — improvements on him** | 5 | Ours is better, mostly because he taught us the problem |
-| **F — oversight.** Nobody decided | 7 | **This is the drift.** Five are worth fixing |
+| **F — oversight.** Nobody decided | 7 | **This is the drift.** Five looked worth fixing; F7 is measured and resolved, leaving four |
 
-**Seven real problems out of thirty-two differences**, five of them worth fixing.
-Four are in the renderer; the seventh is a solver setting nobody knew existed.
+**Seven real problems out of thirty-two differences**, five of which looked worth
+fixing. Four are in the renderer; the seventh was a solver setting nobody knew
+existed, and **F7 is now resolved rather than fixed** — the setting was exposed,
+measured, and left where it was, which leaves **four** worth fixing.
 
 # A — Different product
 
@@ -102,7 +104,8 @@ Places BEVOX is better, usually because he documented the problem first.
 
 # F — Oversight: the actual drift
 
-Six differences nobody decided on. Four are worth fixing.
+Seven differences nobody decided on. Five looked worth fixing; **F7 is now
+resolved**, leaving four.
 
 ## F1. The primary path has no bounding-sphere reject — **bad**
 
@@ -185,21 +188,34 @@ was overruled on 2026-09-30 and the shape settled on 2026-10-01.
   API, and it never pays this repo's gate discipline for code that exists to be
   deleted.
 
-## F7. One velocity pass per substep, where his is a count — **newly found**
+## F7. One velocity pass per substep, where his is a count — **resolved, not fixed**
 
 **What differs.** His solver config carries `velocity_iterations` and
-`relaxation_iterations` as *counts*. BEVOX runs exactly one biased pass and one
-relax pass per substep.
+`relaxation_iterations` as *counts*. **BEVOX now carries them too**, as
+`bevox_physics::Tuning` through `solver::step_with`, and **both are 1** — so the
+structural difference is gone and the effective behaviour is unchanged.
 
 **Why it drifted.** BEVOX's solver was ported from what devlog 26 describes, and
 he describes the *structure* — detect, substep, integrate last — not the iteration
 counts inside it. They were only visible once `rigid_pixels` could be read.
 
-**Good idea?** No. More velocity iterations per substep is the standard lever for
-stacking stability, and stacking stability is exactly what broke on 2026-09-28
-when a 240:1 mass ratio diverged. BEVOX has been running the solver at its least
-stable setting without knowing there was a setting. Cheap to expose, and it wants
-measuring against the stress scene of F4 rather than on its own.
+**Good idea?** The difference was worth closing; **the reason given for closing
+it was wrong.** This entry said more velocity iterations per substep is "the
+standard lever for stacking stability" and that BEVOX "has been running the
+solver at its least stable setting". Measured on 2026-10-01 by
+`solver::tests::what_the_iteration_counts_cost`: **raising the velocity count
+made a 240:1 load less stable**, worst upward velocity 12.83 v/s at one
+iteration against 18.02 v/s at eight, for 2.8x the tick cost. The one gain was
+shallower resting penetration, 0.0017 → 0.0003.
+
+So **the counts stay at 1 by measurement**, and the claim about what raising
+them buys is withdrawn —
+[solver convergence is a setting, and more of it is worse](../concepts/solver-convergence-is-a-setting.md).
+Two things it left behind: the 2026-09-28 divergence **did not reproduce** as
+recorded, and the rebuilt fixture instead collapses through the floor by tick
+55, which is an open defect recorded on that page. F4's stress scene is still
+wanted — not to measure the counts, which is done, but because what makes an
+extreme mass ratio collapse is still unmeasured.
 
 ## F5. Shadows are recomputed every frame — **too early to say**
 

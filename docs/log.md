@@ -1,6 +1,32 @@
 # Update Log
 
 ## 2026-10-01
+* **Measurement, and a negative result**: the solver's two iteration counts are
+  exposed, measured, and **staying at 1**. F7 called raising the velocity count
+  "the standard lever for stacking stability"; `what_the_iteration_counts_cost`
+  says it is **not that in this engine** — a 240:1 load's worst upward velocity
+  goes **12.83 v/s at (1,1) to 18.02 v/s at (8,1)**, for 2.8x the tick cost, and
+  the only variant that beats the default at all is (4,4), by 0.9 v/s for 3.2x.
+  **Less stable under more work, not more.** The one monotonic gain is resting
+  penetration, 0.0017 → 0.0003, now gated by
+  `more_iterations_do_not_deepen_a_resting_contact`. The loops themselves are
+  free: bit-identical at the default, proven by
+  `a_tick_is_unchanged_by_the_default_tuning`. F7 is **resolved, not fixed**, and
+  the claim about what raising the counts buys is withdrawn —
+  [solver convergence is a setting, and more of it is worse](concepts/solver-convergence-is-a-setting.md).
+  Also recorded there, because it was found on the way: **zeroing
+  `velocity_iterations` does not drop a body through the floor.** The unbiased
+  relax pass calls the same `solve`/`solve_friction`/`solve_rolling`, so
+  non-penetration survives; what breaks is eleven tests, mostly joints. The
+  biased pass is not what holds a stack up.
+* **Open defect**: the rebuilt 240:1 fixture **collapses through the floor by
+  tick 55** — peaking at 12.83 v/s *upward* around tick 9-10, then falling at
+  about −23.6 v/s. The 2026-09-28 record ("23 v/s upward by tick 33") **does not
+  reproduce**: different magnitude, direction and timing, and at tick 33 the
+  fixture is settling. This is independent of the iteration counts, nothing was
+  adjusted to chase the recorded number, and **no cause is offered** — only body
+  velocities were instrumented. Runnable from
+  `what_the_iteration_counts_cost`.
 * **Update**: [the fracture and detection spec](superpowers/specs/2026-09-30-bevox-fracture-and-detection-design.md)
   revised, and **reordered**. F7 — the solver's iteration counts — was listed out
   of scope and is now **Part 1**, because `peak[at]`, the accumulated normal

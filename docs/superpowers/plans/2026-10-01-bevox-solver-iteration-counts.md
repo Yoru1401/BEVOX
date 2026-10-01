@@ -297,3 +297,30 @@ git commit -m "perf(physics): converge the solver, and say what it cost"
 - **It does not touch detection.** Part 3 is after that.
 - **It does not multithread anything.** His devlog 27 took 12 ms to 8 ms with a
   thread pool; that is a different drift item and a different plan.
+
+---
+
+# What actually happened
+
+**Tasks 1 and 2 ran as planned. Task 3 was replaced, because the measurement
+falsified the premise the plan was built on.**
+
+The plan assumed the measurement would find an iteration count that fixes the
+240:1 divergence, and Task 3 was written to adopt it. It did not. Raising the
+velocity count made the load fixture **less** stable — 12.83 v/s worst upward at
+`(1, 1)` against 18.02 v/s at `(8, 1)`, for 2.8x the tick cost. The only
+monotonic gain was resting penetration, 0.0017 → 0.0003.
+
+So **both constants stayed at 1**, and Task 3 became: record the negative
+result, gate the one property worth holding
+(`more_iterations_do_not_deepen_a_resting_contact`), and resolve F7 against its
+own reasoning. The tasks above are left as written — they are the record of what
+was intended. What came true is in
+[solver convergence is a setting, and more of it is worse](../../concepts/solver-convergence-is-a-setting.md),
+including the one thing this work found that nobody was looking for: the
+rebuilt 240:1 fixture **collapses through the floor by tick 55**, which is an
+open defect and not an iteration-count problem.
+
+The plan's Step 8 commit message, "converge the solver, and say what it cost",
+describes work that did not happen. What shipped is
+`perf(physics): measure the solver's iteration counts, and leave them at one`.

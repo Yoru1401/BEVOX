@@ -17,6 +17,7 @@ the next one.
 * [The body cap, and what a body costs](body-cap.md) - 0.629 ms per visible body, and why MAX_BODIES is 16.
 * [The frame budget, and where it goes](frame-budget.md) - sixteen bodies with shadows take 22.6 ms against 16.7.
 * [Nine steps a ray, so the walk is not the cost](nine-steps-a-ray.md) - the traversal has nothing left to give; workgroup size is not the lever either.
+* [Solver convergence is a setting, and more of it is worse](solver-convergence-is-a-setting.md) - raising the velocity iteration count destabilised a 240:1 load; both counts stay at 1, and that fixture's collapse is an open defect.
 
 # Decisions
 
