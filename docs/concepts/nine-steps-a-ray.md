@@ -68,6 +68,12 @@ pixel-identical:
 His reference point is **7 ms for a Teardown castle on a 1660 Ti**, primary and
 shadow ray (devlog 17). The bench scene here is 13-15 ms on a 1650.
 
+**And he states a resolution, once, in a video description**: devlog 22 was
+captured *"in real-time 1080p on my GTX 1660 TI"*, eleven months later, with
+textures, foliage, transparency and volumetrics added since. So the comparison
+is **1920x1080 against this bench's 1280x720** — 2.25x the rays. That widens the
+gap rather than explaining it, and it is the figure to beat, not the 7 ms.
+
 That gap is **not the traversal**, because the traversal takes nine steps. The
 candidates left are the hardware (a 1650 is roughly a third down on a 1660 Ti),
 the scene — the bench camera is deliberately the worst case, close to geometry

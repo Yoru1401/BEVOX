@@ -23,6 +23,15 @@ video IDs and upload dates read from YouTube on 2026-09-24. Everything here is
 what he *says* in the videos. His engine is not open source, so nothing below is
 read from his code, and where he gives no number this document gives none.
 
+**Checked twice.** Devlog 17 was read line by line against its captions on
+2026-09-30 and every checkable claim held. On 2026-10-01 all thirty **upload
+dates were compared mechanically** against the channel metadata — **all thirty
+match** — and every video *description* was swept for facts the transcripts do
+not carry. The descriptions added four things, all folded in below (the VVAO
+name in 15, the resolution and card in 22, the DDGI papers in 23, and the three
+videos in the next section) and **contradicted nothing.** Two independent checks
+have now failed to find an error in this file.
+
 **How to read the arc.** Five phases, and he doubles back on each of them:
 
 | Devlogs | Dates | What he is doing |
@@ -489,7 +498,9 @@ This is the first episode with a sponsor.
 **2023-12-25.** [3WaLMBiezMU](https://www.youtube.com/watch?v=3WaLMBiezMU)
 
 **What he built.** Ambient occlusion, "after three attempts", by a method he
-believes is his own.
+believes is his own and names: **volumetric voxel ambient occlusion, VVAO**,
+which he says he invented "to achieve coherent multi-voxel occlusion" (the name
+is from the video's description, not the transcript).
 
 - **Why the two standard approaches failed him:**
   - **Minecraft's per-block AO** looks only at directly adjacent blocks. His
@@ -731,6 +742,14 @@ creating or editing voxel data**, in a voxel engine.
 
 **2025-02-16, five and a half months later.** [YTZBFz3Et40](https://www.youtube.com/watch?v=YTZBFz3Et40)
 
+> All scenes shown in the video were captured in real-time 1080p on my GTX
+> 1660 TI.
+
+**The one resolution claim he makes anywhere**, and it is in the description
+rather than the video. It fixes the rest of his numbers to a baseline: **1920x1080,
+GTX 1660 Ti, real time** — eleven months after the 7 ms of devlog 17, with
+textures, foliage, transparency and volumetrics added on top.
+
 **What he built.** A third rewrite. This is the episode where he explains what
 went wrong with the previous design, and it is two things.
 
@@ -806,7 +825,11 @@ it is less noisy and more efficient.
   probes behind the surface.
 
 He calls it "one of the most complicated things I've implemented and certainly
-the most complicated thing to explain", and cites three papers.
+the most complicated thing to explain", and cites three papers — named in the
+description, not the video: Majercik et al., *Dynamic Diffuse Global
+Illumination with Ray-Traced Irradiance Fields*; Majercik et al., *Scaling
+Probe-Based Real-Time Dynamic Global Illumination for Production*; and Rohacek,
+*Improving Probes in Dynamic Diffuse Global Illumination*.
 
 ---
 
@@ -1114,6 +1137,49 @@ engine of three pistons, and a clock whose joints drive to the current time.
 attached to.** Cut the piece of world holding a door's hinge and the joint
 transfers to the rigid body that detachment just spawned, so the door stays
 hung; cut the hinge out of the door itself and the two become separate objects.
+
+---
+
+# The four videos that are not devlogs
+
+Not numbered, so not in the arc above, and all four were missing from this
+record until the descriptions were swept. One of them matters.
+
+**Voxel physics engine: sneak peek** — 2026-02-20,
+[FUx7nRS6mvw](https://www.youtube.com/watch?v=FUx7nRS6mvw), 2:29. A demo with no
+explanation, **ten weeks before devlog 26**, whose description is the earliest
+statement of the physics BEVOX is modelled on:
+
+> The engine is pure voxels, and features **continuous collision detection** with
+> an iterative **Temporal Gauss-Seidel (TGS)** solver. It's so much more stable
+> than my previous physics engine, and features **material-specific properties**
+> as well.
+
+Three things worth having. It dates TGS and per-material properties to **before**
+devlog 26 explained them, so 25 → 26 is not the jump it reads as. It says he
+built this *"every weekend"* since the start of 2026. And **he calls his
+detection continuous**, which is the same word devlog 11 earns from SAT
+projection gaps — so "continuous collision detection" is his umbrella term, and
+`rigid_pixels`'s substepped `Speculative` detector sits under it. That matters
+for [E2](dwyer-drift.md): the
+[respec](../superpowers/specs/2026-09-30-bevox-fracture-and-detection-design.md)
+is not departing from him by substepping detection, it is implementing what he
+calls CCD.
+
+**Trying OTHER PEOPLE'S voxel game engines** — 2024-08-13,
+[uQgoJYtuCYs](https://www.youtube.com/watch?v=uQgoJYtuCYs), 20:01. He reviews the
+**building systems** of frozein's engine, **Teardown**, and `_rey`'s, and calls
+it *"market research"* so he can build a robust one of his own. His only recorded
+look at an engine other than his own, and the only place Teardown is a subject
+rather than a benchmark.
+
+**INSANE bug in my code from compiler optimization** — 2023-12-13,
+[hBjQ3HqCfxs](https://www.youtube.com/watch?v=hBjQ3HqCfxs), 5:02. Undefined
+behaviour his code relied on, and what the optimiser did with it.
+
+**How to code PONG w/ Rust and Geese** — 2023-09-03,
+[zqNTbttpmaY](https://www.youtube.com/watch?v=zqNTbttpmaY), a tutorial for his
+own event library rather than engine work.
 
 ---
 

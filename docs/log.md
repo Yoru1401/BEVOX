@@ -1,6 +1,35 @@
 # Update Log
 
 ## 2026-10-01
+* **Update**: every Dwyer video **description** swept, and the record checked a
+  second time. All **thirty upload dates compared mechanically** against the
+  channel metadata — **all thirty match** — and the descriptions **contradicted
+  nothing**. Two independent checks have now failed to find an error in
+  [the devlog record](reference/dwyer-devlogs.md), which is as much confidence as
+  that file can earn without his source.
+* **Creation**: [the four videos that are not devlogs](reference/dwyer-devlogs.md),
+  all four missing from the record until now. One matters: the **2026-02-20
+  sneak peek**, ten weeks before devlog 26, whose description dates **TGS,
+  continuous collision detection and material-specific properties to before 26
+  explained them** — so 25 → 26 is not the jump it reads as. **And he calls his
+  detection continuous**, the same word devlog 11 earns from SAT projection gaps,
+  which puts `rigid_pixels`'s substepped `Speculative` detector under his own
+  umbrella term. The [E2 respec](superpowers/specs/2026-09-30-bevox-fracture-and-detection-design.md)
+  is therefore implementing what he calls CCD, not departing from him. The ledger
+  row is updated.
+* **Update**: **the one resolution he states anywhere.** Devlog 22's description
+  says its scenes were captured *"in real-time 1080p on my GTX 1660 TI"* —
+  eleven months after the 7 ms of devlog 17 and with textures, foliage,
+  transparency and volumetrics added since. So the standing comparison is
+  **1920x1080 against this bench's 1280x720, 2.25x the rays**. That **widens**
+  the gap rather than explaining it, and 1080p is the figure to beat —
+  [nine steps a ray](concepts/nine-steps-a-ray.md).
+* **Update**: three smaller facts the transcripts do not carry — his own name for
+  his ambient occlusion, **VVAO, volumetric voxel ambient occlusion** (15); the
+  three DDGI papers named, Majercik et al. twice and Rohacek (23); and his
+  *"market research"* video reviewing the building systems of frozein's engine,
+  **Teardown** and `_rey`'s, the only place Teardown is a subject rather than a
+  benchmark.
 * **Fix**: [John Lin](reference/john-lin.md) corrected from his video
   descriptions, which contradict what the page was written with. **He built three
   renderers in fifteen months**, and on 2020-06-16 abandoned *hardware* ray
