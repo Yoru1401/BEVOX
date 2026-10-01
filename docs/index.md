@@ -50,7 +50,7 @@ lifted out of the plan that produced it.
 
 * [Douglas Dwyer's voxel engine, devlog by devlog](reference/dwyer-devlogs.md) - what he built in each of his thirty Voxel Devlogs, dated, and what each changed from the ones before.
 * [Dwyer's rigid_pixels, read from source](reference/rigid-pixels.md) - the 2D prototype behind devlog 26, which settles what the devlogs leave open.
-* [John Lin's voxel engine, read from his blog](reference/john-lin.md) - a second developer, unrelated to Dwyer, whose objection to sparse voxel octrees names a pattern BEVOX already follows.
+* [John Lin's voxel engine, read from his blog and videos](reference/john-lin.md) - a second developer, unrelated to Dwyer. Three engines in fifteen months, including dropping hardware ray tracing because a BLAS is too heavy for a dynamic scene, and a reversal on unified voxel formats that makes his objection a post-mortem rather than an opinion.
 * [How far BEVOX has drifted from Dwyer](reference/dwyer-drift.md) - thirty-one differences sorted by why each happened and whether it was a good idea. Six causes; only one is drift.
 
 # Design specs

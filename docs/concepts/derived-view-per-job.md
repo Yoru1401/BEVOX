@@ -45,6 +45,12 @@ it — that sparse voxel octrees are "acceptable (not even great)" at storage an
 rendering and bad at everything else. His answer is a canonical minimum format
 plus conversion operators registered by name.
 
+**He is not theorising.** Fourteen months before writing that, he described his
+own engine's *"unified voxel framework"* — world, physics, ray tracing,
+lighting, procedural generation, sound tracing and collision detection all over
+the same voxel data — as its central achievement. The argument is a post-mortem
+on that engine, written after rewriting it.
+
 BEVOX is his answer already, reached without the argument. The difference is
 that his conversions are **declared** and BEVOX's are six unrelated functions
 with no shared vocabulary. That costs nothing until someone reaches for the
@@ -86,6 +92,14 @@ recomputed at every sample rather than cached, and that is the reason
 [F3](/reference/dwyer-drift.md) — per-voxel sun visibility — has nowhere to
 live. The pattern does not say "cache everything derivable"; it says each view
 chooses its own point on that trade, and not storing is a valid choice.
+
+**That choice has a bill, and F3 is it.** A view recomputed per sample cannot
+accumulate anything across frames. Sun visibility is not a function of the
+sample — it is a property of the voxel, measured once and reused — so it needs
+the one thing this pattern has so far declined to build: a **stored** per-voxel
+view. Lin's third engine lists per-voxel material attributes as shipped, so the
+blocker is BEVOX's, not the pattern's. The rule above still holds: that store is
+a seventh view, not a wider `Node`.
 
 # What this rules out
 

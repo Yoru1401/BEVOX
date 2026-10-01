@@ -1,6 +1,34 @@
 # Update Log
 
 ## 2026-10-01
+* **Fix**: [John Lin](reference/john-lin.md) corrected from his video
+  descriptions, which contradict what the page was written with. **He built three
+  renderers in fifteen months**, and on 2020-06-16 abandoned *hardware* ray
+  tracing — *"the engine is no longer using RTX"* — for a custom Vulkan Compute
+  ray tracer, because a BLAS is too heavy to rebuild for a dynamic scene and his
+  own *"extremely lightweight acceleration structure"* was a net win despite
+  being slower in raw terms. The blog's BLAS/SBT sketch is therefore not "his
+  renderer". Also: the claim that his argument carries no measurements was wrong
+  — the descriptions carry fluid simulation under **8 ms on 4 threads**, a
+  **10x** rendering speedup, **5** path-traced bounces, a **256K cubed** world,
+  **y 0-4095**, and a player-built scene under **3 MB**.
+* **Update**: and the reason to trust his argument at all. On **2020-07-12** he
+  presented his engine's *"unified voxel framework"* — world, physics, ray
+  tracing, lighting, procedural generation, sound tracing and collision detection
+  over the same voxel data — as the achievement that made everything possible. On
+  **2021-09-18** one format for every system is the disease. Fourteen months and
+  one rewrite apart, which makes the blog post a **post-mortem on his own
+  engine**, not a position. The earlier caution on that page — that an argument
+  never shipped is weak evidence — had a false premise and is narrowed to the
+  part that is still true: he never shipped the *fix*.
+* **Update**: [the derived-view rule](concepts/derived-view-per-job.md) now names
+  the bill for its own cheapest case. Normals are recomputed per sample and never
+  stored, and a per-sample view cannot accumulate across frames — which is
+  exactly why F3, per-voxel sun visibility, is blocked. Lin's third engine lists
+  per-voxel material attributes as shipped, so that blocker is BEVOX's and not
+  the pattern's. He also says, in passing, *"we don't rotate our voxels here,
+  because we know better"* — BEVOX does, and that parenthesis is the strongest
+  outside argument against it this project has.
 * **Creation**: [John Lin's voxel engine, read from his blog](reference/john-lin.md) —
   a second voxel developer, **unrelated to Dwyer**, whose argument is that one
   format chosen for the renderer poisons every other system: sparse voxel octrees
