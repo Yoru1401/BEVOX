@@ -1,6 +1,30 @@
 # Update Log
 
 ## 2026-10-02
+* **Creation**: the stress scene, drift F4's first half —
+  `solver::tests::forty_nine_cubes_tumble_without_escaping_diverging_or_sinking`.
+  49 glass 2x2x2 cubes in a closed hollow box with two-voxel walls, gravity
+  swept through a full turn over 800 ticks at constant magnitude, because the
+  static world is a `Contree` and cannot be a rotating drum. It gates stacking
+  stability under a continuously changing load direction, **not** Dwyer's
+  tumbler — a real drum drags its contents through wall friction and this does
+  not. **Passed on arrival**: worst speed 45.56 v/s against a bound of 99.94
+  (1.5x a 66.63 v/s free fall across the cavity diagonal), worst penetration
+  0.0259 against `SLOP + BASE_MARGIN` = 0.1200, one fracture at 244,950 against
+  an 8-voxel threshold of 233,333, nothing ever asleep. `#[ignore]`d at 99
+  seconds in a debug build —
+  [how far BEVOX has drifted from Dwyer](reference/dwyer-drift.md).
+* **Update**: what that scene revealed is **how little it loads the solver**.
+  Four deliberate breaks, one fails: `BASE_MARGIN = 0` (0.0268 against a bound
+  that falls to 0.0200 with it). `MAX_PUSH` 20 → 2000 changes the run **bit for
+  bit not at all** — the bias only ever pushes at about 0.08 v/s here, so the
+  clamp is inert. `RELAXATION_ITERATIONS = 0` passes at 42.09 v/s and 0.0200;
+  `BIAS = 0` passes at 0.1025, 85% of the bound and 4x baseline. So the speed
+  assertion is a regression tripwire, not a sensitive instrument, and a
+  calibration checked only against a uniform pile is not checked hard. The
+  earlier claim that F4's scene would say what makes an extreme mass ratio
+  collapse is withdrawn — it does not —
+  [how far BEVOX has drifted from Dwyer](reference/dwyer-drift.md).
 * **Update**: the hand-back has a gate of its own.
   `the_hand_back_scales_with_how_far_past_strength_the_blow_went` strikes the
   same `SIZE_CAP` glass bar twice with the same unbreakable hammer, once

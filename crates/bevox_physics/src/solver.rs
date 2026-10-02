@@ -2225,6 +2225,225 @@ mod tests {
         );
     }
 
+    /// **The tumbler**: forty-nine cubes in a closed hollow box, with gravity
+    /// swept through a full turn.
+    ///
+    /// The one gate here that is not about a feature. Every other whole-scene
+    /// test names a scenario -- a cube lands, three stand, a chain holds, a
+    /// lone voxel sleeps -- and on 2026-09-28 a 240:1 mass ratio through a
+    /// one-voxel plate made a stack accelerate upward at 23 voxels a second by
+    /// tick 33 with nothing in 117 tests catching it, because stability under
+    /// load is not a scenario. This is Dwyer's own validation from devlog 25,
+    /// and what it buys is a scene that behaves like a game, so a future
+    /// calibration can be checked against something more representative than a
+    /// three-cube stack and a one-cube press.
+    ///
+    /// **Gravity rotates; the drum does not, and that is not the same test.**
+    /// The static world is a `Contree`, it cannot move, and there are no
+    /// kinematic bodies, so a rotating drum is not expressible here. Sweeping
+    /// the gravity direction puts the same continuously changing load
+    /// *direction* on the pile with no new engine capability -- but a real
+    /// tumbler also drags its contents tangentially through wall friction, and
+    /// this does not. So what is gated is **stacking stability under a load
+    /// direction that never stops changing**, which is the failure mode that
+    /// bit, and not moving-wall contact. It is not equivalent to his tumbler.
+    ///
+    /// Glass, which breaks, so the fracture path runs too. Fracture cannot
+    /// perturb the scene: `step` only *reports* fractures and the caller
+    /// applies them, so the body count is not a function of how much broke.
+    /// Breakage is therefore traced, not asserted on.
+    ///
+    /// Three assertions: nothing escapes, nothing diverges, nothing sinks.
+    ///
+    /// **How much this scene actually loads the solver, measured 2026-10-02 by
+    /// deliberate break.** Of four, one fails it: `BASE_MARGIN = 0`, at 0.0268
+    /// against a bound that falls to 0.0200 with it. `MAX_PUSH` 20 -> 2000
+    /// changes the run **bit for bit not at all** -- the bias here never
+    /// pushes faster than about 0.08 v/s, so the clamp is inert in a uniform
+    /// pile. `RELAXATION_ITERATIONS = 0` passes (42.09 v/s, 0.0200) and
+    /// `BIAS = 0` passes at 0.1025, 85% of the bound. So the speed assertion
+    /// runs with a 2.2x margin and is a **regression tripwire, not a sensitive
+    /// instrument**: equal densities load the solver far less than the 240:1
+    /// ratio that bit, and a calibration checked only here is not checked hard.
+    ///
+    /// **`#[ignore]`d because it costs 99 seconds in a debug build** -- 800
+    /// ticks of forty-nine bodies in permanent mutual contact -- which is more
+    /// than the rest of this crate's suite put together. Run it by name. A
+    /// stress scene nobody runs on every commit is still worth having; one
+    /// that makes every commit wait is not.
+    #[test]
+    #[ignore = "99s in debug: run it by name"]
+    fn forty_nine_cubes_tumble_without_escaping_diverging_or_sinking() {
+        // Cavity [LO, HI] on every axis, with walls WALL voxels thick around
+        // it: two, so nothing can tunnel a one-voxel shell, and closed on all
+        // six sides, because gravity points up for part of every turn.
+        const LO: f32 = 20.0;
+        const HI: f32 = 36.0;
+        const WALL: u32 = 2;
+        let (lo, hi) = (LO as u32, HI as u32);
+        let mut voxels = Vec::new();
+        let outside = |v: u32| v < lo || v >= hi;
+        for z in lo - WALL..hi + WALL {
+            for y in lo - WALL..hi + WALL {
+                for x in lo - WALL..hi + WALL {
+                    if outside(x) || outside(y) || outside(z) {
+                        voxels.push((UVec3::new(x, y, z), MaterialId(6)));
+                    }
+                }
+            }
+        }
+        let world = Contree::from_voxels(64, &voxels);
+        let field = DistanceField::build(&world);
+        let materials = materials();
+
+        // Forty-nine 2x2x2 cubes: the first 49 cells of a 4x4x4 lattice,
+        // spaced 3.2 so they start 1.2 apart and settle into contact. The
+        // jitter is deterministic and small against that gap -- it is there so
+        // the lattice is not perfectly symmetric and the pile does not
+        // collapse in lockstep.
+        const SPACING: f32 = 3.2;
+        let middle = Vec3::splat((LO + HI) * 0.5);
+        let mut bodies: Vec<Body> = (0u32..49)
+            .map(|i| {
+                let cell = Vec3::new((i % 4) as f32, ((i / 4) % 4) as f32, (i / 16) as f32)
+                    - Vec3::splat(1.5);
+                let jitter = |k: u32| ((i * k) % 7) as f32 * 0.04 - 0.12;
+                let at = middle + cell * SPACING + Vec3::new(jitter(3), jitter(5), jitter(11));
+                placed(cube_of(2, 4, MaterialId(6)), at, Quat::IDENTITY)
+            })
+            .collect();
+        let ids: Vec<BodyId> = bodies.iter().map(|b| b.id).collect();
+
+        // The deepest overlap anywhere in the scene, re-detected at zero
+        // margin so every contact returned is a real overlap and its
+        // separation is how deep. Sampled *during* the run as well as at the
+        // end: a transient sink that the next tick pushes back out is still a
+        // body inside a wall, and a final-frame-only check cannot see one.
+        let deepest = |bodies: &[Body]| {
+            let mut worst = 0.0f32;
+            let mut into = String::from("nothing");
+            for (i, body) in bodies.iter().enumerate() {
+                for c in detect(body, &world, &field, &materials, 0.0) {
+                    if -c.separation > worst {
+                        (worst, into) = (-c.separation, format!("body {i} into the drum"));
+                    }
+                }
+                for (j, other) in bodies.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    for c in detect_pair(body, other, &materials, 0.0) {
+                        if -c.separation > worst {
+                            (worst, into) = (-c.separation, format!("body {i} into body {j}"));
+                        }
+                    }
+                }
+            }
+            (worst, into)
+        };
+
+        const TICKS: u32 = 800;
+        // Every sixteenth tick: fifty samples of an O(n^2) re-detection, which
+        // is a few per cent of the run rather than a doubling of it.
+        const SAMPLE_EVERY: u32 = 16;
+        let g = GRAVITY.length();
+        let mut worst_speed = 0.0f32;
+        let (mut worst_speed_body, mut worst_speed_tick) = (0usize, 0u32);
+        let (mut fractures, mut heaviest) = (0usize, 0.0f32);
+        let mut all_asleep = 0u32;
+        let (mut worst_sink, mut sunk_into, mut worst_sink_tick) = (0.0f32, String::from("nothing"), 0u32);
+        for tick in 0..TICKS {
+            // One full turn over the run, in the xy plane, at a constant
+            // magnitude: down at tick 0, up half way round.
+            let theta = std::f32::consts::TAU * tick as f32 / TICKS as f32;
+            let gravity = Vec3::new(theta.sin(), -theta.cos(), 0.0) * g;
+            let out = step(
+                &mut bodies,
+                &world,
+                &field,
+                &materials,
+                Air::vacuum(gravity),
+                DT,
+                None,
+                &mut [],
+            );
+            fractures += out.fractures.len();
+            heaviest = heaviest.max(out.fractures.iter().map(|f| f.blow).fold(0.0f32, f32::max));
+            if bodies.iter().all(|b| b.asleep) {
+                all_asleep += 1;
+            }
+            for (i, b) in bodies.iter().enumerate() {
+                let speed = b.velocity.length();
+                if speed > worst_speed {
+                    (worst_speed, worst_speed_body, worst_speed_tick) = (speed, i, tick);
+                }
+            }
+            if tick % SAMPLE_EVERY == 0 || tick + 1 == TICKS {
+                let (sink, into) = deepest(&bodies);
+                if sink > worst_sink {
+                    (worst_sink, sunk_into, worst_sink_tick) = (sink, into, tick);
+                }
+            }
+        }
+
+        // The speed bound is the scene's, not a number chosen to pass.
+        // Gravity is the only thing doing work here -- glass has restitution 0
+        // -- and it stays in the xy plane, so the longest run the cavity
+        // offers it is the diagonal of a square cross-section, and a free fall
+        // down that reaches `sqrt(2 g d)`. That is the energy bound from a
+        // standing start; the stated **half again** on top covers what a
+        // rotating gravity can pump into a body over a turn and what the pile
+        // can hand it, neither of which has a closed form. The 2026-09-28
+        // failure was unbounded upward acceleration, which is what this reads.
+        let diagonal = (HI - LO) * std::f32::consts::SQRT_2;
+        let free_fall = (2.0 * g * diagonal).sqrt();
+        let speed_bound = 1.5 * free_fall;
+        // A contact is solved from the moment it is within `BASE_MARGIN`, and
+        // the bias deliberately leaves `SLOP` of overlap alone, so their sum
+        // is everything the scheme permits.
+        let sink_bound = SLOP + BASE_MARGIN;
+
+        println!(
+            "tumbler: {} of 49 bodies left after {TICKS} ticks; worst speed {worst_speed:.2} v/s \
+             (body {worst_speed_body}, tick {worst_speed_tick}) against a bound of \
+             {speed_bound:.2} from a {free_fall:.2} v/s free fall across {diagonal:.2} voxels; \
+             worst penetration {worst_sink:.4} ({sunk_into}, tick {worst_sink_tick}) against \
+             {sink_bound:.4}; \
+             {fractures} fractures, heaviest blow {heaviest:.0}; \
+             {all_asleep} ticks with the whole pile asleep",
+            bodies.len()
+        );
+
+        // 1. Nothing escapes. A body whose box falls below y=0 is deleted by
+        //    `step`, so an escape downward shows up as a missing id; an escape
+        //    through a wall shows up as a centre outside the cavity.
+        for id in &ids {
+            assert!(bodies.iter().any(|b| b.id == *id), "body {id:?} escaped the drum");
+        }
+        for (i, b) in bodies.iter().enumerate() {
+            let p = b.position;
+            assert!(
+                p.cmpge(Vec3::splat(LO)).all() && p.cmple(Vec3::splat(HI)).all(),
+                "body {i} is at {p:?}, outside the cavity [{LO}, {HI}]"
+            );
+        }
+
+        // 2. Nothing diverges.
+        assert!(
+            worst_speed <= speed_bound,
+            "body {worst_speed_body} reached {worst_speed:.2} v/s at tick {worst_speed_tick}, \
+             past the {speed_bound:.2} that a free fall across the cavity allows with half \
+             again on top"
+        );
+
+        // 3. Nothing sinks.
+        assert!(
+            worst_sink <= sink_bound,
+            "{sunk_into} by {worst_sink:.4} at tick {worst_sink_tick}, past the {sink_bound:.4} \
+             that SLOP and the detection margin allow"
+        );
+    }
+
     /// Pressing a held body into brittle material breaks it, however slowly it
     /// is pressed.
     ///

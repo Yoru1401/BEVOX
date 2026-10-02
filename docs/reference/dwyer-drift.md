@@ -167,7 +167,7 @@ optimisation riding on it was never separated from the feature that motivated it
 shadow ray's origin to the voxel centre so a whole face is lit or shadowed
 together. **It already pays for a per-voxel result and collects it per pixel.**
 
-## F4. No stress scene, and no 2D prototype — **bad, and it has already cost**
+## F4. No stress scene, and no 2D prototype — **the stress scene is done; the 2D repo is not**
 
 **What differs.** He ends devlog 20 with "build the 2D version first — it's
 honestly what I should have done the first time", and in devlog 25 he does it:
@@ -185,9 +185,35 @@ tests would have caught it, because stability under load is not a scenario.
 **Two pieces, and Flori wants both** — my "the 2D half is no longer actionable"
 was overruled on 2026-09-30 and the shape settled on 2026-10-01.
 
-- **The stress scene** stays here: his tumbler, a fixture and three assertions,
-  no engine code, and `MAX_BODIES` does not constrain it because the cap is the
-  renderer's. The cheapest item on this page.
+- **The stress scene is done**, 2026-10-02:
+  `solver::tests::forty_nine_cubes_tumble_without_escaping_diverging_or_sinking`
+  — 49 glass 2x2x2 cubes in a closed hollow box with two-voxel walls, gravity
+  swept through a full turn in the xy plane over 800 ticks at constant
+  magnitude. **Gravity rotates because the drum cannot**: the static world is a
+  `Contree` with no kinematic bodies, so the test gates stacking stability
+  under a load direction that never stops changing, and **not** his tumbler —
+  a real drum also drags its contents tangentially through wall friction, and
+  this does not. Three assertions, as specified: nothing escapes (all 49 ids
+  survive, every centre inside the cavity), nothing diverges (no speed past
+  1.5x the 66.63 v/s a free fall across the cavity diagonal reaches), nothing
+  sinks (no overlap past `SLOP + BASE_MARGIN`, sampled every 16 ticks rather
+  than at the final frame alone). **It passed on arrival**: worst speed 45.56
+  v/s against a bound of 99.94, worst penetration 0.0259 against 0.1200, one
+  fracture at 244,950 against an 8-voxel threshold of 233,333, nothing asleep.
+  `#[ignore]`d at 99 seconds in a debug build; run it by name.
+
+  **What the scene revealed is how little it loads the solver.** Of four
+  deliberate breaks, only `BASE_MARGIN = 0` fails it (penetration 0.0268
+  against a bound that falls to 0.0200 with it). `MAX_PUSH` 20 → 2000 changes
+  the run **not at all, bit for bit** — the bias here only ever pushes at about
+  0.08 v/s, so the clamp is inert in this scene. `RELAXATION_ITERATIONS = 0`
+  passes (42.09 v/s, 0.0200). `BIAS = 0` passes at 0.1025, 85% of the way to
+  the bound and 4x the baseline. So the speed assertion has a **2.2x margin**
+  and is a regression tripwire rather than a sensitive instrument: a uniform
+  pile of equal-density cubes loads the solver far less than the 240:1 ratio
+  that bit, and a future calibration checked only against this scene would not
+  be checked hard. The scene was **not** bent until it was green — it was green
+  first, and the three assertions are the ones the ledger specified.
 - **The 2D simulation gets its own repository.** It is a *bench*, not a feature —
   somewhere detectors and solvers can be swapped and compared the way
   `rigid_pixels` is, which is the whole reason he built one. Keeping it out of
@@ -236,8 +262,10 @@ recorded, and the rebuilt fixture instead collapses through the floor at tick
 55 — an open defect, now characterised by the `#[ignore]`d
 `solver::tests::the_240_to_1_load_collapses_through_the_floor`, which passes
 today and is written to be inverted when the collapse is fixed. F4's stress
-scene is still wanted — not to measure the counts, which is done, but because
-what makes an extreme mass ratio collapse is still unmeasured.
+scene is now built and **does not settle this**: a uniform 49-cube pile passes
+every assertion with a 2.2x speed margin and survives `RELAXATION_ITERATIONS
+= 0` and `BIAS = 0`, so what makes an extreme mass ratio collapse is still
+unmeasured, and the tumbler is not the fixture that will measure it.
 
 ## F5. Shadows are recomputed every frame — **too early to say**
 
@@ -287,7 +315,8 @@ interesting open question in the engine.
 1. **F1**, which mirrors code that exists and is already measured on the other ray
    type.
 2. **F2**, his devlog 2, if F1 leaves the primary half worth attacking.
-3. **F4**, the cheapest real win: a fixture, no engine code.
+3. **F4's stress scene — done** 2026-10-02, a fixture and no engine code, as
+   predicted. Its 2D-repository half is not.
 4. **F3**, which needs a per-voxel store BEVOX does not have.
 5. **D's copy-region**, justified by detachment's speed rather than API
    completeness.
