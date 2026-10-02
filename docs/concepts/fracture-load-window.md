@@ -1,7 +1,7 @@
 ---
 type: Measurement
 title: 'The impulse threshold is a force threshold for everything it was built for'
-description: 'Fracture thresholds the accumulated contact impulse, which is what sees a slow crush. Measured over 64-512 Hz: the crush load is proportional to dt and so is a force wearing an impulse''s units, the "resting load" the strengths were calibrated against is a settling impact and not weight, a four-high glass stack destroys itself in the shipped build, and the crush ceiling puts every palette material except ice out of reach.'
+description: 'Fracture thresholds the accumulated contact impulse, which is what sees a slow crush. Measured: the crush load is proportional to dt and so is a force wearing an impulse''s units, the "resting load" the strengths were calibrated against is a settling impact and not weight, the landing peak owes nothing to the bias and the press is clamped at 100%, and past five cubes a stack''s landing is above the ceiling a grab can reach, so the window is empty and only the closing speed separates the regimes.'
 tags: [physics, fracture, dwyer, measurement, open-defect]
 generated: { by: claude-opus-5/claude-code, at: 2026-10-02T00:00:00Z }
 sources:
@@ -72,10 +72,20 @@ the held load that is a force.
 # The "resting load" is a landing, not weight
 
 **Every "resting load" number in this page's history is a settling impact.**
-The fixture starts its cubes 0.2 voxels above where they settle, and
-`peak[at]` includes the push-out velocity the solver's bias adds, so the
+The fixture starts its cubes 0.2 voxels above where they settle, so the
 measured maximum lands on **tick 5 at 64 Hz and tick 33 at 512** -- the same
 78 ms -- and is **17x the load the stack then holds**:
+
+This page used to add "and `peak[at]` includes the push-out velocity the
+solver's bias adds". **That is false, measured 2026-10-02** by
+`where_a_landing_peak_comes_from`: the bias is **0.0%** of the landing peak.
+`solve` takes the `BIAS` branch only when the separation is negative, and then
+uses `(separation + SLOP).min(0.0)`; the deepest separation anywhere in the
+landing is **-0.0135**, shallower than `SLOP`, so the term is identically
+zero for every contact of it. The landing peak is momentum and nothing else --
+the four floor contacts' end-of-substep impulses sum over the tick to
+**1,805,350** against a `sum m dv + m g dt` of **1,805,350**, to the last
+printed digit.
 
 | Stack of 4-voxel cubes, at 64 Hz | Landing maximum | Settled load |
 | --- | --- | --- |
@@ -99,6 +109,60 @@ instead break **nothing**, with a heaviest blow of 56,776.
 it at six -- and what it is is the *landing*, not the weight. Raising
 `GLASS_STRENGTH` is not the fix: 350,000 is already within 5% of the 365,906 a
 grab can press with at 64 Hz, and above 350,000 the crush gate is spent.
+
+## The window is empty, not narrow, measured 2026-10-02
+
+`how_the_landing_and_the_held_load_scale`, 1200 ticks a stack, unbreakable
+glass so nothing comes apart:
+
+| n | landing peak | at tick | held load | landing/held | `m g h n / 4` | late speed | sleeping |
+|---|---|---|---|---|---|---|---|
+| 1 | 126,129 | 4 | 10,231 | 12.3 | 6,131 | 0.0000 | 1 |
+| 2 | 246,227 | 5 | 14,177 | 17.4 | 12,263 | 0.0000 | 2 |
+| 3 | 331,306 | 5 | 18,798 | 17.6 | 18,394 | 0.0000 | 3 |
+| 4 | 356,751 | 5 | 39,308 | 9.1 | 24,525 | 0.0000 | 4 |
+| 6 | 391,195 | 5 | 118,320 | 3.3 | 36,788 | 2.0251 | 0 |
+| 8 | 414,166 | 5 | 176,647 | 2.3 | 49,050 | 4.1189 | 0 |
+
+**The six-high and eight-high landings, 391,195 and 414,166, are both above
+the 365,906 a saturated grab can reach.** So there is no value of
+`GLASS_STRENGTH` at which a six-high glass stack settles and a player can
+still crush glass. The window is not narrow at four cubes and gone at some
+future height -- past five cubes there is nothing to tune.
+
+The landing is **sub-linear**: 3.28x the peak for 8x the mass, about
+`n^0.55`, because a taller stack's cubes separate in flight and arrive over
+several ticks. The held load is roughly **linear** where it means anything --
+`m g h n / 4` is the fair share of weight at four corner contacts, and n = 3
+sits at 1.02x of it. **n = 6 and n = 8 never settle**: late speeds of 2.03 and
+4.12 v/s with the load swinging 59,686-133,272 and 86,716-217,383 and nothing
+asleep, so those two "held load" figures are not weight. That is a stacking
+defect, not a fracture one, and it is the first thing the ladder found that
+`the_240_to_1_load_collapses_through_the_floor` does not already name.
+
+## The blow is one contact's share of an indeterminate split
+
+Measured 2026-10-02 by `where_a_landing_peak_comes_from` and
+`what_the_sweep_counts_do_to_the_landing_peak`. The four floor contacts of a
+cube landing flat are geometrically symmetric, so a fair split of the 744,901
+that substep 0 of the four-high landing delivers would be 186,225 each, under
+`GLASS_STRENGTH`. The measured split is **356,751 / 158,882 / 113,937 /
+115,332**: 47.9% on whichever contact the sweep reaches first.
+
+**Not under-convergence.** Through `step_with`, balanced sweeps 1 -> 16 (the
+shipped counts untouched), the peak goes 356,751 -> 399,486 -> 459,965 ->
+580,848 -> 622,623 and the share stays 47.9% -> 47.5% -> 45.0% -> 45.4% ->
+44.8%. More sweeps make it **worse**, by killing more of the arriving velocity
+inside substep 0 rather than spreading it over four. A redundant four-point
+normal contact has no unique impulse distribution; sequential impulses pick an
+uneven one and keep it.
+
+So **a palette strength is compared against an arbitrary fraction of a load,
+and the fraction moves by 1.7x with body size alone** -- 77% of the clamp for
+a 2-voxel cube against 45% for an 8-voxel one, in the press. This is not the
+cause of the load window: the regimes are 1.06x apart however the impulse is
+counted. It is an accuracy bound on whatever threshold replaces this one, and
+nothing in the suite would notice it changing.
 
 ## The slow crush works on ice, and on nothing else
 
@@ -147,9 +211,22 @@ rate:
 | 512 | 95,801 | 93,512 | 98% |
 
 **At 256 Hz and above the press is simply clamped**, which is why the crush
-column tracks `dt`. At the shipped 64 Hz it reaches under half the clamp, so
-something else holds it there and the penetration-equilibrium reading survives
-*for 64 Hz only*. Both bounds move with the rate either way.
+column tracks `dt`.
+
+**And at 64 Hz it is clamped too. The penetration-equilibrium reading is
+dead.** Measured 2026-10-02 by `what_stops_the_press`: the grab's accumulated
+linear impulse is at **100.0% of its clamp from tick 40 onward**, flat to the
+end of a 400-tick press. What the "48%" measures is not the press -- it is
+**how the clamp divides among the contacts**. At equilibrium the four contacts
+against the world carry 1 / 363,231 / 283,028 / 144,664, summing to
+**790,924** against the grab's clamped **766,406** plus the body's own
+`m g h` of 24,525 -- seven parts in 790,000. The heaviest takes **47.4%**, and
+`766,406 x 0.477` is the 365,906.
+
+So the crush load is **the clamp divided by a contact count**, which is also
+why the mass table above is near-flat: a 2-voxel cube has fewer contacts to
+divide by and reaches 77% of the clamp, an 8-voxel cube has more and reaches
+45%.
 
 # What would actually fix this
 
@@ -159,12 +236,26 @@ Two candidates, neither done:
   took.** The steady load is exactly what resting weight is and exactly what a
   crush is not. This is the one that separates the three regimes the sweep
   found instead of pricing them against each other.
-- **Stop counting the bias's push-out in the blow.** It is what inflates a
-  landing's `peak[at]` to 17x the load the same contact then holds, and so what
-  makes a settling stack the binding constraint rather than an afterthought.
+- ~~**Stop counting the bias's push-out in the blow.**~~ **Withdrawn,
+  measured 2026-10-02: the bias is 0.0% of the landing peak** (see above), so
+  this would change it by nothing.
+- **Tell the regimes apart by the closing speed.** `approach[at]` is already
+  computed per contact and fracture does not read it. Measured 2026-10-02 by
+  `what_the_closing_speed_says_in_each_regime`: **-5.3639 v/s** for the
+  four-high landing, **+0.0003** for the same stack settled, **-0.0003** for a
+  saturated grab. Four orders of magnitude, against **1.06x** between the two
+  loads as impulses.
 
 Raising `GLASS_STRENGTH` is not a candidate: it walks into the crush ceiling
 from the other side.
+
+**And no way of counting the impulse separates the two, measured
+2026-10-02.** One substep's normal impulse summed over every floor contact is
+**744,901** for the four-high landing and **790,924** for the saturated press
+-- 1.06x apart, no better than the 1.03x their maxima already are. The two
+events deliver the same momentum per substep; only the closing speed differs.
+Summing a contact patch instead of taking its maximum therefore buys nothing,
+and the discriminator above is the only candidate left.
 
 # The window is too narrow for a size term, measured 2026-10-02
 

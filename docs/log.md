@@ -1,6 +1,22 @@
 # Update Log
 
 ## 2026-10-02
+* **Update**: the fracture load window, taken apart by measurement —
+  [The impulse threshold is a force threshold for everything it was built for](concepts/fracture-load-window.md).
+  Three of the page's claims were wrong and are now corrected. The bias
+  contributes **0.0%** of the landing peak, not the 17x inflation the page
+  blamed it for: the landing never penetrates deeper than 0.0135 and `SLOP` is
+  0.02, so the clamped term is identically zero. The slow crush is **not** held
+  below its limit by a penetration equilibrium; the grab sits at **100% of its
+  impulse clamp from tick 40**, and the 48% is how that clamp divides among the
+  four contacts. And the window is **empty, not narrow**: a six-high landing is
+  391,195 and an eight-high 414,166, both above the 365,906 a saturated grab
+  reaches, so past five cubes no strength satisfies both gates. What survives is
+  the closing speed as the discriminator — -5.3639 v/s landing against -0.0003
+  pressing, four orders of magnitude, while the two loads are **1.06x** apart as
+  impulses, which is why no way of counting the impulse can separate them. Five
+  `#[ignore]`d diagnostics and a `#[cfg(test)]` `solver::trace` are the
+  instrument; no engine behaviour and no constant moved.
 * **Creation**: `the_physics_runs_at_the_rate_the_tests_assume`, which pins the
   fact that keeps BEVOX's rate-dependence latent. `physics_system` sits in
   `FixedUpdate`, and inside that schedule Bevy rebinds the generic clock to

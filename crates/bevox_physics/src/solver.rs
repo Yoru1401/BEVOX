@@ -155,8 +155,10 @@ pub fn step_with(
             normal_velocity(&bodies[j.body], other, &j.contact)
         })
         .collect();
+    #[cfg(test)]
+    trace::layout(&joined, &approach);
 
-    for _ in 0..SUBSTEPS {
+    for _substep in 0..SUBSTEPS {
         for (b, &r) in bodies.iter_mut().zip(&radii).filter(|(b, _)| b.mass.mass > 0.0 && !b.asleep) {
             // Drag before the cap, and the cap almost never fires: what limits
             // a fall is a force, so the body eases into its terminal speed
@@ -180,6 +182,8 @@ pub fn step_with(
             }
         }
         for _ in 0..tuning.velocity_iterations {
+            #[cfg(test)]
+            trace::phase(_substep, 0);
             solve_joints(bodies, &mut joints, &links, inv_h, true);
             for ((j, impulse), peak) in joined.iter().zip(impulses.iter_mut()).zip(peak.iter_mut()) {
                 let (a, mut b) = pair_mut(bodies, j.body, j.other);
@@ -198,6 +202,8 @@ pub fn step_with(
         // motion reaches the body: relaxing it would stop the body dead every
         // substep, and letting go would throw nothing.
         for _ in 0..tuning.relaxation_iterations {
+            #[cfg(test)]
+            trace::phase(_substep, 1);
             solve_joints(bodies, &mut joints[..scene_joints], &links[..scene_joints], inv_h, false);
             for ((j, impulse), peak) in joined.iter().zip(impulses.iter_mut()).zip(peak.iter_mut()) {
                 let (a, mut b) = pair_mut(bodies, j.body, j.other);
@@ -610,6 +616,8 @@ fn solve(
 
     let total = (impulse.normal - (vn + bias) / k).max(0.0);
     let delta = total - impulse.normal;
+    #[cfg(test)]
+    trace::record(vn, k, separation, bias, impulse.normal, total);
     impulse.normal = total;
     push(a, b, c, c.normal * delta);
 }
@@ -687,6 +695,139 @@ fn integrate(body: &mut Body, h: f32) {
     let omega = world_inverse_inertia(body) * body.angular_momentum;
     let spin = Quat::from_xyzw(omega.x, omega.y, omega.z, 0.0) * body.orientation;
     body.orientation = (body.orientation + spin * (0.5 * h)).normalize();
+}
+
+/// **Diagnostic only.** What one `solve` call saw and what it did, recorded
+/// per contact, per substep, per pass, so a landing can be taken apart after
+/// the fact: how much of the impulse a contact ends a tick with came from the
+/// velocity it had to kill and how much from the push-out bias.
+///
+/// Inert unless a test arms it, compiled only in test builds, and read by the
+/// `#[ignore]`d diagnostics in `tests`. Nothing here is on any code path the
+/// game runs, and nothing here changes a number the solver computes: `record`
+/// is handed values `solve` had already computed for its own use.
+#[cfg(test)]
+pub(crate) mod trace {
+    use std::cell::RefCell;
+
+    /// One `solve` call on one contact.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Row {
+        pub substep: u32,
+        /// 0 for the biased velocity pass, 1 for the unbiased relax pass.
+        pub pass: u8,
+        /// Index into `joined`, i.e. which contact.
+        pub at: usize,
+        /// Closing speed along the normal, before this call. Negative closes.
+        pub vn: f32,
+        /// Effective mass along the normal: impulse per unit velocity change.
+        pub k: f32,
+        /// The gap now. Negative is penetration.
+        pub separation: f32,
+        /// The bias term `solve` used, as a velocity.
+        pub bias: f32,
+        pub before: f32,
+        pub after: f32,
+    }
+
+    impl Row {
+        /// The accumulated impulse this call would have reached with the bias
+        /// term zeroed and everything else held: what the velocity alone asks
+        /// for. The difference from `after` is the bias's share.
+        pub fn without_bias(&self) -> f32 {
+            (self.before - self.vn / self.k).max(0.0)
+        }
+    }
+
+    /// Which bodies a traced contact joins, and where it was at detection.
+    #[derive(Clone, Copy, Debug)]
+    #[allow(dead_code)]
+    pub(crate) struct Where {
+        pub body: usize,
+        /// `None` is the static world.
+        pub other: Option<usize>,
+        pub normal_y: f32,
+        /// The gap at detection, before any substep moved anything.
+        pub separation: f32,
+        /// `approach[at]`: the closing speed at detection. Negative closes.
+        pub approach: f32,
+    }
+
+    struct State {
+        rows: Vec<Row>,
+        layout: Vec<Where>,
+        substep: u32,
+        pass: u8,
+        at: usize,
+    }
+
+    thread_local! {
+        static TRACE: RefCell<Option<State>> = const { RefCell::new(None) };
+    }
+
+    /// Start recording, discarding anything held.
+    pub(crate) fn arm() {
+        TRACE.with(|t| {
+            *t.borrow_mut() =
+                Some(State { rows: Vec::new(), layout: Vec::new(), substep: 0, pass: 0, at: 0 })
+        });
+    }
+
+    /// Stop recording and take what was recorded: every `solve` call, and
+    /// which contact each index was.
+    pub(crate) fn take() -> (Vec<Row>, Vec<Where>) {
+        TRACE.with(|t| t.borrow_mut().take().map(|s| (s.rows, s.layout)).unwrap_or_default())
+    }
+
+    /// The contact list this tick, in the order `at` indexes it.
+    #[allow(private_interfaces)]
+    pub(crate) fn layout(joined: &[super::Joined], approach: &[f32]) {
+        TRACE.with(|t| {
+            if let Some(s) = t.borrow_mut().as_mut() {
+                s.layout = joined
+                    .iter()
+                    .zip(approach)
+                    .map(|(j, &approach)| Where {
+                        body: j.body,
+                        other: j.other,
+                        normal_y: j.contact.normal.y,
+                        separation: j.contact.separation,
+                        approach,
+                    })
+                    .collect();
+            }
+        });
+    }
+
+    /// Which substep and pass the calls that follow belong to. Resets the
+    /// contact counter, which is why it is called once per sweep.
+    pub(crate) fn phase(substep: u32, pass: u8) {
+        TRACE.with(|t| {
+            if let Some(s) = t.borrow_mut().as_mut() {
+                s.substep = substep;
+                s.pass = pass;
+                s.at = 0;
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record(
+        vn: f32,
+        k: f32,
+        separation: f32,
+        bias: f32,
+        before: f32,
+        after: f32,
+    ) {
+        TRACE.with(|t| {
+            if let Some(s) = t.borrow_mut().as_mut() {
+                let (substep, pass, at) = (s.substep, s.pass, s.at);
+                s.at += 1;
+                s.rows.push(Row { substep, pass, at, vn, k, separation, bias, before, after });
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -2186,9 +2327,14 @@ mod tests {
     /// was a closing speed. At 20 this fails by 61,134 fractures.
     ///
     /// **The 331,306 is the stack *landing*, not its weight.** It peaks at
-    /// tick 5: the cubes start 0.2 voxels above where they settle, and
-    /// `peak[at]` counts the push-out velocity the bias adds. The load the
-    /// stack then holds is 18,798, seventeen times less. See
+    /// tick 5, which is where a 0.2-voxel fall arrives; the load the stack
+    /// then holds is 18,798, seventeen times less.
+    ///
+    /// **It is momentum, not the bias.** This used to say `peak[at]` counts
+    /// the push-out velocity the bias adds; measured 2026-10-02 by
+    /// `where_a_landing_peak_comes_from`, the bias is **0.0%** of it -- the
+    /// landing never penetrates deeper than 0.0135, shallower than `SLOP`, so
+    /// the clamped term is identically zero. See
     /// `what_the_tick_rate_does_to_the_blow` and
     /// `docs/concepts/fracture-load-window.md`.
     ///
@@ -3180,12 +3326,15 @@ mod tests {
     /// at their settled heights do not break, which this test prints.
     ///
     /// **It is expected to fail until the rule separates a steady load from a
-    /// newly-taken one**, which is the fix the concept page names -- or until
-    /// the blow stops counting the bias's push-out, which is what inflates a
-    /// landing's `peak[at]` over the momentum it exchanges. Raising
-    /// `GLASS_STRENGTH` is neither: 350,000 is already within 5% of the
-    /// 365,906 a grab can press with, so buying headroom here spends the crush
-    /// gate.
+    /// newly-taken one**, which is the fix the concept page names. The second
+    /// candidate it used to name -- stop counting the bias's push-out -- is
+    /// withdrawn: measured 2026-10-02 by `where_a_landing_peak_comes_from`,
+    /// the bias is 0.0% of this peak and the blow is momentum the tick's own
+    /// `sum m dv + m g dt` accounts for exactly. Raising `GLASS_STRENGTH` is
+    /// not it either: 350,000 is already within 5% of the 365,906 a grab can
+    /// press with, and `how_the_landing_and_the_held_load_scale` measures a
+    /// six-high landing at 391,195 and an eight-high at 414,166, both *above*
+    /// that ceiling -- so past five cubes no strength satisfies both gates.
     ///
     /// `#[ignore]`d for the same reason as
     /// `the_240_to_1_load_collapses_through_the_floor`: it is a record of a
@@ -3264,5 +3413,518 @@ mod tests {
             crate::fixtures::GLASS_STRENGTH
         );
         assert_eq!(bodies.len(), 4, "the stack came apart");
+    }
+
+    // ---------------------------------------------------------------------
+    // Diagnostics for `docs/concepts/fracture-load-window.md`. All
+    // `#[ignore]`d: they print, they assert nothing, and they exist to take
+    // the landing transient and the crush ceiling apart. They read
+    // `solver::trace`, which is compiled only in test builds and is inert
+    // until one of them arms it.
+    // ---------------------------------------------------------------------
+
+    /// How much momentum a stack landing from the fixtures' 0.2 voxels can
+    /// deliver, against what `peak[at]` reports.
+    ///
+    /// The accumulated normal impulse at a contact is reset to nothing by no
+    /// one inside a tick, but it is *re-applied* from scratch every substep:
+    /// `warm_start` pushes the stored value and `solve` then drives the total
+    /// to whatever cancels the normal velocity. So the value a contact holds
+    /// at the end of a substep is exactly the momentum that contact delivered
+    /// in that substep, and the sum over a body's contacts over the substeps
+    /// of a tick is the momentum the tick gave it. That identity is what makes
+    /// `peak[at]` comparable with `m dv` at all, and this prints both.
+    ///
+    /// The unbreakable twin of glass, so fracture cannot hand impulse back and
+    /// perturb the very landing being measured.
+    #[test]
+    #[ignore]
+    fn where_a_landing_peak_comes_from() {
+        let unbreakable = MaterialId(7);
+        let materials = materials();
+        let world = slab_of(64, 0..8, unbreakable);
+        let field = DistanceField::build(&world);
+        let h = DT / SUBSTEPS as f32;
+
+        for n in [3usize, 4] {
+            let mut bodies: Vec<Body> = (0..n)
+                .map(|i| {
+                    placed(
+                        cube_of(4, 4, unbreakable),
+                        Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0),
+                        Quat::IDENTITY,
+                    )
+                })
+                .collect();
+            let m = bodies[0].mass.mass;
+            let total_mass = m * n as f32;
+
+            // Worst case the geometry allows: a free fall through the whole
+            // 0.2 voxels, with nothing detected early and nothing bled off.
+            let v_free = (2.0 * -GRAVITY.y * 0.2).sqrt();
+
+            let mut best: Option<(u32, f32, Vec<Vec3>, Vec<Vec3>, Vec<trace::Row>, Vec<trace::Where>)> =
+                None;
+            for tick in 1..=40u32 {
+                let before: Vec<Vec3> = bodies.iter().map(|b| b.velocity).collect();
+                trace::arm();
+                let out =
+                    step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut []);
+                let (rows, layout) = trace::take();
+                let after: Vec<Vec3> = bodies.iter().map(|b| b.velocity).collect();
+                if best.as_ref().is_none_or(|b| out.peak_impulse > b.1) {
+                    best = Some((tick, out.peak_impulse, before, after, rows, layout));
+                }
+            }
+            let (tick, peak, before, after, rows, layout) = best.unwrap();
+
+            // What the floor actually took this tick, by conservation: every
+            // body's change in momentum, plus the weight gravity added over
+            // the tick, is what the contacts removed.
+            let dp: f32 = before
+                .iter()
+                .zip(&after)
+                .map(|(b, a)| m * (a.y - b.y))
+                .sum::<f32>()
+                - total_mass * GRAVITY.y * DT;
+            let arriving: f32 = before.iter().map(|v| m * -v.y.min(0.0)).sum();
+
+            println!("\n==== {n}-high stack, peak tick {tick} ====");
+            println!("  mass each {m:.0}, total {total_mass:.0}, substep h = {h:.6} s");
+            println!(
+                "  arrival speeds before the tick: {:?}",
+                before.iter().map(|v| (v.y * 1000.0).round() / 1000.0).collect::<Vec<_>>()
+            );
+            println!(
+                "  free-fall bound on a 0.2-voxel drop: {v_free:.4} v/s, so the whole stack \
+                 carries at most m v = {:.0}",
+                total_mass * v_free
+            );
+            println!("  momentum actually arriving (sum m |v_down|): {arriving:.0}");
+            println!("  momentum the contacts removed this tick (sum m dv + m g dt): {dp:.0}");
+            println!("  peak[at] reported: {peak:.0}  ({:.2}x the tick's whole exchange)", peak / dp);
+
+            // Floor contacts only: `other` is the world and the normal points up.
+            let on_floor = |i: usize| layout[i].other.is_none() && layout[i].normal_y > 0.5;
+            let floor_contacts = (0..layout.len()).filter(|&i| on_floor(i)).count();
+            println!(
+                "  contacts this tick: {} total, {floor_contacts} of them body-0-on-floor",
+                layout.len()
+            );
+
+            println!("  per substep, end-of-substep accumulated impulse on the floor contacts:");
+            for s in 0..SUBSTEPS {
+                let end: Vec<&trace::Row> =
+                    rows.iter().filter(|r| r.substep == s && r.pass == 1 && on_floor(r.at)).collect();
+                let sum: f32 = end.iter().map(|r| r.after).sum();
+                let max = end.iter().map(|r| r.after).fold(0.0f32, f32::max);
+                let bias_free: f32 = end.iter().map(|r| r.without_bias()).sum();
+                let depth = end.iter().map(|r| r.separation).fold(f32::INFINITY, f32::min);
+                println!(
+                    "    substep {s}: sum {sum:>12.0}  max {max:>12.0}  (bias-free sum \
+                     {bias_free:>12.0})  deepest separation {depth:>8.4}"
+                );
+            }
+
+            println!("  the single call that set the peak, and its neighbours in that sweep:");
+            let worst = rows
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.after.total_cmp(&b.1.after))
+                .map(|(i, _)| i)
+                .unwrap();
+            let w = rows[worst];
+            for r in rows.iter().filter(|r| r.substep == w.substep && r.pass == w.pass) {
+                println!(
+                    "    at {:>3} {:>6} s{} p{}  vn {:>10.4}  1/k {:>10.0}  sep {:>8.4}  bias \
+                     {:>9.4}  before {:>12.0}  after {:>12.0}  bias-free {:>12.0}",
+                    r.at,
+                    match layout[r.at].other {
+                        None => "world",
+                        Some(_) => "body",
+                    },
+                    r.substep,
+                    r.pass,
+                    r.vn,
+                    1.0 / r.k,
+                    r.separation,
+                    r.bias,
+                    r.before,
+                    r.after,
+                    r.without_bias(),
+                );
+            }
+            println!(
+                "  the peak call itself: bias {:.4} v/s, so of {:.0} the bias explains {:.0} \
+                 ({:.1}%) and the closing velocity {:.0}",
+                w.bias,
+                w.after,
+                w.after - w.without_bias(),
+                100.0 * (w.after - w.without_bias()) / w.after,
+                w.without_bias(),
+            );
+        }
+    }
+
+    /// Landing transient against held load, for stacks of 1 to 8.
+    ///
+    /// Held load is the last tick's `peak_impulse` after 1200 ticks, which is
+    /// what `what_the_tick_rate_does_to_the_blow` calls `rest settled`.
+    /// Unbreakable glass again, so a stack that would come apart does not.
+    #[test]
+    #[ignore]
+    fn how_the_landing_and_the_held_load_scale() {
+        let unbreakable = MaterialId(7);
+        let materials = materials();
+        let world = slab_of(64, 0..8, unbreakable);
+        let field = DistanceField::build(&world);
+        println!(
+            "\n   n |  landing peak | at tick |   held load | landing/held | landing/n | held/n \
+             | m g h n / 4 | late min | late max | late speed | sleeping"
+        );
+        for n in [1usize, 2, 3, 4, 6, 8] {
+            let mut bodies: Vec<Body> = (0..n)
+                .map(|i| {
+                    placed(
+                        cube_of(4, 4, unbreakable),
+                        Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0),
+                        Quat::IDENTITY,
+                    )
+                })
+                .collect();
+            let (mut peak, mut at, mut held) = (0.0f32, 0u32, 0.0f32);
+            let (mut late_max, mut late_min, mut late_speed) = (0.0f32, f32::INFINITY, 0.0f32);
+            for tick in 1..=1200u32 {
+                let out =
+                    step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut []);
+                if out.peak_impulse > peak {
+                    peak = out.peak_impulse;
+                    at = tick;
+                }
+                if out.peak_impulse > 0.0 {
+                    held = out.peak_impulse;
+                }
+                // The last hundred ticks, so a stack that is still moving
+                // cannot be read as a held load: a settled one has a flat
+                // band and no speed left.
+                if tick > 1100 {
+                    late_max = late_max.max(out.peak_impulse);
+                    late_min = late_min.min(out.peak_impulse);
+                    late_speed = late_speed
+                        .max(bodies.iter().map(|b| b.velocity.length()).fold(0.0, f32::max));
+                }
+            }
+            // What weight alone asks of four corner contacts: the bottom
+            // contact holds the whole stack, one substep at a time.
+            let want = n as f32 * 64_000.0 * -GRAVITY.y * (DT / SUBSTEPS as f32) / 4.0;
+            println!(
+                "  {n:>2} | {peak:>13.0} | {at:>7} | {held:>11.0} | {:>12.1} | {:>9.0} | \
+                 {:>6.0} | {:>11.0} | {late_min:>9.0} | {late_max:>9.0} | {late_speed:>9.4} | \
+                 {:>5}",
+                peak / held,
+                peak / n as f32,
+                held / n as f32,
+                want,
+                bodies.iter().filter(|b| b.asleep).count(),
+            );
+        }
+    }
+
+    /// Whether the landing peak is a converged quantity.
+    ///
+    /// The four floor contacts of a cube landing flat are geometrically
+    /// symmetric, so a converged solve has to split the blow four ways. It
+    /// does not: the contact solved first takes about half. This runs the
+    /// same landing at four balanced sweep settings through `step_with`,
+    /// which is the existing public way to vary them, and prints the peak and
+    /// how unevenly the four shared it.
+    ///
+    /// Nothing here changes a shipped constant: `VELOCITY_ITERATIONS` and
+    /// `RELAXATION_ITERATIONS` stay 1 and this passes a `Tuning` instead.
+    #[test]
+    #[ignore]
+    fn what_the_sweep_counts_do_to_the_landing_peak() {
+        let unbreakable = MaterialId(7);
+        let materials = materials();
+        let world = slab_of(64, 0..8, unbreakable);
+        let field = DistanceField::build(&world);
+        println!(
+            "\n  sweeps | landing peak | share of its substep's floor total | floor total | split"
+        );
+        for iters in [1u32, 2, 4, 8, 16] {
+            let tuning = Tuning { velocity_iterations: iters, relaxation_iterations: iters };
+            let mut bodies: Vec<Body> = (0..4)
+                .map(|i| {
+                    placed(
+                        cube_of(4, 4, unbreakable),
+                        Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0),
+                        Quat::IDENTITY,
+                    )
+                })
+                .collect();
+            let mut best: Option<(f32, Vec<trace::Row>, Vec<trace::Where>)> = None;
+            for _ in 1..=40u32 {
+                trace::arm();
+                let out = step_with(
+                    &mut bodies,
+                    &world,
+                    &field,
+                    &materials,
+                    Air::VACUUM,
+                    DT,
+                    None,
+                    &mut [],
+                    tuning,
+                );
+                let (rows, layout) = trace::take();
+                if best.as_ref().is_none_or(|b| out.peak_impulse > b.0) {
+                    best = Some((out.peak_impulse, rows, layout));
+                }
+            }
+            let (peak, rows, layout) = best.unwrap();
+            // The substep and sweep the peak was set in, then the floor
+            // contacts as that sweep left them.
+            let w = rows.iter().copied().max_by(|a, b| a.after.total_cmp(&b.after)).unwrap();
+            let mut share: Vec<f32> = Vec::new();
+            let mut seen = std::collections::HashMap::new();
+            for r in rows.iter().filter(|r| {
+                r.substep == w.substep && layout[r.at].other.is_none() && layout[r.at].normal_y > 0.5
+            }) {
+                seen.insert(r.at, r.after);
+            }
+            let mut keys: Vec<usize> = seen.keys().copied().collect();
+            keys.sort_unstable();
+            for k in keys {
+                share.push(seen[&k]);
+            }
+            let total: f32 = share.iter().sum();
+            println!(
+                "  {iters:>6} | {peak:>12.0} | {:>34.1}% | {total:>11.0} | {:?}",
+                100.0 * peak / total,
+                share.iter().map(|s| s.round() as i64).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// `approach[at]` in each of the three regimes, against the blow.
+    ///
+    /// The closing speed is already computed per contact and fracture does not
+    /// read it. Candidate (c) of the diagnosis turns on whether it separates a
+    /// landing from a lean, so this prints it for all three: a four-high stack
+    /// landing, the same stack after it has settled, and a saturated grab
+    /// pressing into the floor.
+    #[test]
+    #[ignore]
+    fn what_the_closing_speed_says_in_each_regime() {
+        let unbreakable = MaterialId(7);
+        let materials = materials();
+        let world = slab_of(64, 0..8, unbreakable);
+        let field = DistanceField::build(&world);
+
+        // What the contact carrying the heaviest blow was closing at.
+        let worst = |rows: &[trace::Row], layout: &[trace::Where]| -> (f32, f32, f32) {
+            let w = rows.iter().copied().max_by(|a, b| a.after.total_cmp(&b.after));
+            match w {
+                None => (0.0, 0.0, 0.0),
+                Some(w) => (
+                    w.after,
+                    layout[w.at].approach,
+                    layout.iter().map(|l| l.approach).fold(0.0f32, |m, a| m.max(-a)),
+                ),
+            }
+        };
+
+        println!("\n  regime | heaviest blow | its approach | fastest closing contact");
+        let mut bodies: Vec<Body> = (0..4)
+            .map(|i| {
+                placed(
+                    cube_of(4, 4, unbreakable),
+                    Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0),
+                    Quat::IDENTITY,
+                )
+            })
+            .collect();
+        let mut best = (0.0f32, 0.0f32, 0.0f32, 0u32);
+        for tick in 1..=1200u32 {
+            trace::arm();
+            step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut []);
+            let (rows, layout) = trace::take();
+            let (blow, approach, fastest) = worst(&rows, &layout);
+            if blow > best.0 {
+                best = (blow, approach, fastest, tick);
+            }
+            // The last tick before it sleeps is the held load: once asleep it
+            // has no contacts and nothing to report.
+            if tick == 1200 || bodies.iter().all(|b| b.asleep) {
+                println!(
+                    "  landing (tick {}) | {:>13.0} | {:>12.4} | {:>23.4}",
+                    best.3, best.0, best.1, best.2
+                );
+                println!(
+                    "  settled (tick {tick}) | {:>13.0} | {:>12.4} | {:>23.4}",
+                    blow, approach, fastest
+                );
+                break;
+            }
+        }
+
+        let centre = Vec3::new(32.0, 10.0, 32.0);
+        let mut bodies = vec![placed(cube_of(4, 4, unbreakable), centre, Quat::IDENTITY)];
+        assert!(recompute(&mut bodies[0], &materials));
+        let mut grab = Joint::grab(&bodies[0], centre);
+        let mut press = (0.0f32, 0.0f32, 0.0f32);
+        for tick in 0..400u32 {
+            grab.anchor_b = centre - Vec3::Y * (tick as f32 * 0.002);
+            trace::arm();
+            step(
+                &mut bodies,
+                &world,
+                &field,
+                &materials,
+                Air::VACUUM,
+                DT,
+                Some(&mut grab),
+                &mut [],
+            );
+            let (rows, layout) = trace::take();
+            let (blow, approach, fastest) = worst(&rows, &layout);
+            if blow > press.0 {
+                press = (blow, approach, fastest);
+            }
+        }
+        println!(
+            "  press            | {:>13.0} | {:>12.4} | {:>23.4}",
+            press.0, press.1, press.2
+        );
+    }
+
+    /// What holds the slow crush at 48% of the grab's own clamp.
+    ///
+    /// Prints, per tick, the grab's accumulated linear impulse against its
+    /// clamp, the contact's blow, how deep the body is in the floor, and the
+    /// bias the contact solve used -- the four quantities any of which could
+    /// be the binding one. Unbreakable floor, so the press runs to the end.
+    #[test]
+    #[ignore]
+    fn what_stops_the_press() {
+        let unbreakable = MaterialId(7);
+        let materials = materials();
+        let world = slab_of(64, 0..8, unbreakable);
+        let field = DistanceField::build(&world);
+        let centre = Vec3::new(32.0, 10.0, 32.0);
+        let mut bodies = vec![placed(cube_of(4, 4, unbreakable), centre, Quat::IDENTITY)];
+        assert!(recompute(&mut bodies[0], &materials));
+        let mut grab = Joint::grab(&bodies[0], centre);
+        let inv_h = SUBSTEPS as f32 / DT;
+        let clamp = crate::GRAB_MAX_FORCE / inv_h;
+        let m = bodies[0].mass.mass;
+        println!(
+            "\n  grab impulse clamp = GRAB_MAX_FORCE / inv_h = {clamp:.0}; body mass {m:.0}; \
+             MAX_PUSH {} v/s is worth {:.0} of impulse on this mass",
+            MAX_PUSH,
+            MAX_PUSH * m
+        );
+        println!(
+            "  the depth at which the bias saturates MAX_PUSH: separation = {:.4}",
+            -MAX_PUSH / (BIAS * inv_h) - SLOP
+        );
+        println!(
+            "\n tick |   blow peak | grab carried |  % clamp | drift d.y |   body y | deepest \
+             sep | peak bias | peak vn | bias share"
+        );
+        let mut worst = 0.0f32;
+        for tick in 0..400u32 {
+            grab.anchor_b = centre - Vec3::Y * (tick as f32 * 0.002);
+            trace::arm();
+            let out = step(
+                &mut bodies,
+                &world,
+                &field,
+                &materials,
+                Air::VACUUM,
+                DT,
+                Some(&mut grab),
+                &mut [],
+            );
+            let (rows, _layout) = trace::take();
+            worst = worst.max(out.peak_impulse);
+            if tick % 40 == 0 || tick == 399 {
+                let w = rows
+                    .iter()
+                    .copied()
+                    .max_by(|a, b| a.after.total_cmp(&b.after))
+                    .unwrap_or(trace::Row {
+                        substep: 0,
+                        pass: 0,
+                        at: 0,
+                        vn: 0.0,
+                        k: 1.0,
+                        separation: 0.0,
+                        bias: 0.0,
+                        before: 0.0,
+                        after: 0.0,
+                    });
+                let deepest = rows.iter().map(|r| r.separation).fold(f32::INFINITY, f32::min);
+                println!(
+                    " {tick:>4} | {:>11.0} | {:>12.0} | {:>7.1}% | {:>9.4} | {:>8.4} | {:>11.4} \
+                     | {:>9.3} | {:>7.4} | {:>9.1}%",
+                    out.peak_impulse,
+                    grab.carried.linear.length(),
+                    100.0 * grab.carried.linear.length() / clamp,
+                    (bodies[0].position.y - grab.anchor_b.y),
+                    bodies[0].position.y,
+                    deepest,
+                    w.bias,
+                    w.vn,
+                    100.0 * (w.after - w.without_bias()) / w.after.max(1.0),
+                );
+            }
+        }
+        println!("  heaviest blow over the press: {worst:.0}");
+
+        // One more tick, kept apart so the split can be printed against the
+        // grab's own saturated impulse: what the clamp pulls with has to come
+        // back up through the contacts, and how it divides among them is the
+        // whole of why the blow is under half the clamp.
+        grab.anchor_b = centre - Vec3::Y * (400.0 * 0.002);
+        trace::arm();
+        step(
+            &mut bodies,
+            &world,
+            &field,
+            &materials,
+            Air::VACUUM,
+            DT,
+            Some(&mut grab),
+            &mut [],
+        );
+        let (rows, layout) = trace::take();
+        let last = SUBSTEPS - 1;
+        let end: Vec<&trace::Row> = rows
+            .iter()
+            .filter(|r| r.substep == last && r.pass == 1 && layout[r.at].other.is_none())
+            .collect();
+        let sum: f32 = end.iter().map(|r| r.after).sum();
+        println!(
+            "\n  the press at equilibrium, last substep, every contact against the world: \
+             {} of them",
+            end.len()
+        );
+        for r in end.iter() {
+            println!(
+                "    at {:>3}  sep {:>8.4}  after {:>12.0}  ({:>5.1}% of the contacts' total, \
+                 {:>5.1}% of the grab's clamp)",
+                r.at,
+                r.separation,
+                r.after,
+                100.0 * r.after / sum,
+                100.0 * r.after / clamp
+            );
+        }
+        println!(
+            "  contacts' total {sum:.0} against the grab's accumulated {:.0} and its clamp \
+             {clamp:.0}",
+            grab.carried.linear.length()
+        );
     }
 }
