@@ -131,9 +131,11 @@ behind a per-body base offset.
 
 `Material` gains physics columns as the milestones need them:
 
-- **`density`** (milestone 2). A `u16`, so `Material` can still derive `Eq`. A
-  voxel's mass is its material's density, in relative units: only ratios
-  between bodies, and against a joint's force later, are observable.
+- **`density`** (milestone 2). A `u16`, kept integral so density itself is
+  exact. A voxel's mass is its material's density, in relative units: only
+  ratios between bodies, and against a joint's force later, are observable.
+  (`Material` derived `Eq` when every column was integral; `strength` becoming
+  an `f32` on 2026-10-02 ended that, and it derives `PartialEq` alone.)
 - **`friction` and `restitution`** (milestone 3). Per material, so one body can
   slide or bounce differently depending on which of its voxels touches.
 
@@ -520,20 +522,31 @@ by **setting voxels empty**; and the code that already turns loose voxels into
 bodies makes the pieces -- `sculpt::split` for a body, `detach` for the world.
 Nothing plans a piece or copies a volume.
 
-- **The blow is a speed**: how fast the two surfaces met, read at detection
-  before the substeps destroy it, in voxels a second. It is never a *force* --
+> **Revised 2026-10-02.** The blow became the accumulated contact impulse and
+> `strength` an `f32`, so fracture no longer departs from Dwyer here. The three
+> claims this section used to make -- that the blow is a speed, that `strength`
+> is a `u16`, and that the closing speed is a departure -- were all stale.
+> `docs/concepts/fracture-load-window.md` has what the new units cost.
+
+- **The blow is the accumulated contact impulse**: the most the contact carried
+  at any point in the tick, in the solver's units. It is never a *force* --
   a collision resolves inside one tick, so a force threshold breaks differently
-  at 30 and 60 frames a second -- and this is the reason Dwyer gives for
+  at 30 and 60 frames a second -- and that is the reason Dwyer gives for
   thresholding the impulse.
-- **This is where fracture parts from him**, and the reason is units, not
-  taste. His thresholds are in N.s; `strength` here is a `u16`. An impulse
-  grows with the mass a contact holds up, so in these units a stack standing
-  still carries impulses in the hundreds of thousands against a glass strength
-  of 20, and his rule shatters anything for existing. A closing speed keeps his
-  rate-independence and adds symmetry: one collision has one blow, so both
-  sides are asked the same question. A blow divided by *a* mass has to pick one,
+- **It was a closing speed until 2026-10-02**, and what killed that is the
+  crush: the mouse grab drives toward a *velocity* goal with an enormous force
+  limit, so a grabbed body leaning on a wall closes at ~0 however hard it
+  presses, and a player could lean a rock through a window without marking it.
+  `a_slow_crush_breaks_what_it_presses` is that gate.
+- **The impulse is never divided by a mass.** A quotient has to pick a mass,
   and a contact's owner is whichever body the scene lists first -- which is how
-  the same collision came to read two ways.
+  the same collision came to read two ways. The raw impulse is symmetric and
+  needs no owner.
+- **`strength` is an `f32`**, widened from the original `u16` on 2026-10-02:
+  an impulse grows with the mass a contact holds up, so the thresholds a stack
+  standing still must survive run into the hundreds of thousands and do not fit
+  a `u16`. The window that leaves is narrow and is an open defect -- see
+  `docs/concepts/fracture-load-window.md`.
 - **Part of the impulse is handed back** to a contact that broke something, so a
   body carries on through what it broke instead of stopping at a hole nothing
   went through. The share is of the *peak* the contact carried: one that
@@ -642,10 +655,12 @@ Filled in by this design, **not** shown in his devlogs:
 - the centre-of-mass pivot formula;
 - `u16` density;
 - the tick rate;
-- **the blow as a closing speed rather than his contact impulse.** His
-  rate-independence argument is kept; `strength` being a `u16` is what his N.s
-  do not have to face, and a speed is symmetric where an impulse divided by a
-  mass has to choose one. See the Fracture section;
+- ~~the blow as a closing speed rather than his contact impulse~~ --
+  **no longer a departure, as of 2026-10-02.** The blow is his accumulated
+  contact impulse, and `strength` was widened from `u16` to `f32` to hold the
+  thresholds that needs. What remains ours is that the impulse is read raw
+  rather than divided by a mass, which keeps one collision to one blow. See the
+  Fracture section;
 - **rolling resistance at the contact.** Nothing in the devlogs has it. It is
   not a departure but a consequence of taking his rounded corners and edges: a
   lone voxel, or a one-voxel-wide stack, is *entirely* corner and edge and so

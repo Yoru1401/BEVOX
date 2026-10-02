@@ -58,8 +58,9 @@ step(dt):
                                                            nothing is ever
                                                            solved against a sleeper
     4  DETECT every contact                             -- once; substeps reuse these
-    5  read each contact's approach speed                  the bounce and the blow
-                                                           are both written against it
+    5  read each contact's approach speed                  the bounce is written
+                                                           against it; the blow is
+                                                           the impulse from step 9
 
   FOUR TIMES, with h = dt/4
     6  gravity, drag, and whatever gameplay pushed with

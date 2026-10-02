@@ -1,7 +1,7 @@
 ---
 type: Measurement
-title: 'The impulse threshold separates a crush from a lean by ten per cent'
-description: 'Fracture now thresholds the accumulated contact impulse, which is what sees a slow crush. Measured: a three-cube glass stack carries 331,306 at rest, a grab presses with 365,906, and the crush load saturates in mass while the resting load grows with the stack -- so past four cubes the ordering inverts and no single strength can serve both.'
+title: 'The impulse threshold is a force threshold for everything it was built for'
+description: 'Fracture thresholds the accumulated contact impulse, which is what sees a slow crush. Measured over 64-512 Hz: the crush load is proportional to dt and so is a force wearing an impulse''s units, the "resting load" the strengths were calibrated against is a settling impact and not weight, a four-high glass stack destroys itself in the shipped build, and the crush ceiling puts every palette material except ice out of reach.'
 tags: [physics, fracture, dwyer, measurement, open-defect]
 generated: { by: claude-opus-5/claude-code, at: 2026-10-02T00:00:00Z }
 sources:
@@ -16,74 +16,160 @@ sources:
 # The headline
 
 **The blow is the accumulated contact impulse, not the closing speed.** A
-closing speed cannot see a crush: the mouse grab is a joint with a
-1.962e8 force limit driving toward a *velocity* goal, so a grabbed body leaning
-on something presses with up to that force while the contact holds both
-surfaces still. The approach speed is then **under 0.011 voxels a second**
-however hard the press, and a player could lean a rock through a window without
-marking it. `a_slow_crush_breaks_what_it_presses` is that gate.
+closing speed cannot see a crush: the mouse grab is a joint with a 1.962e8
+force limit driving toward a *velocity* goal, so a grabbed body leaning on
+something presses hard while the contact holds both surfaces still. The
+approach speed is then under 0.011 voxels a second however hard the press, and
+a player could lean a rock through a window without marking it.
+`a_slow_crush_breaks_what_it_presses` is that gate.
 
-Dwyer's argument against a *force* is kept intact — a collision resolves inside
-one tick, so the force it reports scales with the tick rate and the impulse it
-exchanges does not. The blow is never divided by a mass either: a contact
-belongs to whichever body the scene lists first, so a quotient would read one
-collision two ways.
+**And for a crush, that impulse is a force threshold in an impulse's units.**
+Measured over four tick rates on 2026-10-02: the crush load is proportional to
+`dt`, so the one case this rule exists for is rate-dependent, which is the
+property Dwyer's argument for the impulse rejects. Dwyer's argument still holds
+for a *collision* -- the slam columns below are flat.
 
-# What the units cost, measured 2026-10-02
+# The rate sweep, measured 2026-10-02
 
-An impulse grows with the mass a contact holds up, and warm starting seeds each
-tick's impulse from the last, so **a settled stack carries a large impulse for
-standing still**. Measured on the fixture glass (density 1000) in
-`resting_weight_breaks_nothing`'s scene, as the peak normal impulse any contact
-carried over 1200 ticks:
+`solver::tests::what_the_tick_rate_does_to_the_blow`, `#[ignore]`d. The same
+wall-clock duration at every rate, rates interleaved in one invocation with 64
+Hz repeated last as a determinism check, every material the unbreakable
+fixture so no measured load is perturbed by the scene coming apart.
 
-| Stack of 4-voxel cubes | Resting load |
-| --- | --- |
-| 1 | 126,129 |
-| 2 | 246,227 |
-| 3 | **331,306** |
-| 4 | 356,751 |
-| 6 | 391,195 |
+| Hz | rest max (at tick) | rest settled | `m g dt` control | crush peak | slam peak | slam sum | slam `m dv` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 64 | 331,306 (5) | 18,798 | 490,430 | 365,906 | 1,047,814 | 1,517,884 | 3,841,039 |
+| 128 | 311,196 (9) | 10,028 | 245,242 | 308,430 | 666,791 | 1,208,314 | 3,855,816 |
+| 256 | 322,637 (17) | 5,157 | 122,622 | 177,597 | 1,333,582 | 1,374,443 | 3,889,906 |
+| 512 | 294,375 (33) | 3,122 | 61,309 | 93,512 | 1,238,326 | 1,314,284 | 3,863,532 |
+| **64/512** | **1.13x** | **6.02x** | **8.00x** | **3.91x** | **0.85x** | **1.15x** | **0.99x** |
 
-Against that, a grab pressing a cube straight down into the floor, target
-creeping 0.002 voxels a tick:
+8.00x is exactly proportional to `dt`; 1.00x is rate-independent. The `m g dt`
+control is the bottom body's own delivered normal impulse, the quantity
+`a_body_at_rest_stays_at_rest` already pins at `m g dt`, and it lands on 8.00x
+to two decimals -- so the sweep can tell the two regimes apart.
 
-| Pressed body | Mass | Crush load |
+**Proportional to `dt`:** the settled resting load, and **the crush load**.
+**Flat:** the landing transient, the slam's `peak[at]`, the slam's blow summed
+over the ticks the detector spread it across, and the momentum the slam
+actually exchanged.
+
+## What that costs, at the shipped 350,000
+
+The crush load at 128 Hz is **308,430, below `GLASS_STRENGTH`**. So
+`a_slow_crush_breaks_what_it_presses` -- which runs only at `DT` = 1/64 s --
+**stops breaking anything the moment the tick rate doubles**, while the
+landing transient the strength is calibrated above does not move. The window
+does not merely narrow above 64 Hz; it closes.
+
+The slam columns are the other half of the result and they are good news: a
+collision's exchanged momentum is flat to 1.3% across a factor of eight in
+rate. `peak[at]` for a collision tracks it loosely (0.85x, and
+non-monotonically, because at a finer rate the detector sees the collision
+coming and spreads it over more ticks). The rule is sound for impacts. It is
+the held load that is a force.
+
+# The "resting load" is a landing, not weight
+
+**Every "resting load" number in this page's history is a settling impact.**
+The fixture starts its cubes 0.2 voxels above where they settle, and
+`peak[at]` includes the push-out velocity the solver's bias adds, so the
+measured maximum lands on **tick 5 at 64 Hz and tick 33 at 512** -- the same
+78 ms -- and is **17x the load the stack then holds**:
+
+| Stack of 4-voxel cubes, at 64 Hz | Landing maximum | Settled load |
+| --- | --- | --- |
+| 3 -- the gate's fixture | 331,306 | 18,798 |
+
+That is why the landing column is flat across the rates and the settled column
+halves: one is a collision and the other is weight. **`GLASS_STRENGTH` is
+calibrated against a landing on one side and a rate-dependent joint clamp on
+the other.** Neither of the two numbers it sits between is resting weight.
+
+# The open defects
+
+## A four-high glass stack destroys itself
+
+`a_four_high_glass_stack_stands`, `#[ignore]`d, **fails in the shipped build**:
+2 fractures, the first at **tick 5**, heaviest blow **356,751** against a
+strength of 350,000. The same four cubes started at their settled heights
+instead break **nothing**, with a heaviest blow of 56,776.
+
+**So the cliff is at four cubes, not "past four"** -- this page previously put
+it at six -- and what it is is the *landing*, not the weight. Raising
+`GLASS_STRENGTH` is not the fix: 350,000 is already within 5% of the 365,906 a
+grab can press with at 64 Hz, and above 350,000 the crush gate is spent.
+
+## The slow crush works on ice, and on nothing else
+
+The crush load **saturates** between about **3.4e5 and 5.9e5** -- near-flat in
+the pressed body's mass, and flat in how long and how far the target is driven
+(0.002 a tick for 400 ticks and for 1500 give the identical 365,906):
+
+| Pressed body, 64 Hz | Mass | Crush load |
 | --- | --- | --- |
 | 2-voxel cube | 8,000 | 588,636 |
-| 4-voxel cube | 64,000 | **365,906** |
+| 4-voxel cube | 64,000 | 365,906 |
 | 8-voxel cube | 512,000 | 343,399 |
 | 10-voxel cube | 1,000,000 | 395,677 |
 
-**The crush load saturates — it is near-flat in the pressed body's mass, and
-flat in how long and how far the target is driven** (0.002 a tick for 400 ticks
-and for 1500 give the identical 365,906). The press settles into a penetration
-equilibrium instead of running up to its force limit, so the contact never
-carries more than about 4e5 however much force is behind it.
+Against the demo palette: **ice is 350,000, brick is 729,167, stone is
+1,312,500, and `DEFAULT_STRENGTH` is 2,800,000.** A grab cannot reach any of
+them but ice.
 
-# The open defect
+**So the slow crush this whole rule change exists for works on ice and on
+nothing else.** Not on terrain, not on stone, not on brick. A player can lean
+a rock on a brick wall with 1.962e8 of force behind it for as long as they
+like and it will never mark.
 
-**The two bound each other at about 1.1x, and past four cubes the ordering
-inverts.** 391,195 for a six-high stack is already above the 365,906 a grab can
-press with, so **no single strength both survives a six-high glass stack and
-gives way under a slow crush.** `GLASS_STRENGTH` is 350,000 — the geometric
-middle of the binding pair 331,306 and 365,906, five per cent of headroom
-either way — and that fits only the fixtures the suite uses.
+And nothing checks that. `the_demo_palette_outlasts_a_resting_stack` asserts
+only a **floor** -- that no material is weaker than the load a stack already
+carries. There is no ceiling assertion, so **a material above the crush load
+is silently uncrushable** and the suite stays green.
 
-Two things would widen it, and neither is done: raise the impulse a contact can
-carry before the penetration equilibrium holds it, or read the load a contact
-has carried *steadily* apart from the load it just took. The second is the real
-answer, because the steady load is exactly what resting weight is and exactly
-what a crush is not.
+## Why the press stops where it does
 
-`DEFAULT_STRENGTH` has no such problem: 2.8e6 is where a 4-voxel stone cube
-(mass 64,000) arrives at about 150 voxels a second, measured from peaks of
-2.48e6 at 120 and 3.43e6 at 200, which keeps the meaning the closing-speed
-threshold had and leaves a factor of eight over the resting load.
+This page used to say the press "settles into a penetration equilibrium rather
+than running up to its force limit", comparing the measured 365,906 against
+"its 1.962e8 force limit". **That is an impulse against a force** -- the exact
+units confusion this change exists to fix.
+
+`joint.rs`'s `solve_linear` clamps the joint's *accumulated impulse*, not its
+force: `let limit = joint.max_force / inv_h`, with `inv_h = SUBSTEPS / dt`. So
+the real ceiling is `GRAB_MAX_FORCE * dt / SUBSTEPS`, and it moves with the
+rate:
+
+| Hz | clamp = `GRAB_MAX_FORCE dt / SUBSTEPS` | measured crush | fraction |
+| --- | --- | --- | --- |
+| 64 | 766,406 | 365,906 | 48% |
+| 128 | 383,203 | 308,430 | 81% |
+| 256 | 191,602 | 177,597 | 93% |
+| 512 | 95,801 | 93,512 | 98% |
+
+**At 256 Hz and above the press is simply clamped**, which is why the crush
+column tracks `dt`. At the shipped 64 Hz it reaches under half the clamp, so
+something else holds it there and the penetration-equilibrium reading survives
+*for 64 Hz only*. Both bounds move with the rate either way.
+
+# What would actually fix this
+
+Two candidates, neither done:
+
+- **Read the load a contact has carried *steadily* apart from the load it just
+  took.** The steady load is exactly what resting weight is and exactly what a
+  crush is not. This is the one that separates the three regimes the sweep
+  found instead of pricing them against each other.
+- **Stop counting the bias's push-out in the blow.** It is what inflates a
+  landing's `peak[at]` to 17x the load the same contact then holds, and so what
+  makes a settling stack the binding constraint rather than an afterthought.
+
+Raising `GLASS_STRENGTH` is not a candidate: it walks into the crush ceiling
+from the other side.
 
 # What an impulse means for the player
 
 `strength` is no longer a speed a material survives. **A bigger body breaks the
-same material at a lower speed**, because the impulse it carries scales with its
-mass. That is what an impulse threshold is, not a flaw in it, but every number
-on a palette now has to be read against a body.
+same material at a lower speed**, because the impulse it carries scales with
+its mass. That is what an impulse threshold is, not a flaw in it, but every
+number on a palette now has to be read against a body -- and, until the held
+load is separated out, against a tick rate.
