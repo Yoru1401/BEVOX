@@ -1,6 +1,22 @@
 # Update Log
 
 ## 2026-10-02
+* **Update**: a slow crush now breaks **stone** — the user-visible half of the
+  two-regime change, and the thing a crush could not do when one constant had to
+  serve both regimes. `CRUSH_STONE` is 76,640,000, the geometric middle of a
+  four-high stone stack's held force (62,164,992) and what a grab presses into
+  stone with (94,487,080): **1.23x each way, from a gap only 1.52x wide.**
+* **Blocked**: **brick and ice cannot be calibrated and stay `UNBREAKABLE`.**
+  Measured per material, four-high held force against press ceiling: stone
+  62,164,992 / 94,487,080 (1.52x), brick **142,913,184 / 95,169,968 — inverted**,
+  ice 43,003,908 / 116,325,592 (2.71x). Brick's floor sits *above* its ceiling, so
+  any crush reaching brick destroys a brick stack standing still. And **none of
+  the three stacks settle** — 0 of 4 asleep in every row — so these are not held
+  loads but swinging piles. **The stacking defect that keeps
+  `an_eight_high_glass_stack_stands` failing reaches the demo palette at four
+  cubes**, and a threshold calibrated against a diverging pile bakes the
+  divergence in. Stone's number is taken only because its gap survives the noise.
+
 * **Update**: the impact strengths rose, the ceiling having left them —
   [The impulse threshold is a force threshold for everything it was built for](concepts/fracture-load-window.md).
   `GLASS_STRENGTH` sat at **350,000** only to stay under the **365,906** a

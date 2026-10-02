@@ -141,15 +141,21 @@ pub(crate) fn demo_scene() -> (Contree, MaterialTable) {
 /// < stone is what the proportion is for.
 /// `the_demo_palette_outlasts_a_resting_stack` is the gate that was missing.
 pub(crate) fn palette() -> MaterialTable {
+    palette_with_crush(CRUSH_STONE, CRUSH_BRICK, CRUSH_ICE)
+}
+
+/// `palette`, with the crush column passed in, so a test can move one column
+/// without touching the other.
+fn palette_with_crush(stone: f32, brick: f32, ice: f32) -> MaterialTable {
     let mut materials = MaterialTable::new();
     materials
-        .push(Material { color: [140, 140, 150, 255], density: 2600, friction: 60, restitution: 5, strength: 1_875_000.0, crush: bevox_core::material::DEFAULT_CRUSH })
+        .push(Material { color: [140, 140, 150, 255], density: 2600, friction: 60, restitution: 5, strength: 1_875_000.0, crush: stone })
         .unwrap(); // 1: stone
     materials
-        .push(Material { color: [180, 90, 70, 255], density: 1900, friction: 70, restitution: 5, strength: 1_041_667.0, crush: bevox_core::material::DEFAULT_CRUSH })
+        .push(Material { color: [180, 90, 70, 255], density: 1900, friction: 70, restitution: 5, strength: 1_041_667.0, crush: brick })
         .unwrap(); // 2: brick
     materials
-        .push(Material { color: [170, 210, 235, 255], density: 900, friction: 4, restitution: 10, strength: 500_000.0, crush: bevox_core::material::DEFAULT_CRUSH })
+        .push(Material { color: [170, 210, 235, 255], density: 900, friction: 4, restitution: 10, strength: 500_000.0, crush: ice })
         .unwrap(); // 3: ice
     materials
         .push(Material {
@@ -158,11 +164,46 @@ pub(crate) fn palette() -> MaterialTable {
             friction: 80,
             restitution: 80,
             strength: bevox_core::material::UNBREAKABLE,
-            crush: bevox_core::material::DEFAULT_CRUSH,
+            // Rubber is the one material here unbreakable in both columns,
+            // which is what makes it the presser in `press_into`.
+            crush: bevox_core::material::UNBREAKABLE,
         })
         .unwrap(); // 4: rubber
     materials
 }
+
+/// The force that crushes the demo's stone, measured 2026-10-02 as the geometric
+/// middle of a four-high stone stack's held force (62,164,992) and what a mouse
+/// grab presses into stone with (94,487,080) -- 1.23x each way, from a gap only
+/// 1.52x wide.
+pub(crate) const CRUSH_STONE: f32 = 76_640_000.0;
+
+/// **Brick and ice cannot be calibrated yet, and this is a blocked item, not a
+/// choice.** Both stay `UNBREAKABLE`, so a slow crush does not reach them.
+///
+/// The measurement that blocks it, from
+/// `what_the_crush_column_must_sit_between`:
+///
+/// | | four-high held force | press ceiling | gap |
+/// |---|---|---|---|
+/// | stone | 62,164,992 | 94,487,080 | 1.52x |
+/// | brick | 142,913,184 | 95,169,968 | **0.67x -- inverted** |
+/// | ice | 43,003,908 | 116,325,592 | 2.71x |
+///
+/// Brick's floor sits *above* its ceiling: a four-high brick stack holds more
+/// than a grab can press with, so any crush that reaches brick destroys a brick
+/// stack standing still. And **none of the three stacks settle** -- 0 of 4
+/// asleep in every row -- so these are not held loads at all but swinging piles,
+/// which is the same stacking defect that keeps
+/// `an_eight_high_glass_stack_stands` ignored and failing.
+///
+/// A threshold calibrated against a diverging pile bakes the divergence in.
+/// Stone's number is taken only because its gap survives the noise; brick and
+/// ice wait for stacking. Re-run the diagnostic when it is fixed.
+pub(crate) const CRUSH_BRICK: f32 = f32::INFINITY;
+
+/// See `CRUSH_BRICK`: blocked on the same measurement.
+pub(crate) const CRUSH_ICE: f32 = f32::INFINITY;
 
 /// The terrain's material: stone, in the palette.
 const STONE: MaterialId = MaterialId(1);
@@ -407,6 +448,252 @@ mod tests {
             );
         }
     }
+    /// The tick the app runs at, and the rate every strength and crush in
+    /// this palette is calibrated at.
+    const DT: f32 = 1.0 / 64.0;
+
+    /// A slab of `material` filling y in 0..8, the floor a press leans on.
+    fn floor_of(material: MaterialId) -> Contree {
+        let mut dense = DenseVolume::new(64).unwrap();
+        for z in 0..64 {
+            for y in 0..8 {
+                for x in 0..64 {
+                    dense.set(UVec3::new(x, y, z), material);
+                }
+            }
+        }
+        dense.into_contree()
+    }
+
+    /// A four-voxel cube of `material` with its mass computed, centred at
+    /// `centre`.
+    ///
+    /// Mass is computed at the origin and the position set afterwards, which is
+    /// what `bevox_physics::fixtures::placed` does and the reason it matters:
+    /// `recompute` reads the volume to find the centre of mass, so computing it
+    /// at the final position leaves `com` offset by that position and the body
+    /// lands nowhere near where the caller asked. Doing it the other way round
+    /// put a four-high stack 2.2 voxels in the air and the pressed body
+    /// entirely out of contact, which made a first attempt at the measurement
+    /// below report a stack that broke at every crush and a press that broke at
+    /// none.
+    fn cube_of(material: MaterialId, centre: Vec3, materials: &MaterialTable) -> Body {
+        let mut voxels = Vec::new();
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    voxels.push((UVec3::new(x, y, z), material));
+                }
+            }
+        }
+        let mut body = Body::new(Contree::from_voxels(4, &voxels), Vec3::ZERO, Quat::IDENTITY);
+        assert!(recompute(&mut body, materials), "a pressed body must have mass");
+        body.position = centre;
+        body
+    }
+
+    /// A rubber body held by a grab and crept down into a `floor` of the demo
+    /// palette, for the same 6.25 seconds `bevox_physics`' own crush fixture
+    /// runs. Returns what broke and the fastest the body moved before anything
+    /// did.
+    ///
+    /// Rubber because it is the one material in this palette that is
+    /// unbreakable in **both** columns, so only the floor can give way and what
+    /// broke is never in question.
+    ///
+    /// The target creeps at a rate per *second*, so the press travels the same
+    /// distance in the same time whatever `DT` is.
+    fn press_into(floor: MaterialId, crush: f32) -> (Vec<bevox_physics::fracture::Fracture>, f32) {
+        /// The 6.25 seconds `bevox_physics`' crush fixture covers.
+        const SECONDS: f32 = 400.0 / 64.0;
+        /// 0.002 a tick at 64 Hz, as a rate per second.
+        const CREEP: f32 = 0.002 * 64.0;
+        /// Rubber: `UNBREAKABLE` in both columns.
+        const RUBBER: MaterialId = MaterialId(4);
+
+        let materials = palette_with_crush(crush, crush, crush);
+        let world = floor_of(floor);
+        let field = DistanceField::build(&world);
+        let centre = Vec3::new(32.0, 10.0, 32.0);
+        let mut bodies = vec![cube_of(RUBBER, centre, &materials)];
+        let mut grab = Joint::grab(&bodies[0], centre);
+
+        let mut broke = Vec::new();
+        let mut fastest = 0.0f32;
+        for tick in 0..(SECONDS / DT).round() as u32 {
+            grab.anchor_b = centre - Vec3::Y * (tick as f32 * DT * CREEP);
+            // Only while nothing has broken: the tick that breaks the floor
+            // hands impulse back and drops the body into the hole, which says
+            // nothing about how gently it was pressing.
+            if broke.is_empty() {
+                fastest = fastest.max(bodies[0].velocity.length());
+            }
+            let out = step(
+                &mut bodies,
+                &world,
+                &field,
+                &materials,
+                Air::VACUUM,
+                DT,
+                Some(&mut grab),
+                &mut [],
+            );
+            broke.extend(out.fractures);
+        }
+        (broke, fastest)
+    }
+
+    /// A four-high stack of `material`, settling onto a floor of itself, with
+    /// `crush` on every material. Returns what broke and how many of the four
+    /// ended asleep.
+    ///
+    /// Four cubes because that is the tallest glass stack `bevox_physics`
+    /// measures that actually *settles* — six and eight never do, and a
+    /// threshold calibrated against a diverging pile bakes the divergence in.
+    fn stack_of(material: MaterialId, crush: f32) -> (Vec<bevox_physics::fracture::Fracture>, usize) {
+        let materials = palette_with_crush(crush, crush, crush);
+        let world = floor_of(material);
+        let field = DistanceField::build(&world);
+        let mut bodies: Vec<Body> = (0..4)
+            .map(|i| {
+                cube_of(material, Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0), &materials)
+            })
+            .collect();
+        let mut broke = Vec::new();
+        for _ in 0..1200 {
+            let out = step(
+                &mut bodies,
+                &world,
+                &field,
+                &materials,
+                Air::VACUUM,
+                DT,
+                None,
+                &mut [],
+            );
+            broke.extend(out.fractures);
+        }
+        let asleep = bodies.iter().filter(|b| b.asleep).count();
+        (broke, asleep)
+    }
+
+    /// What the demo palette's crush column has to sit between, per material,
+    /// measured rather than extrapolated from the fixture glass.
+    ///
+    /// Prints two bounds for each of stone, brick and ice:
+    ///
+    /// - **The floor**, the largest crush a four-high stack of it still breaks
+    ///   under as it settles. The column must sit *above* this or the demo
+    ///   terrain crushes itself the moment a scene loads.
+    /// - **The ceiling**, the smallest crush a saturated grab pressing on it
+    ///   can no longer break. The column must sit *below* this or a lean does
+    ///   nothing, which is the whole defect `a_slow_crush_breaks_stone` exists
+    ///   to catch.
+    ///
+    /// Both by bisection on the boolean "did anything break", because the force
+    /// itself is only visible through `bevox_physics`' `#[cfg(test)]`
+    /// `solver::trace`, which this crate cannot reach. A boolean bisection is
+    /// the same measurement at one bit per step and it needs no instrument.
+    ///
+    /// `#[ignore]`d: it prints, asserts nothing, and takes about a minute.
+    #[test]
+    #[ignore]
+    fn what_the_palette_crush_column_has_to_sit_between() {
+        /// Halvings of a 1e10 bracket: 20 lands inside 0.01%.
+        const STEPS: u32 = 20;
+        let bisect = |breaks: &dyn Fn(f32) -> bool| -> f32 {
+            let (mut lo, mut hi) = (1.0f32, 1.0e10f32);
+            for _ in 0..STEPS {
+                let mid = (lo * hi).sqrt();
+                if breaks(mid) { lo = mid } else { hi = mid }
+            }
+            lo
+        };
+        println!(
+            "{:7} | {:>16} | {:>16} | {:>7}",
+            "mat", "stack floor", "press ceiling", "window"
+        );
+        for (name, id) in [("stone", STONE), ("brick", BRICK), ("ice", MaterialId(3))] {
+            // Both brackets must straddle a real transition, or a bisection
+            // reports an endpoint and it reads like a measurement. An
+            // uncrushable stack must not break -- if it does, it is breaking on
+            // the *impact* branch and the floor below is not about crush at
+            // all -- and a press must break something at a crush of 1.
+            assert!(
+                stack_of(id, f32::INFINITY).0.is_empty(),
+                "an uncrushable four-high {name} stack broke, so the floor below would be \
+                 measuring the impact branch"
+            );
+            assert!(
+                !press_into(id, 1.0).0.is_empty(),
+                "a press did not break {name} at a crush of 1, so the ceiling below would be \
+                 measuring whether the press touches at all"
+            );
+            let floor = bisect(&|c| !stack_of(id, c).0.is_empty());
+            let ceiling = bisect(&|c| !press_into(id, c).0.is_empty());
+            println!(
+                "{name:7} | {floor:16.0} | {ceiling:16.0} | {:7.2}x",
+                ceiling / floor
+            );
+            let (_, asleep) = stack_of(id, f32::INFINITY);
+            println!("        (a four-high {name} stack: {asleep} of 4 asleep)");
+        }
+    }
+
+    /// A player leaning a held body on the demo palette's **stone** crushes it.
+    ///
+    /// The user-visible half of the two-regime split. `bevox_physics`'
+    /// `a_slow_crush_breaks_what_it_presses` proves the rule against the
+    /// fixture glass, which no player ever meets; this proves it against the
+    /// material the demo terrain is actually made of.
+    ///
+    /// It could not pass before the regime split and it is worth being precise
+    /// about why. A crush used to be judged as an impulse against `strength`,
+    /// and a press delivers a measured 365,906 as an impulse at 64 Hz. Stone's
+    /// strength is 1,875,000 — five times that — so no press could ever mark
+    /// it, and the only material in this palette a lean could break was ice.
+    /// The press is now judged as a **force** against `crush`, which is a
+    /// separate column calibrated against what a press actually delivers.
+    #[test]
+    /// Throwaway: prints the forces the crush column must sit between.
+    ///
+    /// A crush of 1.0 breaks everything, so every `Fracture::blow` on the held
+    /// branch is the force that contact carried.
+    #[test]
+    #[ignore]
+    fn what_the_crush_column_must_sit_between() {
+        for (name, id) in [("stone", STONE), ("brick", MaterialId(2)), ("ice", MaterialId(3))] {
+            let (pressed, _) = press_into(id, 1.0);
+            let ceiling = pressed.iter().map(|f| f.blow).fold(0.0f32, f32::max);
+            let (stacked, asleep) = stack_of(id, 1.0);
+            let floor = stacked.iter().map(|f| f.blow).fold(0.0f32, f32::max);
+            println!(
+                "{name}: four-high held floor {floor:.0} ({asleep} asleep), press ceiling \
+                 {ceiling:.0}, ratio {:.2}x, geometric middle {:.0}",
+                ceiling / floor.max(1.0),
+                (floor.max(1.0) * ceiling).sqrt(),
+            );
+        }
+    }
+
+    #[test]
+    fn a_slow_crush_breaks_stone() {
+        let (broke, fastest) = press_into(STONE, CRUSH_STONE);
+        assert!(
+            fastest < 1.0,
+            "the body moved at {fastest} voxels a second before anything broke, so this is an \
+             impact and not a crush"
+        );
+        assert!(
+            !broke.is_empty(),
+            "a body pressed into the demo palette's stone with up to {} of force, at under \
+             {fastest:.3} voxels a second, broke nothing. Stone's `crush` is {} — is the \
+             palette's crush column still `UNBREAKABLE`?",
+            bevox_physics::GRAB_MAX_FORCE,
+            palette().get(STONE).crush,
+        );
+    }
+
     use bevox_physics::Air;
     use bevox_core::distance_field::DistanceField;
     use bevox_physics::joint::follow;
