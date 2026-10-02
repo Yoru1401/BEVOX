@@ -87,6 +87,9 @@ it stopped being the blow.
 | **Impact** | `-approach[at] >= IMPACT_SPEED` | `peak[at]`, the accumulated normal impulse | `Material::strength`, as today |
 | **Held** | otherwise | `peak[at] * SUBSTEPS / dt`, a force | `Material::crush`, new |
 
+(Implemented as `settled[at] * SUBSTEPS / dt`, the **end-of-tick** impulse — see
+"What the measurement corrected".)
+
 `IMPACT_SPEED` sits in the 0.05–1 v/s region, where the diagnosis found nothing
 at all: the two events are 5.36 and 0.0003, so any value in four orders of
 magnitude separates them. **It is not a tuned constant** and the spec says so —
@@ -97,13 +100,44 @@ both.
 
 # What it fixes, and what it does not
 
-**Fixes.** The window disappears — the two regimes stop competing for one number,
-so the landing is judged as an impact against the strength it already has, and a
-press is judged as a force. The four-cube landing stops breaking. The crush
-reaches stone and brick instead of ice alone, because a force threshold is not
-confined to a clamp-divided-by-contact-count ceiling. And the rate-dependence
-goes with it: `peak * SUBSTEPS / dt` is flat in `dt` where `peak` was not, so
-`a_slow_crush_breaks_what_it_presses` stops depending on a 64 Hz tick.
+**Fixes.** The window **widens from 1.10x to 4.21x**. It does not disappear,
+and this paragraph said it did until the implementation measured it — see "What
+the measurement corrected" below. The two regimes stop competing for one
+number, so the landing is judged as an impact against the strength it already
+has, and a press is judged as a force. The four-cube landing stops breaking.
+The crush reaches stone and brick instead of ice alone, because a force
+threshold is not confined to a clamp-divided-by-contact-count ceiling. And
+`a_slow_crush_breaks_what_it_presses` stops depending on a 64 Hz tick, which is
+the gate the whole design exists for.
+
+# What the measurement corrected
+
+Three claims above were wrong, found by Task 2 rather than predicted.
+
+**The window widens, it does not disappear: 1.10x → 4.21x.** The held branch
+needs a floor and a ceiling of its own, and they are 23,909,612 (a four-cube
+stack's largest end-of-tick held force at 64 Hz) and 93,669,600 (a saturated
+press at its weakest rate). `GLASS_CRUSH` is 47,300,000, the geometric middle —
+1.98x either way. Four times the room an impulse threshold had, and not
+unbounded.
+
+**The held blow is the *end-of-tick* accumulated impulse, not `peak`.** `peak`
+is the maximum inside the tick, and in the ticks after a landing the closing
+speed has decayed below `IMPACT_SPEED` while `peak` still holds the landing —
+measured 54x apart at tick 5 of a three-cube stack. Reading `peak` made a
+landing the floor every crush threshold had to clear, and left the eight-cube
+case *unsatisfiable*: 102,018,240, above the press ceiling. Reading `settled`
+brings it to 76,269,120. For a press the two agree to 0.002%, because a press
+holds steadily.
+
+**The rate-dependence is reduced, not removed.** `settled * SUBSTEPS / dt` is
+not flat in `dt`: the three-cube floor climbs 4.7x from 64 Hz to 512, against
+6.8x for `peak` and a ceiling that moves 2.04x. So the crush column is
+calibrated at 64 Hz and at no other rate, and nothing in the suite says so.
+The structural reason is the next section of
+[the fracture load window](/concepts/fracture-load-window.md): **a stack's
+internal contacts are stationary during a landing**, so the discriminator is
+blind to them and the floor is a landing however the impulse is read.
 
 **Does not fix, and must not be claimed to.**
 

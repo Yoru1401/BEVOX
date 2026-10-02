@@ -16,8 +16,8 @@
 //!
 //! | Regime | Test | Blow | Threshold |
 //! |---|---|---|---|
-//! | **Impact** | `-approach[at] >= IMPACT_SPEED` | `peak[at]`, the accumulated normal impulse | `Material::strength` |
-//! | **Held** | otherwise | `peak[at] * SUBSTEPS / dt`, a force | `Material::crush` |
+//! | **Impact** | `-approach[at] >= IMPACT_SPEED` | `peak[at]`, the largest accumulated normal impulse inside the tick | `Material::strength` |
+//! | **Held** | otherwise | `settled[at] * SUBSTEPS / dt`, a force | `Material::crush` |
 //!
 //! For an **impact** the threshold is **never on force**, and that part is
 //! his. A collision resolves inside one tick, so the same collision at 10 ms a
@@ -76,14 +76,22 @@
 //!   records it and fails. Raising `GLASS_STRENGTH` is now possible, because it
 //!   only ever sat at 350,000 to stay under a 365,906 crush ceiling that no
 //!   longer exists -- but it has not been done.
-//! - **The held branch's own floor is a landing too, and it is not flat in the
-//!   rate.** `GLASS_CRUSH` is calibrated between what a press delivers as a
-//!   force and what a stack's largest *held* contact carries, and that second
-//!   number peaks at the landing tick at every rate -- 35,823,928 at 64 Hz
-//!   against 243,368,384 at 512 for three cubes. The ceiling only doubles over
-//!   the same range. So the held threshold is calibrated at 64 Hz and is not
+//! - **The held branch's own floor is a landing too, and no reading of the
+//!   impulse fixes it.** `GLASS_CRUSH` is calibrated between what a press
+//!   delivers as a force and what a stack's largest *held* contact carries,
+//!   and that second number peaks at **tick 4** on the contact between the
+//!   bottom two cubes -- at a closing speed of exactly **+0.0000**, because
+//!   they are falling together while that contact transmits the whole landing.
+//!   No value of `IMPACT_SPEED` reaches zero, so this is a limit of the
+//!   discriminator rather than of any constant. The floor is 22,236,248 at 64
+//!   Hz against the 4,812,288 a settled three-cube stack actually holds, 4.6x
+//!   up. The held branch reading `settled` rather than `peak` cuts the tick-5
+//!   residue by 54x and leaves tick 4 alone.
+//! - **And the floor still climbs with the rate** -- 4.7x from 64 Hz to 512
+//!   (22,236,248 -> 105,040,984) against 6.8x by `peak`, while the ceiling
+//!   moves 2.04x. So the held threshold is calibrated at 64 Hz and is not
 //!   calibrated at 512, and the suite would not say so. `GLASS_CRUSH` has the
-//!   table.
+//!   table and `docs/concepts/fracture-load-window.md` the section.
 //!
 //! `what_the_tick_rate_does_to_the_blow` is the impulse sweep,
 //! `what_a_press_delivers_as_a_force` the force one, and

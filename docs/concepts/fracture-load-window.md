@@ -1,7 +1,7 @@
 ---
 type: Measurement
 title: 'The impulse threshold is a force threshold for everything it was built for'
-description: 'Fracture thresholds the accumulated contact impulse, which is what sees a slow crush. Measured: the crush load is proportional to dt and so is a force wearing an impulse''s units, the "resting load" the strengths were calibrated against is a settling impact and not weight, the landing peak owes nothing to the bias and the press is clamped at 100%, and past five cubes a stack''s landing is above the ceiling a grab can reach, so the window is empty and only the closing speed separates the regimes.'
+description: 'Fracture thresholds the accumulated contact impulse, which is what sees a slow crush. Measured: the crush load is proportional to dt and so is a force wearing an impulse''s units, the "resting load" the strengths were calibrated against is a settling impact and not weight, the landing peak owes nothing to the bias and the press is clamped at 100%, and past five cubes a stack''s landing is above the ceiling a grab can reach -- so only the closing speed separates the regimes. Splitting them on it widened the window from 1.10x to 4.21x rather than closing it, and the reason it cannot close is that a stack''s internal contacts are stationary during a landing, at a closing speed of exactly zero, which no discriminator can reach.'
 tags: [physics, fracture, dwyer, measurement, open-defect]
 generated: { by: claude-opus-5/claude-code, at: 2026-10-02T00:00:00Z }
 sources:
@@ -130,6 +130,12 @@ the 365,906 a saturated grab can reach.** So there is no value of
 still crush glass. The window is not narrow at four cubes and gone at some
 future height -- past five cubes there is nothing to tune.
 
+**This is what the regime split fixed**, and it is the one claim on this page
+that a later change made obsolete rather than merely corrected: `strength` and
+`crush` no longer compete, so the landing series above binds `strength` alone
+and the grab's ceiling binds `crush` alone. See "The window widened to 4.21x"
+below for what the new pair of bounds is and what is still wrong with them.
+
 The landing is **sub-linear**: 3.28x the peak for 8x the mass, about
 `n^0.55`, because a taller stack's cubes separate in flight and arrive over
 several ticks. The held load is roughly **linear** where it means anything --
@@ -227,6 +233,89 @@ So the crush load is **the clamp divided by a contact count**, which is also
 why the mass table above is near-flat: a 2-voxel cube has fewer contacts to
 divide by and reaches 77% of the clamp, an 8-voxel cube has more and reaches
 45%.
+
+# A stack's internal contacts are stationary during a landing
+
+**Measured 2026-10-02 by `what_a_press_delivers_as_a_force`, and it is the
+measured limit of the design this page's discriminator became.** Not a
+calibration problem and not a defect in any constant: a bound on what a
+closing-speed test can see at all.
+
+The largest *held* force a glass stack ever produces lands on **tick 4**, and
+it sits on the contact between the bottom cube and the one above it, at a
+closing speed of **exactly `+0.0000`**:
+
+```
+  3-high at 64 Hz:
+    tick |     by `peak` |  by `settled` | ratio | where the settled maximum sits
+       4 |      22236248 |      22236248 |   1.0 | b0<->b1 n.y-1.00 appr+0.0000
+       5 |      35823928 |        658681 |  54.4 | b1<->b2 n.y-1.00 appr+2.0985
+       6 |      11489077 |      11489077 |   1.0 | b0<->world n.y+1.00 appr+0.3932
+```
+
+**That contact is not misclassified. It genuinely is not closing.** The two
+cubes are falling together, so their relative normal velocity is nil, while the
+contact transmits the whole landing because the cube above it is decelerating.
+The closing speed catches the contact with the **floor** — -5.3639 for a
+four-high landing — and is blind to the contacts *inside* the falling stack.
+
+Two consequences, both measured:
+
+- **No value of `IMPACT_SPEED` reaches zero**, so no choice of the
+  discriminator classifies that contact as an impact. The regime split is
+  right about the floor contact and cannot be right about this one.
+- **No per-tick impulse reading separates it from a press** either. `peak` and
+  `settled` are *equal* at tick 4 — ratio 1.0 — because the impulse only grows
+  through that tick and ends at its maximum. Reading the end-of-tick value
+  removes the residue from tick 5, where the two are 54x apart, and leaves tick
+  4 untouched.
+
+So the held floor is **4.6x above weight** whatever is read: 22,236,248 against
+the 4,812,288 a settled three-cube stack actually holds (18,798 as an impulse
+at 64 Hz). And it is **not flat in the tick rate** — 22,236,248 at 64 Hz
+against 105,040,984 at 512, a climb of 4.7x, against a ceiling that moves
+2.04x. A landing is what is still being measured, and a landing is a collision.
+
+**What would actually fix it** is a quantity that is steady over *several*
+ticks rather than one — the first candidate in the next section, which this
+change did not implement. A contact that has carried the same load for twenty
+ticks is a press; one carrying it for the first is a landing, whichever tick it
+peaks in. Nothing in the engine keeps that history today.
+
+# The window widened to 4.21x; it did not close
+
+**The regime split did not make the window disappear, which the design spec
+claimed and this page is where the correction belongs.** It went from **1.10x
+to 4.21x** — four times the room, and still bounded.
+
+| | floor | ceiling | window |
+|---|---|---|---|
+| one impulse threshold, `GLASS_STRENGTH` | 331,306 (a three-cube landing) | 365,906 (a saturated grab at 64 Hz) | **1.10x** |
+| the held threshold, `GLASS_CRUSH` | 22,236,248 (a three-cube stack's held force at 64 Hz) | 93,669,600 (the press as a force, at its weakest rate) | **4.21x** |
+
+`GLASS_CRUSH` is 47,300,000, the geometric middle of the **four**-cube floor of
+23,909,612 and that ceiling: 1.98x either way, and 2.13x above the three-cube
+floor.
+
+**What still bounds it**, in order of how much:
+
+1. **The floor is a landing, not weight** — the section above. 4.6x of the
+   window is spent on a contact the discriminator cannot see.
+2. **The floor climbs 4.7x with the tick rate and the ceiling only 2.04x**, so
+   above about 128 Hz the window closes again. The crush column is calibrated
+   at 64 Hz and nowhere else.
+3. **The eight-cube stack is outside it entirely**, at 76,269,120 — above
+   `GLASS_CRUSH` and 1.23x under the ceiling. It is excluded deliberately,
+   because it **never settles**: 0 of 8 asleep, late speed 4.12 v/s, held load
+   swinging 86,716–217,383. Calibrating a constant against a configuration that
+   is already diverging bakes a known defect into the constant, and the
+   non-settling is a stacking defect this change does not fix.
+   `an_eight_high_glass_stack_stands` records the cost, `#[ignore]`d and
+   failing, and is expected to pass with no fracture constant moved the day
+   stacking is fixed.
+4. **The blow is still one contact's share of an indeterminate split**, moving
+   1.7x with body size alone — unchanged by any of this, and an accuracy bound
+   on both thresholds.
 
 # What would actually fix this
 

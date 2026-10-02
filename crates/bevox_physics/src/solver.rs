@@ -226,6 +226,14 @@ pub fn step_with(
     for (j, &impulse) in joined.iter().zip(&impulses) {
         bodies[j.body].warm.insert(j.contact.key, impulse);
     }
+    // What each contact *ended* the tick carrying, taken here because this is
+    // where it is still true: `apply_restitution` below mutates `impulses`,
+    // and a bounce is a one-off that is deliberately not fed back into
+    // `warm`. So this is the warm-start value exactly, and it is what the
+    // held branch of `break_what_gave_way` reads -- `peak` is the maximum
+    // inside the tick and says what a contact spiked to, this says what it
+    // settled at.
+    let settled: Vec<f32> = impulses.iter().map(|i| i.normal).collect();
 
     // Spent: a force acts for the tick it was given for, and no longer. A
     // caller that wants to keep pushing says so every tick.
@@ -235,7 +243,8 @@ pub fn step_with(
     }
 
     apply_restitution(bodies, &joined, &mut impulses, &approach);
-    let fractures = break_what_gave_way(bodies, tree, materials, &joined, &peak, &approach, dt);
+    let fractures =
+        break_what_gave_way(bodies, tree, materials, &joined, &peak, &settled, &approach, dt);
     sleep::settle(bodies, &joints, &radii, dt);
     StepOutcome {
         rebuild: bodies.len() != before,
@@ -252,19 +261,36 @@ pub fn step_with(
 ///
 /// **Two regimes, told apart by `approach[at]`, the closing speed at
 /// detection.** At or above `fracture::IMPACT_SPEED` the contact is an impact:
-/// the blow is `peak[at]`, the accumulated normal impulse, read against
-/// `Material::strength`, which is what this has always done. Below it the
-/// contact is *held*, the blow is that impulse as a force -- `peak[at] *
-/// SUBSTEPS / dt` -- and it is read against `Material::crush`. The regimes are
-/// 1.06x apart in impulse and 18,000x apart in closing speed, so the speed is
-/// the only thing that can sort them; `fracture::IMPACT_SPEED` has the
-/// measurements and `docs/concepts/fracture-load-window.md` the tables.
+/// the blow is `peak[at]`, the largest accumulated normal impulse reached
+/// inside the tick, read against `Material::strength` -- what this has always
+/// done. Below it the contact is *held*: the blow is `settled[at] * SUBSTEPS /
+/// dt`, a force, read against `Material::crush`.
+///
+/// **The two branches read different impulses, and that is deliberate.** An
+/// impact is a spike and `peak` is what a spike is. A held contact is a load
+/// carried tick after tick, and `settled` -- what the contact ended the tick
+/// with, the value warm starting seeds the next tick from -- is what carrying
+/// means. Measured 2026-10-02 by `what_a_press_delivers_as_a_force`: for a
+/// press the two agree to 0.002%, because it holds steadily; for the tick
+/// after a landing they differ by **54x**, because the closing speed has
+/// decayed below `IMPACT_SPEED` by then while `peak` still holds the landing.
+/// Reading `peak` here made a landing the floor a crush threshold had to
+/// clear.
+///
+/// The regimes are 1.06x apart in impulse and 18,000x apart in closing speed,
+/// so the speed is the only thing that can sort them.
+/// `fracture::IMPACT_SPEED` has the measurements,
+/// `fixtures::GLASS_CRUSH` the calibration, and
+/// `docs/concepts/fracture-load-window.md` both the tables and the measured
+/// limit of this design -- a stack's internal contacts are stationary during a
+/// landing, so the closing speed cannot see them at all.
 fn break_what_gave_way(
     bodies: &mut [Body],
     tree: &Contree,
     materials: &MaterialTable,
     joined: &[Joined],
     peak: &[f32],
+    settled: &[f32],
     approach: &[f32],
     dt: f32,
 ) -> Vec<Fracture> {
@@ -307,7 +333,9 @@ fn break_what_gave_way(
         // something leans on it with up to `GRAB_MAX_FORCE` while the contact
         // holds both surfaces still: the closing speed is ~0 however hard the
         // press, and the *impulse* is force x dt and so moves with the tick --
-        // measured 365,906 at 64 Hz against 93,512 at 512.
+        // measured 365,906 at 64 Hz against 93,512 at 512. It reads `settled`
+        // rather than `peak` because a held load is what a contact carries
+        // tick after tick, not what it spiked to inside one.
         // `a_slow_crush_breaks_what_it_presses_at_any_rate` is that gate, and
         // for this contact his own stated preference, the maximum force a
         // material takes, is the thing that is actually available.
@@ -322,9 +350,11 @@ fn break_what_gave_way(
         let held = held_contact(approach[at], dt);
         // `Fracture::blow` is what the rule read and `Fracture::impulse` what
         // the contact carried. Until this branch existed they were the same
-        // number; on a held contact they are a force and an impulse, which is
-        // the parting the field's own documentation reserved.
-        let blow = if held { peak[at] * SUBSTEPS as f32 / dt } else { peak[at] };
+        // number; on a held contact they are a force and an impulse, and the
+        // force is derived from a different impulse besides, which is the
+        // parting the field's own documentation reserved.
+        let blow =
+            if held { settled[at] * SUBSTEPS as f32 / dt } else { peak[at] };
         // The struck voxel's material. On the impact branch the threshold is
         // scaled by the size of the body that holds the voxel -- `voxels` is
         // that body's whole volume, not anything local to the impact, and it
@@ -892,7 +922,9 @@ mod tests {
     use crate::GRAVITY;
     use crate::TERMINAL_SPEED;
     use crate::mass::recompute;
-    use crate::fixtures::{cube, cube_of, energy, materials, placed, slab, slab_of};
+    use crate::fixtures::{
+        cube, cube_of, energy, materials, materials_with_glass_crush, placed, slab, slab_of,
+    };
     use crate::joint::{Angular, Joint, Linear};
     use glam::EulerRot;
 
@@ -2426,6 +2458,65 @@ mod tests {
         );
     }
 
+    /// The held branch reads what a contact **settled** at, not what it spiked
+    /// to inside the tick. This is the gate that says so.
+    ///
+    /// `resting_weight_breaks_nothing` cannot say it: measured 2026-10-02, a
+    /// three-cube stack's largest held force at 64 Hz is 22,236,248 by
+    /// `settled` and 35,823,928 by `peak`, and `GLASS_CRUSH` is 47,300,000 --
+    /// above **both**, so that gate passes either way. Restoring `peak` on the
+    /// held branch failed nothing in the whole suite, which is what this
+    /// exists to fix.
+    ///
+    /// So the threshold is put deliberately **between** the two measured
+    /// floors, at 30,000,000. A landing then breaks the stack if and only if
+    /// the held branch is reading the peak. Nothing else about the scene
+    /// changes, and `GLASS_STRENGTH` is untouched -- the landing transient of
+    /// 331,306 is under it, so the impact branch has nothing to say here and
+    /// the only rule that can fire is the crush.
+    ///
+    /// **Why it matters beyond the arithmetic.** In the ticks after a landing
+    /// the closing speed has decayed below `fracture::IMPACT_SPEED`, so the
+    /// contact is classified held while `peak` still holds the landing --
+    /// measured 54x apart at tick 5. Reading `peak` there makes a *landing*
+    /// the floor every crush threshold has to clear, and a landing is three
+    /// times less flat in the tick rate than a held load is.
+    #[test]
+    fn a_landing_is_not_read_as_a_held_load() {
+        /// Between the 22,236,248 a three-cube stack settles at and the
+        /// 35,823,928 it peaks at, both at 64 Hz.
+        const BETWEEN: f32 = 30_000_000.0;
+        let materials = materials_with_glass_crush(BETWEEN);
+        let world = slab_of(64, 0..8, MaterialId(6));
+        let field = DistanceField::build(&world);
+        let mut bodies: Vec<Body> = (0..3)
+            .map(|i| {
+                placed(
+                    cube_of(4, 4, MaterialId(6)),
+                    Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0),
+                    Quat::IDENTITY,
+                )
+            })
+            .collect();
+
+        let mut broke = Vec::new();
+        for _ in 0..1200 {
+            let out =
+                step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut []);
+            broke.extend(out.fractures);
+        }
+        assert!(
+            broke.is_empty(),
+            "a three-cube glass stack landing broke {} things against a crush of {BETWEEN:.0}, \
+             the heaviest blow {:.0}. That threshold is above the 22,236,248 the stack settles \
+             at and below the 35,823,928 it peaks at, so the held branch is reading the peak \
+             and a landing is being judged as a press",
+            broke.len(),
+            broke.iter().map(|f| f.blow).fold(0.0f32, f32::max),
+        );
+        assert_eq!(bodies.len(), 3, "the stack came apart");
+    }
+
     /// **The tumbler**: forty-nine cubes in a closed hollow box, with gravity
     /// swept through a full turn.
     ///
@@ -2750,7 +2841,7 @@ mod tests {
 
     /// Which regime a contact is in, and the guard on `dt`.
     ///
-    /// **The guard is the half worth a test.** The held blow is `peak[at] *
+    /// **The guard is the half worth a test.** The held blow is `settled[at] *
     /// SUBSTEPS / dt`, so a dead tick makes it an infinity or a NaN, and
     /// `over_crush` throws both away -- which would stop a held contact being
     /// judged *at all*, silently, for as long as a caller passed a dead `dt`.
@@ -3829,6 +3920,96 @@ mod tests {
             crate::fixtures::GLASS_STRENGTH
         );
         assert_eq!(bodies.len(), 4, "the stack came apart");
+    }
+
+    /// **A characterisation of a *stacking* defect, not a fracture one.** An
+    /// eight-high glass stack crushes itself, and the number it fails on comes
+    /// from a pile that is still diverging rather than from any load a
+    /// material should be calibrated against.
+    ///
+    /// The spec for the two regimes lists "an eight-high stack lands without
+    /// breaking" as a gate, on the reasoning that the landing transient should
+    /// be judged as an impact at every height. It is -- the impact branch is
+    /// why `a_four_high_glass_stack_stands` is now only about `strength`. What
+    /// this fails on is the **held** branch: measured 2026-10-02 by
+    /// `what_a_press_delivers_as_a_force`, an eight-high stack's largest
+    /// end-of-tick held force at 64 Hz is **76,269,120**, against a
+    /// `GLASS_CRUSH` of 47,300,000 and a press ceiling of 93,669,600. So no
+    /// crush value clears this stack and still lets a grab crush glass with
+    /// better than 1.23x of margin.
+    ///
+    /// **And that figure is not a load.** The same measurement has 0 of the 8
+    /// bodies asleep after 1200 ticks, a late speed of 4.12 voxels a second,
+    /// and the held load swinging 86,716-217,383 as an impulse.
+    /// `how_the_landing_and_the_held_load_scale` recorded the same thing for
+    /// n = 6 and n = 8 and `docs/concepts/fracture-load-window.md` names it a
+    /// stacking defect, independent of fracture, which the fracture plan does
+    /// not fix. `GLASS_CRUSH` is therefore calibrated against the four-high
+    /// stack, which does settle, and the doc comment there argues why:
+    /// calibrating a constant against a configuration that is already
+    /// diverging bakes the defect into the constant.
+    ///
+    /// **So this gate does not belong to fracture and is expected to fail
+    /// until stacking is fixed.** The day eight cubes settle, this should pass
+    /// with no change to any fracture constant -- which is the prediction it
+    /// exists to record. `#[ignore]`d for the same reason as
+    /// `a_four_high_glass_stack_stands`: it is a record of a bug, not a gate
+    /// the suite should enforce.
+    #[test]
+    #[ignore]
+    fn an_eight_high_glass_stack_stands() {
+        let materials = materials();
+        let world = slab_of(64, 0..8, MaterialId(6));
+        let field = DistanceField::build(&world);
+        let mut bodies: Vec<Body> = (0..8)
+            .map(|i| {
+                placed(
+                    cube_of(4, 4, MaterialId(6)),
+                    Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0),
+                    Quat::IDENTITY,
+                )
+            })
+            .collect();
+
+        let mut broke = Vec::new();
+        let mut first = None;
+        for tick in 1..=1200u32 {
+            let out =
+                step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut []);
+            if first.is_none() && !out.fractures.is_empty() {
+                first = Some(tick);
+            }
+            broke.extend(out.fractures);
+        }
+
+        // Which branch broke it, which is the whole point of the record. A
+        // held blow is a force in the tens of millions; an impact blow is an
+        // impulse in the hundreds of thousands. They are three orders apart,
+        // so the heaviest of each says plainly which rule fired.
+        let heaviest = |f: &[Fracture]| f.iter().map(|f| f.blow).fold(0.0f32, f32::max);
+        let (held, impact): (Vec<_>, Vec<_>) =
+            broke.iter().copied().partition(|f| f.blow > crate::fixtures::GLASS_STRENGTH * 10.0);
+        println!(
+            "eight-high glass: {} fractures, first at tick {first:?}. {} by crush, heaviest \
+             force {:.0} against a `GLASS_CRUSH` of {}; {} by impact, heaviest impulse {:.0} \
+             against a `GLASS_STRENGTH` of {}. {} of 8 asleep, fastest body {:.4} v/s.",
+            broke.len(),
+            held.len(),
+            heaviest(&held),
+            crate::fixtures::GLASS_CRUSH,
+            impact.len(),
+            heaviest(&impact),
+            crate::fixtures::GLASS_STRENGTH,
+            bodies.iter().filter(|b| b.asleep).count(),
+            bodies.iter().map(|b| b.velocity.length()).fold(0.0f32, f32::max),
+        );
+        assert!(
+            broke.is_empty(),
+            "an eight-high glass stack broke {} things, {} of them by crush",
+            broke.len(),
+            held.len()
+        );
+        assert_eq!(bodies.len(), 8, "the stack came apart");
     }
 
     // ---------------------------------------------------------------------

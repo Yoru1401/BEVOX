@@ -63,7 +63,7 @@ body sags and drags and the grab cannot force anything through terrain.
 |---|---|---|
 | `BUDGET` | 20 000 | Voxels a detachment walk visits before giving up and calling the piece grounded. A cut into a mountainside must not walk the mountain. |
 | `fracture::SIZE_CAP` | 27 | Voxels past which a body stops counting as small. Its material's strength is scaled by `cbrt(min(voxels, SIZE_CAP) / SIZE_CAP)`, so a chip gives way under a load a sheet holds; the static world saturates it. |
-| `fracture::IMPACT_SPEED` | 0.1 | Closing speed, in voxels a second, at or above which a contact is an **impact** — blow `peak[at]`, threshold `strength` — and below which it is **held** — blow `peak[at] * SUBSTEPS / dt`, a force, threshold `crush`. Not tuned: a landing closes at 5.36 and a saturated grab at 0.0003, so anything from 0.001 to 1 sorts them alike. A discriminator, not a dial. |
+| `fracture::IMPACT_SPEED` | 0.1 | Closing speed, in voxels a second, at or above which a contact is an **impact** — blow `peak[at]`, the largest impulse inside the tick, threshold `strength` — and below which it is **held** — blow `settled[at] * SUBSTEPS / dt`, the end-of-tick impulse as a force, threshold `crush`. Not tuned: a landing closes at 5.36 and a saturated grab at 0.0003, so anything from 0.001 to 1 sorts them alike. A discriminator, not a dial — and blind to a stack's internal contacts, which close at exactly 0 during a landing. |
 
 A material's own `density`, `friction`, `restitution`, `strength` and `crush`
 are not here: they are in `bevox_core::material`, per material, and are read
