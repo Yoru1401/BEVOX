@@ -34,6 +34,14 @@ pub struct StepOutcome {
     /// Contacts that carried more than their material could take. The caller
     /// applies them: this crate knows nothing about the scene they belong to.
     pub fractures: Vec<Fracture>,
+    /// The largest blow any contact carried this tick -- the same `peak[at]`
+    /// the fracture threshold reads, before any strength is applied. Zero when
+    /// nothing touched.
+    ///
+    /// Reported because a strength is only meaningful against a measured load,
+    /// and the load is otherwise invisible from outside a tick:
+    /// `solver::tests::what_the_tick_rate_does_to_the_blow` is what reads it.
+    pub peak_impulse: f32,
 }
 
 /// A contact and the bodies it joins: the one it belongs to, and the one it is
@@ -223,7 +231,11 @@ pub fn step_with(
     apply_restitution(bodies, &joined, &mut impulses, &approach);
     let fractures = break_what_gave_way(bodies, tree, materials, &joined, &peak);
     sleep::settle(bodies, &joints, &radii, dt);
-    StepOutcome { rebuild: bodies.len() != before, fractures }
+    StepOutcome {
+        rebuild: bodies.len() != before,
+        fractures,
+        peak_impulse: peak.iter().copied().fold(0.0, f32::max),
+    }
 }
 
 /// Which contacts carried more than their material could take, and the impulse
@@ -271,11 +283,17 @@ fn break_what_gave_way(
         // `a_collision_breaks_the_same_things_whichever_body_is_listed_first`
         // holds against.
         let blow = peak[at];
-        // A contact that never carried anything is one the surfaces never
-        // reached: a speculative contact holds the full approach speed for the
-        // tick before they touch, and nothing has struck anything yet. The
-        // running total is no use here -- by the end of the tick a contact that
-        // did its work and let go is back at zero -- so this asks the peak.
+        // Inert for any positive strength, and kept for two smaller reasons.
+        //
+        // It used to carry the argument that a speculative contact which never
+        // touched must not be read as a blow. With the impulse that argument
+        // is `over_strength`'s and it holds there: `peak` is a running maximum
+        // from 0, so a contact that never touched gives exactly 0, which is
+        // past no positive strength. What is left is a *negative* strength,
+        // where `0 <= strength` is false and `over_strength` would report a
+        // break for a contact that never happened -- and the two material
+        // lookups and bounds checks below, which this skips for every
+        // speculative contact in the scene.
         if peak[at] <= 0.0 {
             continue;
         }
@@ -1877,12 +1895,18 @@ mod tests {
     ///
     /// The binding constraint on every strength in the table, because the blow
     /// is an impulse and an impulse grows with the mass a contact holds up:
-    /// warm starting seeds each tick from the last, so a settled stack carries
-    /// a large one while doing nothing at all. This stack's bottom contact
-    /// carries a measured 331,306, which is why `GLASS_STRENGTH` -- the
-    /// weakest material in the fixture table -- is 350,000 and not the 20 it
-    /// was when the blow was a closing speed. At 20 this fails by 61,134
-    /// fractures.
+    /// warm starting seeds each tick from the last, so a stack carries a large
+    /// one while doing nothing much. This stack's bottom contact reaches a
+    /// measured 331,306, which is why `GLASS_STRENGTH` -- the weakest material
+    /// in the fixture table -- is 350,000 and not the 20 it was when the blow
+    /// was a closing speed. At 20 this fails by 61,134 fractures.
+    ///
+    /// **The 331,306 is the stack *landing*, not its weight.** It peaks at
+    /// tick 5: the cubes start 0.2 voxels above where they settle, and
+    /// `peak[at]` counts the push-out velocity the bias adds. The load the
+    /// stack then holds is 18,798, seventeen times less. See
+    /// `what_the_tick_rate_does_to_the_blow` and
+    /// `docs/concepts/fracture-load-window.md`.
     ///
     /// Glass deliberately: the weakest material makes this the binding case.
     #[test]
@@ -2423,5 +2447,319 @@ mod tests {
             "the repeated (1,1) differs from the first by {:.1}%: this run is drift, its numbers may not be used",
             drift * 100.0
         );
+    }
+
+    /// **What the tick rate does to the blow.** Not a gate: it prints a table.
+    ///
+    /// The threshold `break_what_gave_way` reads is `peak[at]`, the largest
+    /// *accumulated* normal impulse a contact reached inside the tick. For a
+    /// collision that resolves inside one tick that is near enough the
+    /// momentum exchanged, which is rate-independent -- Dwyer's argument
+    /// against a force. For a load that is *held*, it is force x dt, and a
+    /// quantity proportional to `dt` halves at every doubling of the rate.
+    ///
+    /// Which of the two every column is, is the question. A column
+    /// proportional to `dt` falls by 8 from 64 Hz to 512; a rate-independent
+    /// one is flat. The same wall-clock duration is simulated at each rate,
+    /// not the same number of ticks, and the rates are interleaved within this
+    /// one invocation with 64 Hz repeated last, so the repeat is a determinism
+    /// check on the whole table rather than a number from an earlier run.
+    ///
+    /// Every material here is the unbreakable fixture (7), so nothing fractures
+    /// and no measured load is perturbed by the scene coming apart. It is glass
+    /// in every other respect -- same density, friction and restitution.
+    #[test]
+    #[ignore]
+    fn what_the_tick_rate_does_to_the_blow() {
+        // Same wall clock at every rate: the tick counts the earlier
+        // measurements used, divided by the 64 Hz they used them at.
+        const REST_SECONDS: f32 = 1200.0 / 64.0;
+        const CRUSH_SECONDS: f32 = 400.0 / 64.0;
+        const SLAM_SECONDS: f32 = 1.0 / 6.0;
+        /// The crush target creeps at a rate per *second*, not per tick:
+        /// 0.002 a tick at 64 Hz is an eighth of a voxel a second.
+        const CREEP: f32 = 0.002 * 64.0;
+        const SLAM_SPEED: f32 = 60.0;
+
+        let ticks = |seconds: f32, dt: f32| (seconds / dt).round() as u32;
+        let unbreakable = MaterialId(7);
+
+        // The three-cube stack of `resting_weight_breaks_nothing`, in the
+        // unbreakable material. Returns the largest blow any contact carried
+        // over the run, the last non-zero one (the settled load, after the
+        // drop from 10.2 has gone), and the normal impulse the bottom body's
+        // contacts deliver in a tick -- which is `m g dt` and is therefore a
+        // known-proportional-to-dt control column.
+        let resting = |dt: f32| -> (f32, u32, f32, f32) {
+            let materials = materials();
+            let world = slab_of(64, 0..8, unbreakable);
+            let field = DistanceField::build(&world);
+            let mut bodies: Vec<Body> = (0..3)
+                .map(|i| {
+                    placed(
+                        cube_of(4, 4, unbreakable),
+                        Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0),
+                        Quat::IDENTITY,
+                    )
+                })
+                .collect();
+            let (mut peak, mut at, mut settled) = (0.0f32, 0u32, 0.0f32);
+            for tick in 1..=ticks(REST_SECONDS, dt) {
+                let out =
+                    step(&mut bodies, &world, &field, &materials, Air::VACUUM, dt, None, &mut []);
+                assert!(out.fractures.is_empty(), "the unbreakable fixture broke");
+                if out.peak_impulse > peak {
+                    peak = out.peak_impulse;
+                    at = tick;
+                }
+                if out.peak_impulse > 0.0 {
+                    settled = out.peak_impulse;
+                }
+            }
+            assert_eq!(bodies.len(), 3, "the stack came apart");
+            // What the bottom body's contacts actually delivered, as
+            // `a_body_at_rest_stays_at_rest` reads it: the floor contacts plus
+            // the one to the cube above, so `m g dt` for the whole stack plus
+            // the two cubes above it. Summed in a fixed order -- `warm` is a
+            // hash map, and float addition is not associative, so iteration
+            // order would move the last bit between runs.
+            let mut carried: Vec<f32> = bodies[0].warm.values().map(|i| i.normal).collect();
+            carried.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let delivered: f32 = carried.iter().sum::<f32>() * SUBSTEPS as f32;
+            (peak, at, settled, delivered)
+        };
+
+        // `a_slow_crush_breaks_what_it_presses`, with the floor unbreakable so
+        // the press runs the whole way instead of stopping at the first break.
+        let crush = |dt: f32| -> f32 {
+            let materials = materials();
+            let world = slab_of(64, 0..8, unbreakable);
+            let field = DistanceField::build(&world);
+            let centre = Vec3::new(32.0, 10.0, 32.0);
+            let mut bodies = vec![placed(cube_of(4, 4, unbreakable), centre, Quat::IDENTITY)];
+            assert!(recompute(&mut bodies[0], &materials));
+            let mut grab = Joint::grab(&bodies[0], centre);
+            let mut peak = 0.0f32;
+            for tick in 0..ticks(CRUSH_SECONDS, dt) {
+                grab.anchor_b = centre - Vec3::Y * (tick as f32 * dt * CREEP);
+                let out = step(
+                    &mut bodies,
+                    &world,
+                    &field,
+                    &materials,
+                    Air::VACUUM,
+                    dt,
+                    Some(&mut grab),
+                    &mut [],
+                );
+                assert!(out.fractures.is_empty(), "the unbreakable fixture broke");
+                peak = peak.max(out.peak_impulse);
+            }
+            peak
+        };
+
+        // One slam, as `slam` stages it: no gravity, so the approach speed is
+        // the only thing in it. Returns the largest `peak[at]` of the
+        // collision, the normal impulse summed over every tick of it, and the
+        // momentum the body actually gave up -- `m dv`, which is the exchanged
+        // momentum by conservation and so the reference the other two are read
+        // against.
+        let slam_at = |dt: f32| -> (f32, f32, f32) {
+            let materials = materials();
+            let world = slab_of(64, 0..8, unbreakable);
+            let field = DistanceField::build(&world);
+            let mut body =
+                placed(cube_of(4, 4, unbreakable), Vec3::new(32.0, 11.0, 32.0), Quat::IDENTITY);
+            assert!(recompute(&mut body, &materials));
+            body.velocity = Vec3::new(0.0, -SLAM_SPEED, 0.0);
+            let mass = body.mass.mass;
+            let mut bodies = vec![body];
+            let (mut peak, mut summed) = (0.0f32, 0.0f32);
+            for _ in 0..ticks(SLAM_SECONDS, dt) {
+                let out =
+                    step(&mut bodies, &world, &field, &materials, Air::STILL, dt, None, &mut []);
+                assert!(out.fractures.is_empty(), "the unbreakable fixture broke");
+                peak = peak.max(out.peak_impulse);
+                // The blow summed over however many ticks the detector spread
+                // the collision across. With no gravity the body rests on a
+                // contact carrying nothing once the collision is over, so this
+                // sums the collision and not the window.
+                //
+                // Not `warm` x `SUBSTEPS`: that identity holds for a contact at
+                // equilibrium, which is exactly what a collision is not -- it
+                // read 11.0e6 against a true 3.84e6 at 64 Hz and 17e3 at 256,
+                // where the contact had already separated by the tick's end.
+                summed += out.peak_impulse;
+            }
+            (peak, summed, mass * (bodies[0].velocity.y + SLAM_SPEED))
+        };
+
+        // 64 Hz last as well as first: these are deterministic simulations, so
+        // the repeat must come back bit-identical, and a table whose repeat
+        // moved is a table that measured something other than the rate.
+        let rates = [64.0f32, 128.0, 256.0, 512.0, 64.0];
+        let mut rows = Vec::new();
+        for &hz in &rates {
+            let dt = 1.0 / hz;
+            let (rest_peak, rest_tick, rest_settled, weight) = resting(dt);
+            let crush_peak = crush(dt);
+            let (slam_peak, slam_summed, slam_exchanged) = slam_at(dt);
+            rows.push([
+                hz,
+                rest_peak,
+                rest_tick as f32,
+                rest_settled,
+                weight,
+                crush_peak,
+                slam_peak,
+                slam_summed,
+                slam_exchanged,
+            ]);
+        }
+
+        println!(
+            "  Hz |   rest max | at tick | rest settled |   m g dt |  crush peak |   slam peak |              slam sum | slam m dv"
+        );
+        for r in &rows {
+            println!(
+                "{:>4} | {:>10.0} | {:>7.0} | {:>12.0} | {:>8.0} | {:>11.0} | {:>11.0} |                  {:>8.0} | {:>9.0}",
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]
+            );
+        }
+
+        // How far each column moved over the three doublings. 8.0 is exactly
+        // proportional to `dt`; 1.0 is rate-independent.
+        let names =
+            ["rest max", "rest settled", "m g dt", "crush peak", "slam peak", "slam sum", "slam m dv"];
+        let columns = [1usize, 3, 4, 5, 6, 7, 8];
+        let moved: Vec<String> = names
+            .iter()
+            .zip(columns)
+            .map(|(name, c)| {
+                let (a, b) = (rows[0][c], rows[3][c]);
+                format!("{name} {:.2}x", if b == 0.0 { f32::INFINITY } else { a / b })
+            })
+            .collect();
+        println!(
+            "64 Hz / 512 Hz -- {}  (8.00 = proportional to dt, 1.00 = rate-independent)",
+            moved.join(", ")
+        );
+
+        // Deterministic simulations, so the repeat must land on the same
+        // numbers. A relative window rather than equality: nothing here sums a
+        // hash map any more, but a measurement is not the place to make a
+        // float's last bit the gate.
+        for (c, name) in columns.iter().zip(names) {
+            let (first, repeat) = (rows[0][*c], rows[4][*c]);
+            assert!(
+                (first - repeat).abs() <= 1e-4 * first.abs().max(1.0),
+                "the repeated 64 Hz row's {name} is {repeat} against the first row's {first}:                  this table did not measure the rate"
+            );
+        }
+    }
+
+    /// **A characterisation of a known defect, not a property anyone wants.**
+    /// A four-high glass stack destroys itself as it settles.
+    ///
+    /// `resting_weight_breaks_nothing` stands three cubes and `GLASS_STRENGTH`
+    /// is 350,000, calibrated just above the 331,306 that stack carries. A
+    /// fourth cube carries 356,751 -- measured 2026-10-02 and recorded in
+    /// `docs/concepts/fracture-load-window.md` -- which is *above* the shipped
+    /// strength. So the cliff is at **four cubes, not past four**: the page
+    /// said six, and the arithmetic in its own table said four.
+    ///
+    /// **What it is not is weight.** The break lands at tick 5, and
+    /// `what_the_tick_rate_does_to_the_blow` measures the three-cube stack's
+    /// *settled* blow at 18,798 against a transient maximum of 331,306 at
+    /// tick 5 -- the same tick. Both tables' "resting load" is the stack
+    /// landing from the 0.2 voxels the fixture starts above the floor, and the
+    /// load it then holds is twenty times smaller. The same four cubes started
+    /// at their settled heights do not break, which this test prints.
+    ///
+    /// **It is expected to fail until the rule separates a steady load from a
+    /// newly-taken one**, which is the fix the concept page names -- or until
+    /// the blow stops counting the bias's push-out, which is what inflates a
+    /// landing's `peak[at]` over the momentum it exchanges. Raising
+    /// `GLASS_STRENGTH` is neither: 350,000 is already within 5% of the
+    /// 365,906 a grab can press with, so buying headroom here spends the crush
+    /// gate.
+    ///
+    /// `#[ignore]`d for the same reason as
+    /// `the_240_to_1_load_collapses_through_the_floor`: it is a record of a
+    /// bug, not a gate the suite should enforce. The day it passes, drop the
+    /// `#[ignore]` and the defect half of this comment.
+    #[test]
+    #[ignore]
+    fn a_four_high_glass_stack_stands() {
+        let materials = materials();
+        let world = slab_of(64, 0..8, MaterialId(6));
+        let field = DistanceField::build(&world);
+        let mut bodies: Vec<Body> = (0..4)
+            .map(|i| {
+                placed(
+                    cube_of(4, 4, MaterialId(6)),
+                    Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0),
+                    Quat::IDENTITY,
+                )
+            })
+            .collect();
+
+        let mut broke = Vec::new();
+        let mut heaviest = 0.0f32;
+        let mut first = None;
+        for tick in 1..=1200u32 {
+            let out =
+                step(&mut bodies, &world, &field, &materials, Air::VACUUM, DT, None, &mut []);
+            heaviest = heaviest.max(out.peak_impulse);
+            if first.is_none() && !out.fractures.is_empty() {
+                first = Some(tick);
+            }
+            broke.extend(out.fractures);
+        }
+        // The tick matters as much as the count. `rest settled` in
+        // `what_the_tick_rate_does_to_the_blow` is 18,798 for three cubes, two
+        // orders below the strength, so a break in the first few ticks is the
+        // stack *landing* from the 0.2 voxels the fixture starts above the
+        // floor -- not its weight.
+        println!(
+            "four-high glass: {} fractures, first at tick {:?}, heaviest blow {heaviest:.0}              against a strength of {}",
+            broke.len(),
+            first,
+            crate::fixtures::GLASS_STRENGTH
+        );
+        // The same four cubes, started where they settle instead of 0.2
+        // voxels up: no landing, so what is left is the weight. Printed, not
+        // asserted -- it is the control that says which of the two the
+        // assertion below is about.
+        let mut settled: Vec<Body> = (0..4)
+            .map(|i| {
+                placed(
+                    cube_of(4, 4, MaterialId(6)),
+                    Vec3::new(32.0, 10.0 + i as f32 * 4.0, 32.0),
+                    Quat::IDENTITY,
+                )
+            })
+            .collect();
+        let (mut settled_broke, mut settled_heaviest) = (0usize, 0.0f32);
+        for _ in 0..1200 {
+            let out =
+                step(&mut settled, &world, &field, &materials, Air::VACUUM, DT, None, &mut []);
+            settled_heaviest = settled_heaviest.max(out.peak_impulse);
+            settled_broke += out.fractures.len();
+        }
+        println!(
+            "four-high glass started at its settled heights: {settled_broke} fractures,              heaviest blow {settled_heaviest:.0}"
+        );
+
+        assert!(
+            broke.is_empty(),
+            "a four-high glass stack settling onto the floor broke {} things; the heaviest blow \
+             any contact carried was {heaviest:.0} against a strength of {}. Started at its \
+             settled heights instead, the same stack broke {settled_broke} with a heaviest blow \
+             of {settled_heaviest:.0}",
+            broke.len(),
+            crate::fixtures::GLASS_STRENGTH
+        );
+        assert_eq!(bodies.len(), 4, "the stack came apart");
     }
 }

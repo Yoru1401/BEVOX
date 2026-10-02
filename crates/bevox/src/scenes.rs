@@ -356,7 +356,14 @@ mod tests {
     /// or this gate fires, which is the outcome worth having.
     #[test]
     fn the_demo_palette_outlasts_a_resting_stack() {
-        /// What a settled three-cube glass stack carries, measured.
+        /// What a three-cube glass stack reaches as it settles, measured. A
+        /// landing rather than a weight -- see
+        /// `docs/concepts/fracture-load-window.md` -- but it is still the load
+        /// a material must survive to be placed in a scene at all.
+        ///
+        /// **This gate is a floor and there is no ceiling.** A grab can press
+        /// with at most about 5.9e5, so every material here except ice is
+        /// silently uncrushable and nothing fails for it.
         const RESTING_LOAD: f32 = 331_306.0;
         let materials = palette();
         let floor = RESTING_LOAD;

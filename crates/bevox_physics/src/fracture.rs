@@ -28,28 +28,32 @@
 //! through a window without marking it.
 //! `a_slow_crush_breaks_what_it_presses` is that gate.
 //!
-//! **What the units cost, measured 2026-10-02.** An impulse grows with the mass
-//! a contact holds up, so a settled stack carries a large one for standing
-//! still -- warm starting seeds each tick's impulse from the last.
-//! `resting_weight_breaks_nothing` is that gate, and the first attempt at this
-//! rule failed it by 61,134 fractures. Every strength is now calibrated above
-//! the resting load, and the window that leaves is narrow:
+//! **What the units cost, measured 2026-10-02 and re-measured across four tick
+//! rates the same day.** An impulse grows with the mass a contact holds up, so
+//! a stack carries a large one for doing nothing much -- warm starting seeds
+//! each tick's impulse from the last. `resting_weight_breaks_nothing` is that
+//! gate, and the first attempt at this rule failed it by 61,134 fractures.
+//! Every strength is now calibrated above that load, and three things about
+//! the window it leaves are open defects rather than solved problems:
 //!
-//! - A three-cube glass stack carries 331,306 at its bottom contact, and the
-//!   load grows with the stack: 126,129 for one cube, 246,227 for two, 356,751
-//!   for four, 391,195 for six.
-//! - A grab pressing that same glass saturates at about 365,906 -- and it
-//!   *saturates*, near-flat in the pressed body's mass (588,636 for a
-//!   two-voxel cube, 343,399 for an eight), because the press settles into a
-//!   penetration equilibrium rather than running up to the force limit.
+//! - **The 331,306 a three-cube glass stack is calibrated against is a
+//!   *landing*, not weight.** It peaks at tick 5 -- the fixture starts 0.2
+//!   voxels above where it settles, and `peak[at]` counts the bias's push-out.
+//!   The load the same stack then holds is 18,798.
+//! - **A four-high glass stack destroys itself**, at 356,751 against a
+//!   strength of 350,000, on the same landing. `a_four_high_glass_stack_stands`
+//!   records it and fails.
+//! - **The crush load is proportional to `dt`** -- 365,906 at 64 Hz, 308,430 at
+//!   128, 93,512 at 512 -- so for a *held* load this threshold is a force
+//!   wearing an impulse's units, which is the one property Dwyer's argument
+//!   rejects. Above 64 Hz the crush gate's own case falls under
+//!   `GLASS_STRENGTH` and stops breaking. A *collision*'s exchanged momentum is
+//!   flat to 1.3% over the same range, so the rule is sound for impacts.
 //!
-//! **So the two bound each other at about 1.1x, and past four cubes the
-//! ordering inverts**: no single strength both survives a six-high stack and
-//! gives way under a slow crush. `GLASS_STRENGTH` fits between them for the
-//! fixtures the suite uses, with five per cent of headroom either way. Raising
-//! the impulse a contact can carry before it is held in equilibrium -- or
-//! reading the load a contact has carried *steadily* apart from the load it
-//! just took -- is what would widen it. Neither is done.
+//! `what_the_tick_rate_does_to_the_blow` is the sweep, and
+//! `docs/concepts/fracture-load-window.md` has the whole table, what the grab's
+//! per-substep impulse clamp has to do with it, and the two candidate fixes.
+//! Neither is done.
 
 use bevox_core::body::BodyId;
 use glam::{IVec3, UVec3, Vec3};
@@ -70,10 +74,15 @@ pub struct Fracture {
     /// units. The peak rather than what it ended with: a collision that
     /// resolved and let go is back at zero by the end of the tick.
     pub impulse: f32,
-    /// What was tested against the material's strength, which is that same
-    /// peak impulse: the two are equal, and both are kept because `impulse`
-    /// says what the contact carried and `blow` says what the rule read. The
-    /// same number whichever side of the contact is asked about.
+    /// What was tested against the material's strength. The solver sets it to
+    /// that same peak impulse, so in anything `step` raises the two are equal;
+    /// both are kept because `impulse` says what the contact carried and
+    /// `blow` says what the rule read, and a rule that stops reading the raw
+    /// impulse would part them. The same number whichever side of the contact
+    /// is asked about.
+    ///
+    /// A hand-built `Fracture` -- `main.rs`'s `blow_on` is the one -- may set
+    /// them independently, so nothing may *rely* on their being equal.
     pub blow: f32,
     /// How far past that strength it went: 1.0 exactly at the threshold, 3.0
     /// for three times what the material could take. What sizes the cracks.

@@ -229,16 +229,23 @@ pub(crate) mod fixtures {
     ///
     /// Calibrated by measurement, and the window is narrow because an impulse
     /// threshold has to separate a crush from a lean. It sits above the
-    /// 331,306 a three-cube glass stack carries for standing still
+    /// 331,306 a three-cube glass stack reaches as it settles onto the floor
     /// (`resting_weight_breaks_nothing`) and above the 190,512 a body arriving
     /// at 8 lands (`the_same_collision_breaks_at_any_tick_rate` requires that
-    /// to survive). It sits below the 365,906 a grab presses with
+    /// to survive). It sits below the 365,906 a grab presses with at 64 Hz
     /// (`a_slow_crush_breaks_what_it_presses`), the 375,223 of the two-body
     /// collision gate, and the 968,836 that arriving at 60 lands.
     ///
     /// 350,000 is the geometric middle of the binding pair, 331,306 and
-    /// 365,906 -- five per cent of headroom either way. See
-    /// `fracture`'s module docs for what that tightness costs.
+    /// 365,906 -- five per cent of headroom either way.
+    ///
+    /// **Both of those bounds are measured at 64 Hz and only one of them stays
+    /// there.** The crush bound is proportional to `dt` and the landing bound
+    /// is not, so at 128 Hz the crush falls to 308,430, under this number, and
+    /// the window is gone. A four-high stack is already over it at 356,751.
+    /// `solver::tests::what_the_tick_rate_does_to_the_blow` is the sweep and
+    /// `docs/concepts/fracture-load-window.md` is what it means; read it before
+    /// moving this.
     pub const GLASS_STRENGTH: f32 = 350_000.0;
 
     /// Material 1 weighs 1000 and grips; 2 weighs 3000 and grips; 3 is
