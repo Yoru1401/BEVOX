@@ -1,6 +1,35 @@
 # Update Log
 
 ## 2026-10-02
+* **Update**: a material's strength is scaled by the size of the body that holds
+  it, after Dwyer's `sqrt(min(area, 7))` — `cbrt(min(voxels, SIZE_CAP))` with
+  `SIZE_CAP = 27`, so a chip of glass gives way under a load a sheet of it
+  holds. `Body::voxel_count` caches the count in `mass::recompute`, which
+  already holds the voxel slice; `break_what_gave_way` runs per contact per tick
+  and must not allocate there. The static world has no body and saturates at
+  `SIZE_CAP`, because reading the missing count as one voxel would make terrain
+  the most fragile thing in the scene.
+  **The factor had to be normalised to run 1/3 → 1 rather than 1 → 3**, and that
+  was measured rather than chosen: every strength in every table was calibrated
+  against bodies at or past the cap, the crush gate has 4.5% of headroom over
+  `GLASS_STRENGTH` and the list-order gate's eight-voxel pebble 7.2%, and no
+  `SIZE_CAP` above 1 passes both. The ten-per-cent fracture load window is the
+  real constraint — [the load window](concepts/fracture-load-window.md) has the
+  table — and it is an open defect, not this change's to fix.
+  [Fracture on a size-scaled impulse](superpowers/plans/2026-10-02-bevox-fracture-on-impulse.md).
+* **Update**: a breaking contact hands back **exactly the excess** it carried
+  past the weaker side's threshold, clamped to what it actually carried, and
+  `fracture::REBOUND = 0.6` is retired. The fixed share was a guess at the thing
+  the excess is. The clamp matters because the excess is measured over the
+  *weaker* side while the impulse belongs to the pair, so an unclamped hand-back
+  could add energy the scene never had;
+  `the_hand_back_never_exceeds_what_the_contact_carried` is the gate and it fails
+  by 500 units unclamped.
+* **Creation**: `the_weaker_side_breaks_and_the_stronger_does_not`, which
+  **passed on arrival** and was kept. One impulse tested against two thresholds
+  may come out two ways; Flori read that as a bug and it is the design. The gate
+  is what makes it explicable, and a gate that passes the day it is written is
+  still a record of the claim.
 * **Fix**: the window's size was read once, at startup, and never again —
   `create_march_target` is a `Startup` system, so the storage texture, the size
   `dispatch_march` turns into a workgroup count, and the sprite's `custom_size`

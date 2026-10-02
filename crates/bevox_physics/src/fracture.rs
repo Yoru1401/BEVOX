@@ -54,6 +54,16 @@
 //! `docs/concepts/fracture-load-window.md` has the whole table, what the grab's
 //! per-substep impulse clamp has to do with it, and the two candidate fixes.
 //! Neither is done.
+//!
+//! **The threshold is scaled by the size of the body that holds the struck
+//! voxel**, which is also his: a chip of glass gives way under a load a sheet of
+//! the same glass holds. `size_factor` is the rule and `SIZE_CAP` the volume it
+//! stops at. It is normalised to the cap rather than to one voxel, and the
+//! narrow window above is why -- the doc comment there has the measurements.
+//!
+//! **A breaking contact hands back exactly the excess**, which is what it
+//! carried past the weaker side's threshold, clamped to what it carried.
+//! `hand_back` is that, and it replaced a fixed `REBOUND = 0.6` on 2026-10-02.
 
 use bevox_core::body::BodyId;
 use glam::{IVec3, UVec3, Vec3};
@@ -160,13 +170,29 @@ pub fn over_strength(blow: f32, strength: f32, voxels: u32) -> Option<f32> {
     Some(blow / threshold)
 }
 
-/// How much of a fracturing contact's impulse is handed back to the bodies.
+/// How much of a fracturing contact's impulse is handed back to the bodies:
+/// exactly the `excess` it carried past the weaker side's threshold, and never
+/// more than it actually `carried`.
 ///
 /// Dwyer's point, and it is what separates fracture that reads as fracture from
 /// fracture that reads as a wall: a rock that breaks a window has to carry on
 /// through it. Without this the contact stops the rock dead and the pieces fall
-/// out of a hole nothing went through.
-pub const REBOUND: f32 = 0.6;
+/// out of a hole nothing went through. A fixed share of the impulse -- 0.6,
+/// until 2026-10-02 -- was a guess at the same thing; the excess is the thing
+/// itself. A contact takes what breaking cost and returns the rest.
+///
+/// **The clamp is not decoration.** The excess is measured over the *weaker*
+/// side's threshold while the impulse belongs to the pair, so handing back more
+/// than the contact held would add energy to the scene. Today `break_what_gave_
+/// way` passes `blow` and `peak[at]`, which are the same number, so the excess
+/// is always under it by construction -- but `Fracture`'s own documentation
+/// says nothing may rely on `blow` and `impulse` staying equal, and a rule that
+/// stopped reading the raw impulse would part them. The clamp is what makes
+/// that a change of threshold rather than a change of energy.
+/// `the_hand_back_never_exceeds_what_the_contact_carried` is the gate.
+pub fn hand_back(excess: f32, carried: f32) -> f32 {
+    excess.clamp(0.0, carried.max(0.0))
+}
 
 /// Voxels to clear around `at` so that what was solid there comes apart.
 ///
@@ -333,6 +359,26 @@ mod tests {
             None,
             "a negative-infinite blow slipped through"
         );
+    }
+
+    /// The hand-back is the excess and nothing more.
+    ///
+    /// The ceiling is what matters: the excess is measured over the weaker
+    /// side's threshold while the impulse belongs to the pair, so an unclamped
+    /// hand-back can exceed what the contact carried and add energy to the
+    /// scene.
+    #[test]
+    fn the_hand_back_never_exceeds_what_the_contact_carried() {
+        assert_eq!(hand_back(400.0, 1000.0), 400.0, "the excess is not handed back whole");
+        assert_eq!(
+            hand_back(1500.0, 1000.0),
+            1000.0,
+            "an excess past what the contact carried was handed back in full, which is energy \
+             the scene did not have"
+        );
+        assert_eq!(hand_back(1000.0, 1000.0), 1000.0, "all of it is still allowed");
+        assert_eq!(hand_back(-5.0, 1000.0), 0.0, "a negative excess pulled the bodies together");
+        assert_eq!(hand_back(400.0, -1.0), 0.0, "a contact that carried nothing handed something back");
     }
 
     /// Cracks stay inside the reach they claim, and the same seed gives the

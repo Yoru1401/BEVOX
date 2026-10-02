@@ -62,7 +62,6 @@ body sags and drags and the grab cannot force anything through terrain.
 | | | |
 |---|---|---|
 | `BUDGET` | 20 000 | Voxels a detachment walk visits before giving up and calling the piece grounded. A cut into a mountainside must not walk the mountain. |
-| `fracture::REBOUND` | 0.6 | The share of a breaking contact's peak impulse handed back, so a body carries on through what it broke instead of stopping at a hole nothing went through. |
 | `fracture::SIZE_CAP` | 27 | Voxels past which a body stops counting as small. Its material's strength is scaled by `cbrt(min(voxels, SIZE_CAP) / SIZE_CAP)`, so a chip gives way under a load a sheet holds; the static world saturates it. |
 
 A material's own `density`, `friction`, `restitution` and `strength` are not

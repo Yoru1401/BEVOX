@@ -254,7 +254,11 @@ fn break_what_gave_way(
     let mut give_back = Vec::new();
     for (at, j) in joined.iter().enumerate() {
         let c = &j.contact;
-        let mut broke = false;
+        // The largest `over` any side reported, which is the weakest side's:
+        // `over` is the blow over that side's own threshold, so the biggest one
+        // names the lowest threshold. That is the threshold breaking cost, and
+        // the rest of the impulse is the contact's to give back.
+        let mut weakest_over = 0.0f32;
         // The most the contact carried at any point in the tick, which is what
         // a material's strength is written in.
         //
@@ -303,7 +307,7 @@ fn break_what_gave_way(
         // under a load a sheet of it holds.
         let mut side = |voxel: [u32; 3], body: Option<BodyId>, strength: f32, voxels: u32| {
             if let Some(over) = fracture::over_strength(blow, strength, voxels) {
-                broke = true;
+                weakest_over = weakest_over.max(over);
                 fractures.push(Fracture {
                     at: c.world_point,
                     voxel: UVec3::from(voxel),
@@ -346,21 +350,25 @@ fn break_what_gave_way(
                 );
             }
         }
-        if broke {
-            give_back.push(at);
+        if weakest_over > 1.0 {
+            // What the contact carried past the weakest threshold it met.
+            // `over` is the blow over that threshold, so the threshold is the
+            // blow over `over`, and the excess is what is left.
+            give_back.push((at, blow - blow / weakest_over));
         }
     }
 
     // Separately, because the scan holds the bodies immutably. Breaking
-    // something costs less speed than bouncing off it: see `fracture::REBOUND`.
+    // something costs less speed than bouncing off it: the contact keeps what
+    // breaking took and returns the rest, which is `fracture::hand_back`.
     //
     // Against the peak, not the running total: a collision that resolved and
     // let go inside the tick ends it carrying nothing, and giving back a share
     // of nothing would leave the striking body stopped dead at a hole it made.
-    for at in give_back {
+    for (at, excess) in give_back {
         let j = &joined[at];
         let (a, b) = pair_mut(bodies, j.body, j.other);
-        push(a, b, &j.contact, -j.contact.normal * peak[at] * fracture::REBOUND);
+        push(a, b, &j.contact, -j.contact.normal * fracture::hand_back(excess, peak[at]));
     }
     fractures
 }
@@ -2001,6 +2009,64 @@ mod tests {
              at all, so this is reading something other than the impulse",
             crate::fixtures::GLASS_STRENGTH
         );
+    }
+
+    /// Two bodies of different strength in one collision: the weaker gives way
+    /// and the stronger does not, and the fracture reports an `over` measured
+    /// against its *own* threshold.
+    ///
+    /// Flori read this as a bug, and it is not one. A contact is one impulse
+    /// shared by a pair, but a threshold belongs to a voxel in a body, so one
+    /// blow tested twice can come out two ways -- which is the whole reason
+    /// `break_what_gave_way` asks both sides rather than picking an owner. The
+    /// gate is what makes that explicable instead of surprising.
+    #[test]
+    fn the_weaker_side_breaks_and_the_stronger_does_not() {
+        let materials = materials();
+        let world = Contree::empty(3);
+        let field = DistanceField::build(&world);
+
+        // The same collision as the list-order gate: a glass pebble thrown at a
+        // heavier cube of the default material, which is eight times stronger.
+        let anvil =
+            placed(cube_of(4, 4, MaterialId(2)), Vec3::new(32.0, 32.0, 32.0), Quat::IDENTITY);
+        let mut pebble =
+            placed(cube_of(2, 4, MaterialId(6)), Vec3::new(32.0, 40.0, 32.0), Quat::IDENTITY);
+        pebble.velocity = Vec3::new(0.0, -100.0, 0.0);
+        let (strong, weak_id) = (anvil.id, pebble.id);
+        let mut bodies = vec![anvil, pebble];
+
+        let mut broke = Vec::new();
+        for _ in 0..16 {
+            let out = step(&mut bodies, &world, &field, &materials, Air::STILL, DT, None, &mut []);
+            broke.extend(out.fractures);
+        }
+
+        assert!(
+            broke.iter().any(|f| f.body == Some(weak_id)),
+            "the glass pebble survived a collision it reported {} fractures from",
+            broke.len()
+        );
+        assert!(
+            !broke.iter().any(|f| f.body == Some(strong)),
+            "the stronger body broke too, so the threshold is not being read per side"
+        );
+
+        // The pebble's eight voxels put its threshold at two thirds of
+        // `GLASS_STRENGTH`, and `over` is the blow over *that* -- not over the
+        // anvil's strength, and not over the raw table figure.
+        let want = crate::fixtures::GLASS_STRENGTH * fracture::size_factor(8);
+        for f in broke.iter().filter(|f| f.body == Some(weak_id)) {
+            let over = f.blow / want;
+            assert!(
+                (f.over - over).abs() < 1e-4 * over,
+                "a fracture reported {} times over on a blow of {:.0}, and its own threshold of \
+                 {want:.0} makes that {over}",
+                f.over,
+                f.blow
+            );
+            assert!(f.over > 1.0, "a reported fracture was not past its threshold");
+        }
     }
 
     /// Weight alone breaks nothing, however long it leans.

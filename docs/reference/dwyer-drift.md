@@ -29,7 +29,7 @@ because the cause is what says whether a difference needs fixing.
 |---|---|---|
 | **A — different product.** He is building a moddable multiplayer browser platform | 6 | Right, and cheap to be right about |
 | **B — different architecture.** His verdicts are tied to a renderer BEVOX does not have | 3 | Right, and it skipped two of his rewrites |
-| **C — different constraints.** A `u16`, an extent of 4096, eight storage buffers | 5 | Forced, and correct under the constraint |
+| **C — different constraints.** A `u16`, an extent of 4096, eight storage buffers, a ten-per-cent fracture load window | 5 | Forced, and correct under the constraint |
 | **D — not reached yet.** Deferred, not rejected | 6 | Fine, except one |
 | **E — improvements on him** | 5 | Ours is better, mostly because he taught us the problem |
 | **F — oversight.** Nobody decided | 7 | **This is the drift.** Five looked worth fixing; F7 is measured and resolved, leaving four |
@@ -78,7 +78,7 @@ Each is forced by something his engine does not face. None is a preference.
 
 | Difference | Devlog | Why | Good idea? |
 |---|---|---|---|
-| Fracture threshold is a **closing speed**, not his contact impulse | 28 | Chosen because `Material::strength` is a `u16` and his rule failed a resting-stack gate by 61,134 fractures | **No — reverting.** His `breaking_impulse` is an `f32` and his threshold is scaled by object size. **The units were the problem and the physics was changed to fix them.** It cost crush fracture: a mouse grab presses with 2e8 of force at nearly no speed, so nothing breaks. See [rigid_pixels](rigid-pixels.md) and [the respec](../superpowers/specs/2026-09-30-bevox-fracture-and-detection-design.md) |
+| The size term on the fracture threshold is calibrated at **cap-sized**, not at one voxel | 28 | His scaling runs `sqrt(min(area, 7))` up from a single unit. The window between the load a resting stack carries (331,306) and the load a mouse grab presses with (365,906) is ten per cent wide, and a term that multiplies up from one voxel triples every strength in the table and closes it | **Forced, and the same rule.** `size_factor` is `cbrt(min(voxels, SIZE_CAP) / SIZE_CAP)`, running 1/3 → 1: identical behaviour for anything at or past the cap, where every strength was measured, and small bodies weaker, which is all his comment on the rule claims. The narrow window is the real constraint and an open defect — [the load window](../concepts/fracture-load-window.md) |
 | Cracks are random planes, not authored boolean pattern volumes | 28 | His patterns are a data format for a modding API. BEVOX has no modders to author them | **Yes for now**, and reversible: the generator is one function behind one call |
 | The ambient-occlusion blend runs in the shader, not through a hardware sampler | 15 | The fullness grid rides in the distance field's buffer because the compute stage is at **wgpu's default of eight storage buffers**. No sampler, so eight reads and nine weights in WGSL | **Neutral.** It measured inside drift, so nothing was lost — but the sampler is exactly what he calls the reason his version is "cheap as dirt", and giving it up went unrecorded until 2026-09-28 |
 | Visited cells are a hash map, not his **dense bitmap** | 12 | He names constant-time membership as what makes walking nodes worth doing. His world is chunked; this tree reaches **4096**, so a dense array is 6.9×10¹⁰ entries and a walk may roam anywhere within `BUDGET` | **Forced, and handled**: a cheap integer hasher recovered 17-26% of it on 2026-09-28 |

@@ -161,6 +161,15 @@ and would have made fracture look 260 times more expensive than it is.
   The blow is now the closing speed at detection, which needs no mass and no
   owner. `DEFAULT_STRENGTH` moved from 40 to 150 and the brittle fixture from 5
   to 20 with it, because the numbers now mean arrival speeds directly.
+
+  **Superseded again 2026-10-02.** A closing speed cannot see a crush: the mouse
+  grab drives toward a velocity goal with a 1.962e8 force limit, so a grabbed
+  body leaning on glass closes at nearly nothing however hard it presses. The
+  blow is Dwyer's accumulated contact impulse after all -- the raw one, never a
+  quotient -- and the units problem that drove it out in the first place was
+  answered by calibrating every strength above the resting load rather than by
+  changing what is measured. It cost a narrow window, which is an open defect:
+  see [the load window](../../concepts/fracture-load-window.md).
 - **The tick-rate gate had to be rewritten around outcomes.** The peak per-tick
   blow was *not* rate-independent while it came from the impulse: 16.4 at 64 Hz
   against 10.4 at 128 on the test scene, because a collision the detector sees
@@ -208,3 +217,26 @@ and would have made fracture look 260 times more expensive than it is.
 | The body cap ignored | `a_full_scene_leaves_a_broken_body_whole` |
 | The blow divided by the owning body's mass (2026-09-28) | `a_collision_breaks_the_same_things_whichever_body_is_listed_first` |
 | The threshold read as Dwyer's raw impulse (2026-09-28) | `resting_weight_breaks_nothing`, by 61,134 fractures |
+| The size term flattened to 1 for every body (2026-10-02) | `a_small_body_breaks_before_a_large_one`, and `a_small_body_takes_less_than_a_large_one` on the arithmetic |
+| Nothing handed back once the fixed fraction went (2026-10-02) | `breaking_something_does_not_stop_you`, both runs left falling at 2.76 |
+| The hand-back left unclamped (2026-10-02) | `the_hand_back_never_exceeds_what_the_contact_carried` |
+
+## Names as shipped
+
+**No gate was renamed.** The gates the 2026-10-02 work added landed under the
+names the plan asked for: `a_small_body_breaks_before_a_large_one` and
+`the_weaker_side_breaks_and_the_stronger_does_not`, plus
+`the_hand_back_never_exceeds_what_the_contact_carried`, which the plan did not
+name but the clamp needed.
+
+`the_weaker_side_breaks_and_the_stronger_does_not` **passed on arrival.** The
+per-side threshold and the size term had already made it true, and it was kept
+anyway: it is the record of a claim Flori read as a bug, and the claim is that
+one impulse tested against two thresholds may come out two ways. A gate that
+passes the day it is written is still the only thing that makes that
+explicable.
+
+Two names left the code rather than arriving. `fracture::REBOUND` is gone: a
+contact keeps what breaking cost and hands back the excess, which is
+`fracture::hand_back`. `over_strength` takes a third argument, the struck
+body's voxel count.
