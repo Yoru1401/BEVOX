@@ -49,6 +49,7 @@ lifted out of the plan that produced it.
 
 # Reference
 
+* [Douglas Dwyer's voxel engine, as a design](reference/dwyer-engine.md) - what his engine is and how its parts work, by system rather than by date: the contree, two renderers, four lighting systems, three physics engines, the architecture, what he rejected and why, and how he works. No comparison with anything here.
 * [Douglas Dwyer's voxel engine, devlog by devlog](reference/dwyer-devlogs.md) - what he built in each of his thirty Voxel Devlogs, dated, and what each changed from the ones before, plus the four videos that are not devlogs.
 * [Dwyer's rigid_pixels, read from source](reference/rigid-pixels.md) - the 2D prototype behind devlog 26, which settles what the devlogs leave open.
 * [John Lin's voxel engine, read from his blog and videos](reference/john-lin.md) - a second developer, unrelated to Dwyer. Three engines in fifteen months, including dropping hardware ray tracing because a BLAS is too heavy for a dynamic scene, and a reversal on unified voxel formats that makes his objection a post-mortem rather than an opinion.
