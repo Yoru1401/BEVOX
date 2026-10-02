@@ -89,6 +89,77 @@ pub struct Fracture {
     pub over: f32,
 }
 
+/// The volume, in voxels, past which a body counts as large and the size term
+/// stops shrinking its material's strength.
+///
+/// Dwyer's 2D rule is `sqrt(min(area, 7))`, commented as making small objects
+/// break sooner; the 3D analogue of a length from an area is a length from a
+/// volume, so it is `cbrt(min(voxels, SIZE_CAP))`. 27 makes that span a factor
+/// of three, the same span his 1 -> 2.65 covers.
+pub const SIZE_CAP: u32 = 27;
+
+/// What a body of `voxels` voxels multiplies its material's strength by: a
+/// third for a single voxel, rising to 1 at `SIZE_CAP` and stopping.
+///
+/// A chip of glass gives way under a load a window-sized sheet of the same
+/// glass holds. Capped because the alternative is terrain -- a mountain of
+/// millions of voxels -- being unbreakable by arithmetic rather than by its
+/// material.
+///
+/// **Divided by `cbrt(SIZE_CAP)`, so the factor runs 1/3 -> 1 rather than the
+/// 1 -> 3 the plan asks for, and this is a deviation measured into existence
+/// rather than chosen.** Every strength in every table is calibrated against
+/// bodies at or past the cap -- the fixture cubes are 4x4x4, which is 64
+/// voxels -- so a term that runs 1 -> 3 does not leave those numbers alone, it
+/// triples them. Two gates then fail, and no value of `SIZE_CAP` above 1 saves
+/// them:
+///
+/// - `a_slow_crush_breaks_what_it_presses` presses the static world's glass
+///   floor with a measured 365,906, 4.5% over `GLASS_STRENGTH`. The world
+///   saturates at `SIZE_CAP`, so any factor past 1.046 there stops the crush
+///   breaking anything.
+/// - `a_collision_breaks_the_same_things_whichever_body_is_listed_first` throws
+///   an eight-voxel glass pebble, blow 375,223, 7.2% over. Any factor past
+///   1.072 on eight voxels stops it.
+///
+/// Normalising puts the calibration point at the cap instead of at one voxel,
+/// which is where it was measured. Nothing at or past the cap moves at all;
+/// only small bodies get weaker, which is the whole of what Dwyer's comment
+/// claims. The window those two bounds leave is 331,306 to 365,906 -- ten per
+/// cent wide, documented in `docs/concepts/fracture-load-window.md` as an open
+/// defect -- and a multiplicative term spanning three needs three hundred.
+pub fn size_factor(voxels: u32) -> f32 {
+    (voxels.min(SIZE_CAP) as f32).cbrt() / (SIZE_CAP as f32).cbrt()
+}
+
+/// Whether a blow of this impulse breaks that material in a body of `voxels`
+/// voxels, and by how much.
+///
+/// The threshold is the struck voxel's material scaled by the size of the body
+/// that holds it, so the same material is tougher in a large body than in a
+/// small one. `over` is measured against that scaled threshold, which is what
+/// keeps a hit "three times over strength" meaning the same thing whatever the
+/// body: it is what sizes the cracks.
+///
+/// `None` for a material that holds, for `UNBREAKABLE` whatever the blow, and
+/// for a non-finite blow: a NaN compares false against everything, so
+/// `blow <= threshold` would silently let it through as "did not break" rather
+/// than raising the error it actually is.
+pub fn over_strength(blow: f32, strength: f32, voxels: u32) -> Option<f32> {
+    if !blow.is_finite() || strength == bevox_core::material::UNBREAKABLE {
+        return None;
+    }
+    // Multiplied, not divided into the blow: `UNBREAKABLE` is an infinity and
+    // scaling it stays infinite, so an unbreakable material in a body of any
+    // size is still unbreakable. The guard above catches it first; this keeps
+    // the arithmetic from depending on that order.
+    let threshold = strength * size_factor(voxels);
+    if blow <= threshold {
+        return None;
+    }
+    Some(blow / threshold)
+}
+
 /// How much of a fracturing contact's impulse is handed back to the bodies.
 ///
 /// Dwyer's point, and it is what separates fracture that reads as fracture from
@@ -96,19 +167,6 @@ pub struct Fracture {
 /// through it. Without this the contact stops the rock dead and the pieces fall
 /// out of a hole nothing went through.
 pub const REBOUND: f32 = 0.6;
-
-/// Whether a blow of this impulse breaks that material, and by how much.
-///
-/// `None` for a material that holds, for `UNBREAKABLE` whatever the blow, and
-/// for a non-finite blow: a NaN compares false against everything, so
-/// `blow <= strength` would silently let it through as "did not break" rather
-/// than raising the error it actually is.
-pub fn over_strength(blow: f32, strength: f32) -> Option<f32> {
-    if !blow.is_finite() || strength == bevox_core::material::UNBREAKABLE || blow <= strength {
-        return None;
-    }
-    Some(blow / strength)
-}
 
 /// Voxels to clear around `at` so that what was solid there comes apart.
 ///
@@ -210,10 +268,53 @@ mod tests {
     /// impulse at all breaks an unbreakable material.
     #[test]
     fn a_material_breaks_only_past_its_strength() {
-        assert_eq!(over_strength(39.0, 40.0), None);
-        assert_eq!(over_strength(40.0, 40.0), None, "exactly at strength is not past it");
-        assert_eq!(over_strength(80.0, 40.0), Some(2.0));
-        assert_eq!(over_strength(1e30, UNBREAKABLE), None, "unbreakable broke");
+        // At the cap, where the size term is 1 and the threshold is the
+        // material's own strength.
+        assert_eq!(over_strength(39.0, 40.0, SIZE_CAP), None);
+        assert_eq!(
+            over_strength(40.0, 40.0, SIZE_CAP),
+            None,
+            "exactly at strength is not past it"
+        );
+        assert_eq!(over_strength(80.0, 40.0, SIZE_CAP), Some(2.0));
+        assert_eq!(over_strength(1e30, UNBREAKABLE, 1), None, "unbreakable broke");
+        assert_eq!(
+            over_strength(1e30, UNBREAKABLE, SIZE_CAP),
+            None,
+            "unbreakable broke once the size term scaled it"
+        );
+    }
+
+    /// The same blow against the same material: a single voxel gives way and a
+    /// `SIZE_CAP` body does not.
+    ///
+    /// Dwyer's rule, at the level of the arithmetic. The factor runs 1 -> 3 and
+    /// stops, so a blow between one and three times the raw strength separates
+    /// the two, and a bigger body than `SIZE_CAP` is no tougher than one at it.
+    #[test]
+    fn a_small_body_takes_less_than_a_large_one() {
+        assert_eq!(size_factor(SIZE_CAP), 1.0, "a body at the cap is not the unscaled case");
+        assert_eq!(size_factor(u32::MAX), 1.0, "the size term is not capped");
+        assert_eq!(size_factor(0), 0.0, "a body with no voxels should scale to nothing");
+        assert!(
+            (size_factor(1) - 1.0 / 3.0).abs() < 1e-6,
+            "a single voxel scaled by {}, want a third",
+            size_factor(1)
+        );
+
+        // Half the strength: past a single voxel's third of it, under a capped
+        // body's whole.
+        assert_eq!(over_strength(20.0, 40.0, SIZE_CAP), None, "a large body broke at half");
+        let over = over_strength(20.0, 40.0, 1).expect("a single voxel held at half");
+        assert!((over - 1.5).abs() < 1e-5, "a single voxel read {over} times over, want 1.5");
+        // `over` is measured against the *scaled* threshold, so "three times
+        // over" sizes the cracks the same way whatever the body.
+        assert_eq!(over_strength(120.0, 40.0, SIZE_CAP), Some(3.0));
+        let over = over_strength(40.0, 40.0, 1).expect("a single voxel held its whole strength");
+        assert!(
+            (over - 3.0).abs() < 1e-5,
+            "a blow at a capped body's threshold read {over} times over on one voxel, want 3"
+        );
     }
 
     /// A NaN blow compares false against everything, so without an explicit
@@ -221,10 +322,14 @@ mod tests {
     /// error it is.
     #[test]
     fn a_non_finite_blow_never_breaks_anything() {
-        assert_eq!(over_strength(f32::NAN, 40.0), None, "a NaN blow slipped through as a break");
-        assert_eq!(over_strength(f32::INFINITY, 40.0), None, "an infinite blow slipped through");
         assert_eq!(
-            over_strength(f32::NEG_INFINITY, 40.0),
+            over_strength(f32::NAN, 40.0, 1),
+            None,
+            "a NaN blow slipped through as a break"
+        );
+        assert_eq!(over_strength(f32::INFINITY, 40.0, 1), None, "an infinite blow slipped through");
+        assert_eq!(
+            over_strength(f32::NEG_INFINITY, 40.0, 1),
             None,
             "a negative-infinite blow slipped through"
         );

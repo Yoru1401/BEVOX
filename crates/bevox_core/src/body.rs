@@ -130,6 +130,13 @@ pub struct Body {
     /// Corner and edge voxels, the only ones tested for contact. Empty until
     /// `recompute`.
     pub features: Features,
+    /// How many solid voxels the volume holds. Zero until `recompute`.
+    ///
+    /// Cached rather than counted on demand because fracture scales a
+    /// material's strength by the size of the body it is in, and that runs per
+    /// contact per tick: `Contree::voxels()` allocates a `Vec` of the whole
+    /// volume, which is not a thing to do in a contact loop.
+    pub voxel_count: u32,
     /// Each contact's accumulated impulse from the last tick, for warm
     /// starting. Cleared by `recompute`, whose voxels may have moved.
     pub warm: HashMap<ContactKey, ContactImpulse>,
@@ -165,6 +172,7 @@ impl Body {
             torque: Vec3::ZERO,
             angular_momentum: Vec3::ZERO,
             features: Features::default(),
+            voxel_count: 0,
             warm: HashMap::new(),
             asleep: false,
             still_for: 0.0,

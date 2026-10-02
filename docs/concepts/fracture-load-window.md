@@ -166,6 +166,40 @@ Two candidates, neither done:
 Raising `GLASS_STRENGTH` is not a candidate: it walks into the crush ceiling
 from the other side.
 
+# The window is too narrow for a size term, measured 2026-10-02
+
+The size scaling that followed -- `fracture::SIZE_CAP`, a material's strength
+scaled by its body's volume after Dwyer -- had to be **normalised** because of
+this window, and that is the first thing the window has cost rather than
+merely threatened.
+
+The plan asked for `cbrt(min(voxels, SIZE_CAP))`, running 1 -> 3 with the
+calibration point at one voxel. Every strength in every table was measured
+against bodies at or past the cap -- the fixture cubes are 4x4x4, 64 voxels --
+so that term does not leave those numbers alone, it triples them. Two gates
+then fail, and **no value of `SIZE_CAP` above 1 saves them**:
+
+| gate | blow | struck body | largest factor it tolerates |
+|---|---|---|---|
+| `a_slow_crush_breaks_what_it_presses` | 365,906 | static world, saturated at `SIZE_CAP` | 1.046 |
+| `a_collision_breaks_the_same_things_whichever_body_is_listed_first` | 375,223 | 8-voxel glass pebble | 1.072 |
+| `the_same_collision_breaks_at_any_tick_rate`, at 60 | 1,047,814 | 64-voxel glass cube | 2.994 |
+
+The first two are 4.5% and 7.2% of headroom over 350,000. A multiplicative
+term spanning three needs three hundred per cent of it, and this window is
+ten.
+
+So `size_factor` is `cbrt(min(voxels, SIZE_CAP) / SIZE_CAP)`, running 1/3 -> 1:
+the calibration point moves to the cap, which is where it was measured.
+Nothing at or past the cap moves at all, and only small bodies get weaker --
+which is the whole of what Dwyer's comment about the rule claims. The static
+world still saturates at `SIZE_CAP`, so it still reads the toughest factor
+there is, which is the point of saturating it.
+
+**This is a symptom, not a second defect.** Either fix above widens the window
+and lets the term run 1 -> 3 if that is ever wanted. Until then, a palette
+number means what a cap-sized body of that material takes.
+
 # What an impulse means for the player
 
 `strength` is no longer a speed a material survives. **A bigger body breaks the

@@ -297,8 +297,12 @@ fn break_what_gave_way(
         if peak[at] <= 0.0 {
             continue;
         }
-        let mut side = |voxel: [u32; 3], body: Option<BodyId>, strength: f32| {
-            if let Some(over) = fracture::over_strength(blow, strength) {
+        // The struck voxel's material, scaled by the size of the body that
+        // holds it: `voxels` is that body's whole volume, not anything local to
+        // the impact. Dwyer's rule, and it is why a chip of glass gives way
+        // under a load a sheet of it holds.
+        let mut side = |voxel: [u32; 3], body: Option<BodyId>, strength: f32, voxels: u32| {
+            if let Some(over) = fracture::over_strength(blow, strength, voxels) {
                 broke = true;
                 fractures.push(Fracture {
                     at: c.world_point,
@@ -312,14 +316,34 @@ fn break_what_gave_way(
         };
 
         let mine = &bodies[j.body];
-        side(c.key.mine, Some(mine.id), materials.get(mine.volume.get(UVec3::from(c.key.mine))).strength);
+        side(
+            c.key.mine,
+            Some(mine.id),
+            materials.get(mine.volume.get(UVec3::from(c.key.mine))).strength,
+            mine.voxel_count,
+        );
         match j.other {
-            // The static world's own voxel, in world coordinates.
-            None => side(c.key.theirs, None, materials.get(tree.get(UVec3::from(c.key.theirs))).strength),
+            // The static world's own voxel, in world coordinates. It has no
+            // body and so no voxel count, and it takes `SIZE_CAP` -- saturated,
+            // because the world is the largest thing in the scene. Reading the
+            // missing count as 1 would give terrain the threshold of a single
+            // chip, the most fragile thing anywhere, and nothing in the suite
+            // asks about the world's size, so nothing would catch it.
+            None => side(
+                c.key.theirs,
+                None,
+                materials.get(tree.get(UVec3::from(c.key.theirs))).strength,
+                fracture::SIZE_CAP,
+            ),
             Some(o) => {
                 let other = &bodies[o];
                 let material = other.volume.get(UVec3::from(c.key.theirs));
-                side(c.key.theirs, Some(other.id), materials.get(material).strength);
+                side(
+                    c.key.theirs,
+                    Some(other.id),
+                    materials.get(material).strength,
+                    other.voxel_count,
+                );
             }
         }
         if broke {
@@ -1784,6 +1808,94 @@ mod tests {
             "the unbreakable body broke, so strength is not being read"
         );
     }
+
+    /// A narrow hammer of unbreakable material driven straight down onto
+    /// `target`, which sits on an unbreakable floor. Returns every fracture and
+    /// the largest blow any contact carried.
+    ///
+    /// The floor takes the load, so what a contact reads is the hammer's
+    /// momentum rather than the target's own mass. That is the whole point of
+    /// the fixture: a small target and a large one can be struck *identically*,
+    /// which is impossible when the target is the thing supplying the momentum
+    /// -- a one-voxel body exchanges a sixty-fourth of what a four-cube does at
+    /// the same speed, which would swamp any size term.
+    ///
+    /// No gravity: the strike is the only thing under test.
+    fn hammered(target: Contree, speed: f32) -> (Vec<Fracture>, f32) {
+        let world = slab_of(64, 0..8, MaterialId(7));
+        let field = DistanceField::build(&world);
+        let materials = materials();
+        // The struck voxel spans the same world box whatever the target's size:
+        // both fixtures are placed so that the voxel under the hammer is
+        // 31.5..32.5 across and 8..9 up. Contact geometry is therefore not what
+        // separates the two runs.
+        let at = Vec3::new(32.0, 8.5, 32.0);
+        let mut bodies = vec![
+            placed(target, at, Quat::IDENTITY),
+            // A one-voxel footprint, so it strikes exactly one voxel of either
+            // target. Just inside the contact margin, so the strike lands on
+            // the first tick instead of being bled over two.
+            placed(block(1, 4, 1, 4, MaterialId(7)), Vec3::new(32.0, 11.05, 32.0), Quat::IDENTITY),
+        ];
+        bodies[1].velocity = Vec3::new(0.0, -speed, 0.0);
+
+        let mut fractures = Vec::new();
+        let mut hardest = 0.0f32;
+        for _ in 0..8 {
+            let out =
+                step(&mut bodies, &world, &field, &materials, Air::STILL, DT, None, &mut []);
+            hardest = hardest.max(out.peak_impulse);
+            fractures.extend(out.fractures);
+        }
+        (fractures, hardest)
+    }
+
+    /// Dwyer's rule, and the reason it exists: a small thing breaks under a
+    /// blow a large thing of the same material shrugs off.
+    ///
+    /// Both targets are glass and both are struck by the same hammer at the
+    /// same speed on the same voxel. The only difference is how many voxels the
+    /// struck voxel's body has -- one against twenty-seven, which is `SIZE_CAP`
+    /// and so the full span of the size term: a third of `GLASS_STRENGTH`
+    /// against the whole of it, 116,667 against 350,000.
+    #[test]
+    fn a_small_body_breaks_before_a_large_one() {
+        // A 1x1x27 bar rather than a 3x3x3 cube: the cube would present a nine
+        // voxel face to the hammer and split the blow nine ways, which would
+        // make the large target survive for a reason that has nothing to do
+        // with its size. The bar's middle voxel is the only one struck, and it
+        // sits exactly where the small target's single voxel does.
+        let (small, small_blow) = hammered(cube_of(1, 4, MaterialId(6)), HAMMER_SPEED);
+        let (large, large_blow) = hammered(block(1, 1, 27, 64, MaterialId(6)), HAMMER_SPEED);
+        // Not equal blows -- the bar's own mass means the same hammer leaves a
+        // *larger* impulse on it, 638,388 against 387,507 -- and that is the
+        // stronger statement: the large target survives a harder blow than the
+        // one that broke the small one, so what saved it cannot be a gentler
+        // hit. The only way to pass this with a flat threshold is for neither
+        // to break, which the first assertion forbids.
+        assert!(
+            large_blow >= small_blow,
+            "the large target was struck at {large_blow:.0} and the small one at \
+             {small_blow:.0}: it survived for want of a blow, not for its size"
+        );
+        assert!(
+            small.iter().any(|f| f.body.is_some()),
+            "a one-voxel glass body took a blow of {small_blow:.0} against a third of the {} \
+             its material holds at `SIZE_CAP`, and did not break",
+            crate::fixtures::GLASS_STRENGTH
+        );
+        assert!(
+            !large.iter().any(|f| f.body.is_some()),
+            "a twenty-seven-voxel glass body broke under the same blow of {large_blow:.0}: the \
+             size term is not reaching the threshold"
+        );
+    }
+
+    /// Chosen so both blows land between a single voxel's threshold and a
+    /// capped body's, which is what leaves the size term as the only thing that
+    /// can decide the outcome: the small target reads 164,915 against 116,667
+    /// and the large one 260,656 against 350,000.
+    const HAMMER_SPEED: f32 = 70.0;
 
     /// Dwyer's devlog 28, and the reason the threshold is not on force: what
     /// breaks must not depend on how often the physics ticks.

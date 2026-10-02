@@ -107,6 +107,10 @@ mod tests {
 pub fn recompute(body: &mut Body, materials: &MaterialTable) -> bool {
     body.warm.clear();
     let voxels = body.volume.voxels();
+    // Here rather than in `break_what_gave_way`, which reads it per contact per
+    // tick: this slice is already in hand, and building it there would allocate
+    // the whole volume inside the contact loop.
+    body.voxel_count = voxels.len() as u32;
     let Some((mass, com)) = mass_properties(&voxels, materials) else {
         body.mass = MassProperties::default();
         body.features = Features::default();
