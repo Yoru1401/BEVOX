@@ -109,7 +109,7 @@ than each caller remembering. See
 | `DEFAULT_DENSITY` | 1000 | Mass per voxel when the source says nothing, as a MagicaVoxel palette does not. |
 | `DEFAULT_FRICTION` | 60 | Hundredths, so 0.6: about dry stone. |
 | `DEFAULT_RESTITUTION` | 5 | Hundredths. Barely bouncy, which is what most solids are. |
-| `DEFAULT_STRENGTH` | 2 800 000 | The largest contact impulse a material survives. An impulse, so it is read against a body: a four-voxel stone cube cracks terrain at about 150 voxels a second. Well clear of the 331 306 a three-cube stack leans with. |
+| `DEFAULT_STRENGTH` | 2 800 000 | The largest contact impulse a material survives. An impulse, so it is read against a body: a four-voxel stone cube breaks terrain arriving at 200 voxels a second, which is terminal, and holds at 120. Deliberately unchanged when `GLASS_STRENGTH` rose — it is calibrated against a thrown body, not a landing — and nearly seven times clear of the 414 166 the worst glass stack lands with. |
 | `UNBREAKABLE` | `f32::INFINITY` | A material that never fractures, however hard it is hit. |
 | `DEFAULT_CRUSH` | `f32::INFINITY` | The largest contact *force* a material survives while resting, as opposed to `strength`'s impulse on an impact. Nothing reads it yet, so every table sets it to `UNBREAKABLE`. |
 

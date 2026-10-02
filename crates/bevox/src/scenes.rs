@@ -129,21 +129,27 @@ pub(crate) fn demo_scene() -> (Contree, MaterialTable) {
 /// survived the change in units and turned the demo into a scene where a body
 /// landing anywhere set off a chain reaction that took the map apart.
 ///
-/// They are rescaled by a single factor, 350_000 / 12, which puts the weakest
-/// of them exactly on `fixtures::GLASS_STRENGTH` — the one strength in this
-/// project measured against what a resting stack actually carries (331_306) —
-/// and leaves stone and brick in the same proportion to it they always had.
+/// They are rescaled by a single factor, which puts the weakest of them
+/// exactly on `fixtures::GLASS_STRENGTH` — the one strength in this project
+/// measured against what a stack actually carries — and leaves stone and brick
+/// in the same proportion to it they always had.
+///
+/// The factor was `350_000 / 12`. It is now `500_000 / 12`: `GLASS_STRENGTH`
+/// rose by 10/7 when the crush ceiling stopped binding it, and ice is pinned to
+/// that constant by construction, so all three moved with it — 1_312_500 →
+/// 1_875_000, 729_167 → 1_041_667, 350_000 → 500_000. The ordering ice < brick
+/// < stone is what the proportion is for.
 /// `the_demo_palette_outlasts_a_resting_stack` is the gate that was missing.
 pub(crate) fn palette() -> MaterialTable {
     let mut materials = MaterialTable::new();
     materials
-        .push(Material { color: [140, 140, 150, 255], density: 2600, friction: 60, restitution: 5, strength: 1_312_500.0, crush: bevox_core::material::DEFAULT_CRUSH })
+        .push(Material { color: [140, 140, 150, 255], density: 2600, friction: 60, restitution: 5, strength: 1_875_000.0, crush: bevox_core::material::DEFAULT_CRUSH })
         .unwrap(); // 1: stone
     materials
-        .push(Material { color: [180, 90, 70, 255], density: 1900, friction: 70, restitution: 5, strength: 729_167.0, crush: bevox_core::material::DEFAULT_CRUSH })
+        .push(Material { color: [180, 90, 70, 255], density: 1900, friction: 70, restitution: 5, strength: 1_041_667.0, crush: bevox_core::material::DEFAULT_CRUSH })
         .unwrap(); // 2: brick
     materials
-        .push(Material { color: [170, 210, 235, 255], density: 900, friction: 4, restitution: 10, strength: 350_000.0, crush: bevox_core::material::DEFAULT_CRUSH })
+        .push(Material { color: [170, 210, 235, 255], density: 900, friction: 4, restitution: 10, strength: 500_000.0, crush: bevox_core::material::DEFAULT_CRUSH })
         .unwrap(); // 3: ice
     materials
         .push(Material {
@@ -357,10 +363,18 @@ mod tests {
     /// or this gate fires, which is the outcome worth having.
     #[test]
     fn the_demo_palette_outlasts_a_resting_stack() {
-        /// What a three-cube glass stack reaches as it settles, measured. A
-        /// landing rather than a weight -- see
+        /// The worst landing transient any glass stack reaches, measured: an
+        /// eight-high stack, 414,166. A landing rather than a weight -- see
         /// `docs/concepts/fracture-load-window.md` -- but it is still the load
         /// a material must survive to be placed in a scene at all.
+        ///
+        /// **Raised from 331_306**, a three-cube stack, with
+        /// `GLASS_STRENGTH`. The series is sub-linear in the number of cubes
+        /// (about `n^0.55`: 126,129 / 246,227 / 331,306 / 356,751 / 391,195 /
+        /// 414,166 for n = 1, 2, 3, 4, 6, 8), so clearing n = 8 clears stacks
+        /// far taller than eight and there is no need to pick a height per
+        /// scene. Three cubes was the figure only because it was the tallest
+        /// stack that stood.
         ///
         /// **This gate is a floor and there is no ceiling.** A grab can press
         /// with at most about 5.9e5, so every material here except ice is
@@ -376,7 +390,7 @@ mod tests {
         /// small body gets *safer* under its own weight, not more fragile.
         /// The sub-cap case this would have to cover is a small body holding
         /// up a large one, which no scene here builds.
-        const RESTING_LOAD: f32 = 331_306.0;
+        const RESTING_LOAD: f32 = 414_166.0;
         let materials = palette();
         let floor = RESTING_LOAD;
         for id in 1..=4 {

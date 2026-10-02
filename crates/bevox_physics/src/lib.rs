@@ -227,30 +227,77 @@ pub(crate) mod fixtures {
     /// What the brittle fixture material takes, as the impulse a contact on it
     /// may carry.
     ///
-    /// Calibrated by measurement, and the window is narrow because an impulse
-    /// threshold has to separate a crush from a lean. It sits above the
-    /// 331,306 a three-cube glass stack reaches as it settles onto the floor
-    /// (`resting_weight_breaks_nothing`) and above the 190,512 a body arriving
-    /// at 8 lands (`the_same_collision_breaks_at_any_tick_rate` requires that
-    /// to survive). It sits below the 365,906 a grab presses with at 64 Hz
-    /// (`a_slow_crush_breaks_what_it_presses`), the 405,054 of the two-body
-    /// collision gate, and the 968,836 that arriving at 60 lands.
+    /// **Calibrated against landings, which is the only thing that binds it
+    /// now.** It was 350,000 and it was pinned there by a ceiling that no
+    /// longer exists: before the regime split one number had to serve both a
+    /// struck contact and a held one, so this sat below the 365,906 a grab
+    /// presses with at 64 Hz and above the 331,306 a three-cube stack reaches
+    /// as it settles -- five per cent of headroom either way. A press is now
+    /// judged as a force against `GLASS_CRUSH`, so that ceiling is gone from
+    /// `strength` entirely.
     ///
-    /// 350,000 is the geometric middle of the binding pair, 331,306 and
-    /// 365,906 -- five per cent of headroom either way.
+    /// **The floor is the landing series**, measured 2026-10-02 by
+    /// `solver::tests::how_the_landing_and_the_held_load_scale`, for stacks of
+    /// n glass cubes settling from the 0.2 voxels the fixtures start above the
+    /// floor:
     ///
-    /// **The crush half of that window is gone, and this number has not moved
-    /// yet.** Since the regime split a press is judged as a force against
-    /// `GLASS_CRUSH`, so the 365,906 ceiling no longer applies to `strength`
-    /// at all and the crush gate does not care what this is. What still binds
-    /// it is landings: the series is 126,129 / 246,227 / 331,306 / 356,751 /
-    /// 391,195 / 414,166 for stacks of one to eight, and a four-high stack is
-    /// already over this at 356,751, which is why
-    /// `a_four_high_glass_stack_stands` is `#[ignore]`d and fails. Raising
-    /// this is the next change and the measurements above are what it is
-    /// against. `solver::tests::what_the_tick_rate_does_to_the_blow` is the
-    /// sweep and `docs/concepts/fracture-load-window.md` is what it means.
-    pub const GLASS_STRENGTH: f32 = 350_000.0;
+    /// | n | 1 | 2 | 3 | 4 | 6 | 8 |
+    /// |---|---|---|---|---|---|---|
+    /// | landing impulse | 126,129 | 246,227 | 331,306 | 356,751 | 391,195 | 414,166 |
+    ///
+    /// The series is **sub-linear, about `n^0.55`**, so clearing n = 8 clears
+    /// stacks far taller than eight: doubling to sixteen would add about 47%,
+    /// not 100%. **414,166 is therefore the floor**, and at 350,000 a four-high
+    /// stack already broke on landing at 356,751, which is what kept
+    /// `a_four_high_glass_stack_stands` `#[ignore]`d and failing.
+    ///
+    /// **The ceiling is 607,581**, and it is the two-body collision gate rather
+    /// than any press. `a_collision_breaks_the_same_things_whichever_body_is_
+    /// listed_first` throws an eight-voxel glass pebble that must break, and
+    /// its contact carries 405,054. Eight voxels is under `fracture::SIZE_CAP`,
+    /// so the threshold it meets is `size_factor(8)` -- two thirds -- of this
+    /// constant: `405,054 / (2/3)`. The other collision bound is slacker and
+    /// does not bind: arriving at 60 lands 1,047,814 on a cap-sized cube.
+    ///
+    /// **500,000 is the geometric middle** of 414,166 and 607,581.
+    ///
+    /// | margin | factor | headroom |
+    /// |---|---|---|
+    /// | above the worst landing in the series (n = 8) | 1.207x | +20.7% |
+    /// | above the four-high landing the gate turns on | 1.401x | +40.1% |
+    /// | below the eight-voxel pebble's effective threshold | 1.215x | -17.7% |
+    ///
+    /// A fifth either way, against the five per cent it had before. The window
+    /// went from 1.10x wide to **1.47x**.
+    ///
+    /// **`DEFAULT_STRENGTH` deliberately did not move with this.** Raising
+    /// every strength by the same 10/7 would have taken it to 4,000,000, above
+    /// the 3,429,210 a terminal arrival lands, so default terrain would survive
+    /// every fall there is. It is calibrated against what a *thrown* body
+    /// delivers, not against a landing transient -- it is already eight times
+    /// clear of those -- and that quantity did not change.
+    /// `solver::tests::default_strength_breaks_at_terminal_speed_and_holds_
+    /// below_it` is the gate that now says so. The demo palette *did* move,
+    /// by construction: its ice is pinned to this constant.
+    ///
+    /// **What raising this cost: `over` shrank, and so did the cracks.**
+    /// `fracture::over` is the blow as a multiple of the threshold and it sizes
+    /// the crack pattern, so every blow in the suite now reads 0.7x the `over`
+    /// it did. `fracture::planes_of` was already clamped at its floor of 2 for
+    /// every blow here before and after, and `fracture::reach_of` falls by one
+    /// voxel on exactly one of them -- the pebble, 3 to 2 -- because it grows
+    /// as a square root and is clamped at 2. The visible pattern is therefore
+    /// almost unchanged. What did change is the *top* of the range: the hardest
+    /// blow this engine can land on a cap-sized glass body is 963,237, capped
+    /// by `MAX_SPEED` rather than by any speed a test asks for, and that now
+    /// reads 1.926 over instead of 2.75. `solver::tests::the_hand_back_scales_
+    /// with_how_far_past_strength_the_blow_went` had to drop its bracket from
+    /// 2.5 to `BRACKET` for that reason, which is the one place this change
+    /// made a gate weaker.
+    ///
+    /// `solver::tests::what_the_tick_rate_does_to_the_blow` is the rate sweep
+    /// and `docs/concepts/fracture-load-window.md` is what all of it means.
+    pub const GLASS_STRENGTH: f32 = 500_000.0;
 
     /// What the brittle fixture material takes as a **force**, while a contact
     /// on it is held rather than struck. `GLASS_STRENGTH` is the impact half
@@ -280,8 +327,8 @@ pub(crate) mod fixtures {
     ///
     /// **The floor is 23,909,612**, a four-cube stack at 64 Hz -- the rate
     /// `resting_weight_breaks_nothing` runs at, and the height
-    /// `a_four_high_glass_stack_stands` needs once the impact strengths are
-    /// raised. **47,300,000 is the geometric middle** of that and the ceiling.
+    /// `a_four_high_glass_stack_stands` needs -- which it now passes, the
+    /// impact strengths having been raised. **47,300,000 is the geometric middle** of that and the ceiling.
     ///
     /// | margin | factor |
     /// |---|---|

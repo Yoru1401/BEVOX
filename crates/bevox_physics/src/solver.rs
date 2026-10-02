@@ -2016,6 +2016,71 @@ mod tests {
         (fractures, left)
     }
 
+    /// `DEFAULT_STRENGTH` still means what its doc comment says it means: a
+    /// default-material body breaks when it arrives at terminal speed and
+    /// holds at anything a player can drop it from.
+    ///
+    /// **This gate exists because Task 3 nearly broke that and nothing would
+    /// have said so.** `GLASS_STRENGTH` rose by 10/7 when the crush ceiling
+    /// stopped binding it, and the obvious move was to raise every other
+    /// strength by the same factor to keep the materials in proportion.
+    /// `DEFAULT_STRENGTH` must not move with them: it is not calibrated
+    /// against a landing transient -- it is already eight times clear of the
+    /// worst of those -- but against what a *thrown* body delivers, and that
+    /// quantity did not change. At 10/7 it becomes 4,000,000, which is above
+    /// the 3,429,210 a terminal arrival lands, so default terrain would
+    /// survive any fall and break only at `MAX_SPEED`. The whole suite stayed
+    /// green on that value.
+    ///
+    /// Measured 2026-10-02 with the unbreakable fixture, so the peak is read
+    /// whether or not it broke:
+    ///
+    /// | arrival speed | peak impulse |
+    /// |---|---|
+    /// | 60 | 1,047,814 |
+    /// | 120 | 2,476,651 |
+    /// | 150 | 2,071,706 |
+    /// | 200 (terminal) | 3,429,210 |
+    /// | 256 (`MAX_SPEED`) | 6,096,372 |
+    ///
+    /// **The curve is not monotonic** -- 150 lands a smaller peak than 120 --
+    /// because where inside the substep loop the contact is first seen moves
+    /// with the speed. So this brackets 120 and 200 and says nothing about
+    /// between them, and the doc comment's old "arrives at about 150" was
+    /// never true: at 150 the peak is 2,071,706, under the threshold.
+    ///
+    /// The window it pins is 2,476,651 < `DEFAULT_STRENGTH` <= 3,429,210.
+    #[test]
+    fn default_strength_breaks_at_terminal_speed_and_holds_below_it() {
+        /// Terminal speed for a falling body, which `a_fall_reaches_a_terminal_
+        /// speed` holds under `MAX_SPEED`. The hardest arrival gravity alone
+        /// can produce.
+        const TERMINAL: f32 = 200.0;
+        /// Comfortably the hardest drop a player builds, and well under
+        /// terminal.
+        const A_LONG_DROP: f32 = 120.0;
+
+        let (hard, _) = slam(MaterialId(1), TERMINAL, DT);
+        assert!(
+            hard.iter().any(|f| f.body.is_some()),
+            "a default-material body arriving at {TERMINAL} broke nothing. `DEFAULT_STRENGTH` \
+             is {}, and the peak a terminal arrival lands is a measured 3,429,210: above that \
+             the default material survives every fall there is and breaks only at `MAX_SPEED`, \
+             which is not what its doc comment claims. Was it scaled with `GLASS_STRENGTH`?",
+            bevox_core::material::DEFAULT_STRENGTH
+        );
+
+        let (soft, _) = slam(MaterialId(1), A_LONG_DROP, DT);
+        assert!(
+            soft.is_empty(),
+            "a default-material body arriving at {A_LONG_DROP} broke {} things against a \
+             `DEFAULT_STRENGTH` of {}: default terrain is meant to be the tough case and \
+             survive any fall a player builds",
+            soft.len(),
+            bevox_core::material::DEFAULT_STRENGTH
+        );
+    }
+
     /// Hit something hard enough and it breaks; land gently and it does not.
     #[test]
     fn a_hard_landing_breaks_and_a_soft_one_does_not() {
@@ -2104,7 +2169,7 @@ mod tests {
     /// same speed on the same voxel. The only difference is how many voxels the
     /// struck voxel's body has -- one against twenty-seven, which is `SIZE_CAP`
     /// and so the full span of the size term: a third of `GLASS_STRENGTH`
-    /// against the whole of it, 116,667 against 350,000.
+    /// against the whole of it, 166,667 against 500,000.
     #[test]
     fn a_small_body_breaks_before_a_large_one() {
         // A 1x1x27 bar rather than a 3x3x3 cube: the cube would present a nine
@@ -2115,7 +2180,7 @@ mod tests {
         let (small, small_blow, _) = hammered(cube_of(1, 4, MaterialId(6)), HAMMER_SPEED);
         let (large, large_blow, _) = hammered(size_cap_bar(), HAMMER_SPEED);
         // Not equal blows -- the bar's own mass means the same hammer leaves a
-        // *larger* impulse on it, 638,388 against 387,507 -- and that is the
+        // *larger* impulse on it, 373,976 against 237,875 -- and that is the
         // stronger statement: the large target survives a harder blow than the
         // one that broke the small one, so what saved it cannot be a gentler
         // hit. The only way to pass this with a flat threshold is for neither
@@ -2124,6 +2189,13 @@ mod tests {
             large_blow >= small_blow,
             "the large target was struck at {large_blow:.0} and the small one at \
              {small_blow:.0}: it survived for want of a blow, not for its size"
+        );
+        println!(
+            "small (1 voxel): blow {small_blow:.0} against {:.0}; large ({} voxels): blow \
+             {large_blow:.0} against {:.0}",
+            crate::fixtures::GLASS_STRENGTH * fracture::size_factor(1),
+            fracture::SIZE_CAP,
+            crate::fixtures::GLASS_STRENGTH * fracture::size_factor(fracture::SIZE_CAP),
         );
         assert!(
             small.iter().any(|f| f.body.is_some()),
@@ -2157,16 +2229,49 @@ mod tests {
     }
 
     /// A strike that passes the threshold and almost nothing more: `over` is
-    /// 1.069, a blow of 373,976 against `GLASS_STRENGTH`.
-    const BARELY_OVER_SPEED: f32 = 100.0;
+    /// 1.073, a blow of 536,400 against `GLASS_STRENGTH`.
+    ///
+    /// **Raised from 100 with `GLASS_STRENGTH`**, by the same 10/7. At 100 the
+    /// blow is 373,976, which was 1.069 times over 350,000 and is 0.748 times
+    /// over 500,000 -- under the threshold, breaking nothing, leaving this gate
+    /// measuring two hand-backs of zero. Both speeds here move together so the
+    /// pair still brackets 2.5.
+    const BARELY_OVER_SPEED: f32 = 143.0;
 
-    /// A strike far past it: `over` is 2.687, a blow of 940,572.
+    /// The `over` the two strikes must straddle, and so the fixed hand-back
+    /// fraction this pair rules out: `1 - 1/BRACKET`.
+    ///
+    /// **It was 2.5, because `1 - 1/2.5 == 0.6` and 0.6 was the fixed
+    /// `REBOUND` this rule replaced.** That is no longer reachable, and the
+    /// reason is the one Review Focus 5 predicted: raising `GLASS_STRENGTH`
+    /// shrinks `over` for every blow, and here it shrinks the *largest `over`
+    /// the fixture can reach at all*. `MAX_SPEED` is 256, so the hammer's
+    /// arrival speed is capped and the blow saturates: measured 2026-10-02, it
+    /// is 963,000 at 357 and unchanged at 500, 800 and 1500. Against 500,000
+    /// that is 1.926 over, and no strike in this fixture exceeds it. Against
+    /// the old 350,000 the same saturated blow was 2.75 over, which is why 2.5
+    /// used to fit.
+    ///
+    /// 1.5 is the round value between the two reachable readings, 1.073 and
+    /// 1.926. What it rules out is a fixed hand-back of a third rather than of
+    /// 0.6 -- a weaker statement than the gate used to make, and the
+    /// substance of the gate is the two assertions below it, which compare the
+    /// two strikes against *each other* and need no absolute bracket at all.
+    const BRACKET: f32 = 1.5;
+
+    /// A strike far past it: `over` is 1.926, a blow of 963,237 -- and that is
+    /// the hardest blow this fixture can land at all, `MAX_SPEED` rather than
+    /// this speed being what sets it.
+    ///
+    /// **Raised from 250 with `GLASS_STRENGTH`**, by the same 10/7: at 250 the
+    /// blow of 940,572 is only 1.881 times over 500,000, which no longer sits
+    /// above the 2.5 this pair has to bracket.
     ///
     /// The two speeds bracket 2.5, which is where a fixed 0.6 hand-back and
     /// the excess coincide -- `1 - 1/2.5 == 0.6`. A fixed fraction is therefore
     /// too generous on one of these strikes and too mean on the other, and
     /// cannot be right about both.
-    const FAR_OVER_SPEED: f32 = 250.0;
+    const FAR_OVER_SPEED: f32 = 357.0;
 
     /// The hand-back is the excess, so it scales with how far past strength the
     /// blow went: a hammer barely over the threshold is left nearly stopped,
@@ -2199,11 +2304,18 @@ mod tests {
             "the gentler strike left {barely_blow:.0} and broke nothing: it is under the \
              threshold, so this gate is measuring two hand-backs of zero"
         );
+        println!(
+            "barely: blow {barely_blow:.0}, over {barely_over:.3}, left {barely_left:.2} of \
+             {BARELY_OVER_SPEED}; far: blow {far_blow:.0}, over {far_over:.3}, left \
+             {far_left:.2} of {FAR_OVER_SPEED}"
+        );
         assert!(
-            far_over > 2.5 && barely_over < 2.5,
-            "the two strikes read {barely_over:.3} and {far_over:.3} times over strength and \
-             do not bracket 2.5, where a fixed 0.6 and the excess agree: a fixed fraction \
-             could sit between them and pass"
+            far_over > BRACKET && barely_over < BRACKET,
+            "the two strikes read {barely_over:.3} and {far_over:.3} times over strength \
+             (blows {barely_blow:.0} and {far_blow:.0}) and do not bracket {BRACKET}, where a \
+             fixed hand-back of {:.3} and the excess agree: a fixed fraction could sit between \
+             them and pass",
+            1.0 - 1.0 / BRACKET
         );
 
         let (barely_share, far_share) =
@@ -2216,8 +2328,14 @@ mod tests {
              rather than the excess",
             barely_share * 100.0
         );
+        // 0.35 when the far strike read 2.687 times over strength. The share a
+        // hammer keeps falls with `over` -- the hand-back is the excess, so a
+        // blow less far past the threshold is charged a larger fraction of
+        // itself -- and `over` is now capped at 1.926 by `MAX_SPEED`, not by
+        // the speed this fixture asks for. Measured 29.3% at that ceiling. The
+        // bound tracks the ceiling; it is not a property that got worse.
         assert!(
-            far_share > 0.35,
+            far_share > 0.25,
             "a hammer {far_over:.3} times over the threshold kept only {:.1}% of its speed \
              ({far_left:.2} of {FAR_OVER_SPEED}), blow {far_blow:.0}: a blow far past what the \
              material could take is being charged most of itself for the break",
@@ -2235,9 +2353,15 @@ mod tests {
 
     /// Chosen so both blows land between a single voxel's threshold and a
     /// capped body's, which is what leaves the size term as the only thing that
-    /// can decide the outcome: the small target reads 164,915 against 116,667
-    /// and the large one 260,656 against 350,000.
-    const HAMMER_SPEED: f32 = 70.0;
+    /// can decide the outcome: the small target reads 237,875 against 166,667
+    /// and the large one 373,976 against 500,000.
+    ///
+    /// **Raised from 70 with `GLASS_STRENGTH`**, by the same 10/7, when the
+    /// crush ceiling stopped binding the impact threshold. At 70 the small
+    /// target read 164,915 against a third of 500,000, which is 166,667 -- it
+    /// survived by one per cent and the gate failed. That is `over` shrinking
+    /// because the threshold rose, and the fixture has to follow it.
+    const HAMMER_SPEED: f32 = 100.0;
 
     /// Dwyer's devlog 28, and the reason the threshold is not on force: what
     /// breaks must not depend on how often the physics ticks.
@@ -2337,11 +2461,18 @@ mod tests {
             (a - b).abs() < 1e-3 * a.max(b),
             "the same collision read as {a:.1} one way round and {b:.1} the other"
         );
+        // Against the *scaled* threshold, which is the one the blow had to
+        // exceed to be reported at all: the pebble is `cube_of(2, ..)`, eight
+        // voxels, so `size_factor` puts its threshold at two thirds of the
+        // table figure. Reading the raw constant here was only coincidentally
+        // true -- at a `GLASS_STRENGTH` of 350,000 the blow of 405,054 cleared
+        // the unscaled number too, and at 500,000 it clears 333,333 and not
+        // 500,000. The fixture is unchanged; the guard was wrong.
+        let threshold = crate::fixtures::GLASS_STRENGTH * fracture::size_factor(8);
         assert!(
-            a > crate::fixtures::GLASS_STRENGTH,
-            "the blow came out at {a:.1}, at or under the {} it had to exceed to be reported \
-             at all, so this is reading something other than the impulse",
-            crate::fixtures::GLASS_STRENGTH
+            a > threshold,
+            "the blow came out at {a:.1}, at or under the {threshold} it had to exceed to be \
+             reported at all, so this is reading something other than the impulse"
         );
     }
 
@@ -2410,7 +2541,7 @@ mod tests {
     /// warm starting seeds each tick from the last, so a stack carries a large
     /// one while doing nothing much. This stack's bottom contact reaches a
     /// measured 331,306, which is why `GLASS_STRENGTH` -- the weakest material
-    /// in the fixture table -- is 350,000 and not the 20 it was when the blow
+    /// in the fixture table -- is 500,000 and not the 20 it was when the blow
     /// was a closing speed. At 20 this fails by 61,134 fractures.
     ///
     /// **The 331,306 is the stack *landing*, not its weight.** It peaks at
@@ -3814,41 +3945,35 @@ mod tests {
         }
     }
 
-    /// **A characterisation of a known defect, not a property anyone wants.**
-    /// A four-high glass stack destroys itself as it settles.
+    /// A four-high glass stack settles onto the floor without destroying
+    /// itself.
     ///
-    /// `resting_weight_breaks_nothing` stands three cubes and `GLASS_STRENGTH`
-    /// is 350,000, calibrated just above the 331,306 that stack carries. A
-    /// fourth cube carries 356,751 -- measured 2026-10-02 and recorded in
-    /// `docs/concepts/fracture-load-window.md` -- which is *above* the shipped
-    /// strength. So the cliff is at **four cubes, not past four**: the page
-    /// said six, and the arithmetic in its own table said four.
+    /// **This was a characterisation of a defect and is now a gate.** It was
+    /// `#[ignore]`d and failing for the whole life of the one-number
+    /// threshold: a fourth cube lands 356,751 on its bottom contact, measured
+    /// 2026-10-02, against a `GLASS_STRENGTH` pinned at 350,000 by the
+    /// 365,906 a grab presses with. Nothing could be done about it while one
+    /// constant had to clear a landing and stay under a press.
     ///
-    /// **What it is not is weight.** The break lands at tick 5, and
-    /// `what_the_tick_rate_does_to_the_blow` measures the three-cube stack's
-    /// *settled* blow at 18,798 against a transient maximum of 331,306 at
-    /// tick 5 -- the same tick. Both tables' "resting load" is the stack
-    /// landing from the 0.2 voxels the fixture starts above the floor, and the
-    /// load it then holds is twenty times smaller. The same four cubes started
-    /// at their settled heights do not break, which this test prints.
+    /// Two changes freed it. The regime split sends a press to
+    /// `Material::crush` as a force, so the press ceiling left `strength`
+    /// altogether; `GLASS_STRENGTH` then rose to 500,000, above the whole
+    /// measured landing series and 1.4x above this stack's 356,751.
     ///
-    /// **It is expected to fail until the rule separates a steady load from a
-    /// newly-taken one**, which is the fix the concept page names. The second
-    /// candidate it used to name -- stop counting the bias's push-out -- is
-    /// withdrawn: measured 2026-10-02 by `where_a_landing_peak_comes_from`,
-    /// the bias is 0.0% of this peak and the blow is momentum the tick's own
-    /// `sum m dv + m g dt` accounts for exactly. Raising `GLASS_STRENGTH` is
-    /// not it either: 350,000 is already within 5% of the 365,906 a grab can
-    /// press with, and `how_the_landing_and_the_held_load_scale` measures a
-    /// six-high landing at 391,195 and an eight-high at 414,166, both *above*
-    /// that ceiling -- so past five cubes no strength satisfies both gates.
+    /// **What it is not is weight.** The break used to land at tick 5, and
+    /// `what_the_tick_rate_does_to_the_blow` measures a three-cube stack's
+    /// *settled* blow at 18,798 against a transient maximum of 331,306 at the
+    /// same tick. Both tables' "resting load" is the stack landing from the 0.2
+    /// voxels the fixture starts above the floor, and the load it then holds is
+    /// twenty times smaller. The same four cubes started at their settled
+    /// heights never broke even at 350,000, which this test still prints as the
+    /// control that says which of the two the assertion is about.
     ///
-    /// `#[ignore]`d for the same reason as
-    /// `the_240_to_1_load_collapses_through_the_floor`: it is a record of a
-    /// bug, not a gate the suite should enforce. The day it passes, drop the
-    /// `#[ignore]` and the defect half of this comment.
+    /// **Its taller sibling is still `#[ignore]`d and still fails.**
+    /// `an_eight_high_glass_stack_stands` fails on the *held* branch, not this
+    /// one, and for a stacking reason rather than a fracture one: eight cubes
+    /// never settle. That is outside this change.
     #[test]
-    #[ignore]
     fn a_four_high_glass_stack_stands() {
         let materials = materials();
         let world = slab_of(64, 0..8, MaterialId(6));
@@ -3952,9 +4077,10 @@ mod tests {
     /// **So this gate does not belong to fracture and is expected to fail
     /// until stacking is fixed.** The day eight cubes settle, this should pass
     /// with no change to any fracture constant -- which is the prediction it
-    /// exists to record. `#[ignore]`d for the same reason as
-    /// `a_four_high_glass_stack_stands`: it is a record of a bug, not a gate
-    /// the suite should enforce.
+    /// exists to record. `#[ignore]`d because it is a record of a bug, not a
+    /// gate the suite should enforce -- which is what
+    /// `a_four_high_glass_stack_stands` used to be and, since `GLASS_STRENGTH`
+    /// rose above the whole landing series, no longer is.
     #[test]
     #[ignore]
     fn an_eight_high_glass_stack_stands() {

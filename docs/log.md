@@ -1,6 +1,47 @@
 # Update Log
 
 ## 2026-10-02
+* **Update**: the impact strengths rose, the ceiling having left them —
+  [The impulse threshold is a force threshold for everything it was built for](concepts/fracture-load-window.md).
+  `GLASS_STRENGTH` sat at **350,000** only to stay under the **365,906** a
+  saturated grab presses with; the regime split sends a press to
+  `Material::crush` as a force, so that ceiling no longer applies to `strength`
+  at all. It is now **500,000**, the geometric middle of the **414,166** an
+  eight-high stack lands with (the worst of a landing series that is sub-linear
+  at about `n^0.55`, so clearing eight clears far taller) and the **607,581**
+  the two-body collision gate allows — an eight-voxel pebble carrying 405,054
+  against a `size_factor(8)` of two thirds. The window went from **1.10x to
+  1.47x**. `a_four_high_glass_stack_stands` is **un-`#[ignore]`d and passing**
+  after failing for the whole life of the one-number threshold. The demo palette
+  moved with it, its ice being pinned to that constant: 1,312,500 / 729,167 /
+  350,000 → **1,875,000 / 1,041,667 / 500,000**, and the palette gate's floor
+  rose from the three-cube 331,306 to 414,166.
+* **Creation**: `default_strength_breaks_at_terminal_speed_and_holds_below_it`,
+  because scaling every strength by the same 10/7 nearly shipped terrain nothing
+  could break. `DEFAULT_STRENGTH` is calibrated against what a **thrown** body
+  delivers, not a landing — it is already seven times clear of those — and the
+  measured peak curve is 1,047,814 / 2,476,651 / 2,071,706 / 3,429,210 /
+  6,096,372 at arrival speeds 60 / 120 / 150 / 200 / 256. At 10/7 it becomes
+  4,000,000, **above the 3,429,210 a terminal arrival lands**, so default terrain
+  would survive every fall there is and break only at `MAX_SPEED`. **The whole
+  suite stayed green on that value.** It stays at 2,800,000 and the new gate
+  pins the window 2,476,651 to 3,429,210. The curve is also **not monotonic** —
+  150 lands less than 120, the substep the contact is first seen in moving with
+  the speed — so the old doc comment's "arrives at about 150" was never true.
+* **Update**: raising a threshold shrinks `fracture::over`, and `over` sizes the
+  crack pattern. Every blow now reads **0.7x** the `over` it did. The visible
+  pattern barely moves: `planes_of` was already at its clamp floor of 2 for
+  every blow in the suite before and after, and `reach_of` loses one voxel on
+  exactly one of them (the eight-voxel pebble, 3 → 2). What did shrink is the
+  **top** of the range — the hardest blow the engine can land on a cap-sized
+  glass body is **963,237**, capped by `MAX_SPEED` and not by any speed a test
+  asks for, and that reads **1.926** over instead of 2.75. So
+  `the_hand_back_scales_with_how_far_past_strength_the_blow_went` lost the
+  bracket it was built on: `1 - 1/2.5 == 0.6` pinned the fixed `REBOUND` the
+  rule replaced, 2.5 is no longer reachable, and the bracket is now 1.5, which
+  rules out a fixed third instead. **The one place this change made a gate
+  weaker.** A heavier hammer would buy 2.5 back, since the cap is on speed and
+  the blow is an impulse.
 * **Update**: the fracture load window, taken apart by measurement —
   [The impulse threshold is a force threshold for everything it was built for](concepts/fracture-load-window.md).
   Three of the page's claims were wrong and are now corrected. The bias

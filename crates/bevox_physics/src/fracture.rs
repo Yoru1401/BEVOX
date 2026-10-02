@@ -71,11 +71,23 @@
 //!   *landing*, not weight.** It peaks at tick 5 -- the fixture starts 0.2
 //!   voxels above where it settles. The load the same stack then holds is
 //!   18,798. (It is momentum and not the bias: measured 0.0%.)
-//! - **A four-high glass stack destroys itself**, at 356,751 against a
-//!   strength of 350,000, on the same landing. `a_four_high_glass_stack_stands`
-//!   records it and fails. Raising `GLASS_STRENGTH` is now possible, because it
-//!   only ever sat at 350,000 to stay under a 365,906 crush ceiling that no
-//!   longer exists -- but it has not been done.
+//!   `GLASS_STRENGTH` is now calibrated against the whole landing series
+//!   rather than against the three-cube figure, so this bounds the constant
+//!   without breaking anything: 500,000 clears the worst of it, 414,166 at
+//!   eight cubes, by 1.21x. It is still a landing and not a weight, which is
+//!   why the margin has to be read against a transient.
+//! - **A four-high glass stack no longer destroys itself**, and
+//!   `a_four_high_glass_stack_stands` is a passing gate rather than a record.
+//!   It failed at 356,751 against a strength of 350,000, which only ever sat
+//!   there to stay under a 365,906 crush ceiling. The regime split sent the
+//!   press to `Material::crush` as a force, the ceiling left `strength`, and
+//!   `GLASS_STRENGTH` rose to 500,000. **What the raise cost** is `over`: it is
+//!   the blow as a multiple of the threshold and it sizes the crack pattern, so
+//!   every blow now reads 0.7x the `over` it did. `planes_of` was already at
+//!   its clamp floor of 2 for every blow in the suite before and after, and
+//!   `reach_of` loses one voxel on one of them, so the pattern barely moves --
+//!   but the hardest blow the engine can land on a cap-sized glass body,
+//!   963,237 and capped by `MAX_SPEED`, now reads 1.926 over instead of 2.75.
 //! - **The held branch's own floor is a landing too, and no reading of the
 //!   impulse fixes it.** `GLASS_CRUSH` is calibrated between what a press
 //!   delivers as a force and what a stack's largest *held* contact carries,
@@ -187,9 +199,14 @@ pub const SIZE_CAP: u32 = 27;
 /// Normalising puts the calibration point at the cap instead of at one voxel,
 /// which is where it was measured. Nothing at or past the cap moves at all;
 /// only small bodies get weaker, which is the whole of what Dwyer's comment
-/// claims. The window those two bounds leave is 331,306 to 365,906 -- ten per
-/// cent wide, documented in `docs/concepts/fracture-load-window.md` as an open
-/// defect -- and a multiplicative term spanning three needs three hundred.
+/// claims. The window those two bounds leave was 331,306 to 365,906 -- ten per
+/// cent wide, documented in `docs/concepts/fracture-load-window.md` -- and a
+/// multiplicative term spanning three needs three hundred. The window is now
+/// 414,166 to 607,581, **47 per cent**, since the crush bound left `strength`
+/// and `GLASS_STRENGTH` rose to 500,000. Still not three hundred, so the
+/// normalisation stands; and the second bound above is now the *only* thing
+/// holding the term down, which is what makes `size_factor(8)` worth measuring
+/// if anyone ever wants the rule Dwyer actually asks for.
 pub fn size_factor(voxels: u32) -> f32 {
     (voxels.min(SIZE_CAP) as f32).cbrt() / (SIZE_CAP as f32).cbrt()
 }

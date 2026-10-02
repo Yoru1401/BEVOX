@@ -80,19 +80,45 @@ pub const DEFAULT_RESTITUTION: u8 = 5;
 /// What a material takes before it cracks when its source says nothing.
 ///
 /// An impulse, as `Material::strength` is, so it has to be read against a body:
-/// a four-voxel cube of ordinary stone weighs 64,000 in these units, and
-/// driven into terrain it lands a measured peak of 2.48e6 at 120 voxels a
-/// second and 3.43e6 at 200. 2.8e6 is where that body arrives at about 150,
-/// which keeps the meaning the old closing-speed threshold had: "survives any
-/// fall a player builds and breaks when it is thrown or blasted", a terminal
-/// speed being 200. Default terrain should be the tough case; what is meant to
-/// shatter says so.
+/// a four-voxel cube of ordinary stone weighs 64,000 in these units. Driven
+/// into terrain, the peak impulse its contact carries is measured
+/// 2026-10-02 as:
+///
+/// | arrival speed | peak impulse |
+/// |---|---|
+/// | 60 | 1,047,814 |
+/// | 120 | 2,476,651 |
+/// | 150 | 2,071,706 |
+/// | 200 (terminal) | 3,429,210 |
+/// | 256 (`MAX_SPEED`) | 6,096,372 |
+///
+/// 2.8e6 sits between the 120 row and the 200 row, which keeps the meaning the
+/// old closing-speed threshold had: "survives any fall a player builds and
+/// breaks when it is thrown or blasted", a terminal speed being 200. Default
+/// terrain should be the tough case; what is meant to shatter says so.
+/// `physics::solver::tests::default_strength_breaks_at_terminal_speed_and_
+/// holds_below_it` is the gate, and the window it pins is 2,476,651 to
+/// 3,429,210.
+///
+/// **The curve is not monotonic**: 150 lands a smaller peak than 120, because
+/// where inside the substep loop the contact is first seen moves with the
+/// speed. An earlier version of this comment said 2.8e6 "is where that body
+/// arrives at about 150", which the measurement falsifies -- at 150 the peak
+/// is 2,071,706, under the threshold.
+///
+/// **This did not move when `GLASS_STRENGTH` rose by 10/7**, and the gate above
+/// exists because it nearly did. 4,000,000 is above the 3,429,210 a terminal
+/// arrival lands, so default terrain would survive every fall there is and
+/// break only at `MAX_SPEED`. Nothing in the suite failed on that value until
+/// the gate was written. This constant is calibrated against what a *thrown*
+/// body delivers and `GLASS_STRENGTH` against what a *stack* lands with; the
+/// two are independent and only the second one changed.
 ///
 /// Well clear of resting load, which is the constraint an impulse threshold
-/// has and a speed does not: a three-cube stack of that same body reaches a
-/// measured 331,306 on its bottom contact as it *settles*, so this leaves a
-/// factor of eight against the worst of it. That figure is a landing transient
-/// and not a weight -- the load the same stack then holds is 18,798 -- but the
+/// has and a speed does not: the worst landing transient any glass stack
+/// reaches is a measured 414,166, at eight cubes, so this leaves a factor of
+/// nearly seven against the worst of it. That figure is a landing and not a
+/// weight -- the load a three-cube stack then holds is 18,798 -- but the
 /// transient is the number a strength has to clear, which is why it is the one
 /// quoted. `docs/concepts/fracture-load-window.md` has both.
 pub const DEFAULT_STRENGTH: f32 = 2_800_000.0;
