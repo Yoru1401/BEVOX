@@ -3300,18 +3300,32 @@ mod tests {
     }
 
     /// **What a press and a resting stack deliver as a *force*.** Not a gate:
-    /// it prints the two numbers `Material::crush` is calibrated between.
+    /// it prints the two numbers `Material::crush` is calibrated between, and
+    /// it prints them **two ways**, which is the point of it.
     ///
-    /// The held branch's blow is `peak[at] * SUBSTEPS / dt`, so `crush` has to
-    /// sit above the largest force any *held* contact of a stack standing
-    /// there ever carries, and below the smallest force a saturated grab can
-    /// press with at any rate the engine might run at. Only held contacts are
-    /// counted -- a landing closes at 5.36 v/s and goes to the impact branch
-    /// against `strength`, so its force is not a bound on anything here.
+    /// The held branch's blow is an accumulated normal impulse times
+    /// `SUBSTEPS / dt`, and there are two candidates for which impulse:
     ///
-    /// Every material is the unbreakable fixture, so nothing fractures and no
-    /// measured load is perturbed by the scene coming apart. The rates are
-    /// interleaved in this one invocation.
+    /// - **`peak`**, the largest the contact reached at any point inside the
+    ///   tick, which is what the impact branch reads.
+    /// - **`settled`**, what it ended the tick carrying -- the value `step`
+    ///   writes into `b.warm` for the next tick to warm-start from.
+    ///
+    /// For a press they should be the same thing: it holds steadily, so the
+    /// maximum and the final value coincide. For the ticks *after* a landing
+    /// they are not, and that is the whole finding. The closing speed has
+    /// decayed below `IMPACT_SPEED` by then, so the contact is classified
+    /// held, while `peak` still carries the landing residue -- the diagnosis
+    /// measured 331,306 transient against 18,798 settled for a three-stack, a
+    /// factor of seventeen. So `peak` on the held branch makes a *landing*
+    /// the floor a crush threshold has to clear, and a landing is not flat in
+    /// the tick rate.
+    ///
+    /// Only held contacts are counted: a landing closes at 5.36 v/s and goes
+    /// to the impact branch against `strength`, so its force is not a bound on
+    /// anything here. Every material is the unbreakable fixture, so nothing
+    /// fractures and no measured load is perturbed by the scene coming apart.
+    /// The rates are interleaved in this one invocation.
     #[test]
     #[ignore]
     fn what_a_press_delivers_as_a_force() {
@@ -3323,33 +3337,66 @@ mod tests {
         let ticks = |seconds: f32, dt: f32| (seconds / dt).round() as u32;
 
         /// The largest force any **held** contact carried in the tick just
-        /// stepped: the trace's own per-contact peak accumulated impulse times
-        /// `SUBSTEPS / dt`, over the contacts whose closing speed at detection
-        /// was under `fracture::IMPACT_SPEED`. This is the quantity
-        /// `break_what_gave_way` computes, assembled from the trace rather
-        /// than from a number the solver reports, because `StepOutcome` has
-        /// only the scene-wide maximum and that is dominated by impacts.
-        fn held_force(dt: f32) -> f32 {
+        /// stepped, by both readings: `(peak, settled)`.
+        ///
+        /// Assembled from the trace rather than from a number the solver
+        /// reports, because `StepOutcome` carries only the scene-wide maximum
+        /// and that is dominated by impacts. `settled` is the `after` of the
+        /// last `solve` call on each contact, which is `impulses` as the
+        /// substep loop leaves it -- and nothing between there and
+        /// `b.warm.insert` touches it, so it is the warm-start value exactly.
+        fn held_force(dt: f32) -> (f32, f32, String) {
             let (rows, layout) = trace::take();
             let mut peak = vec![0.0f32; layout.len()];
+            let mut settled = vec![0.0f32; layout.len()];
+            let mut last = vec![(0u32, 0u8); layout.len()];
             for r in &rows {
-                if r.at < peak.len() {
-                    peak[r.at] = peak[r.at].max(r.after);
+                if r.at >= peak.len() {
+                    continue;
+                }
+                peak[r.at] = peak[r.at].max(r.after);
+                if (r.substep, r.pass) >= last[r.at] {
+                    last[r.at] = (r.substep, r.pass);
+                    settled[r.at] = r.after;
                 }
             }
-            peak.iter()
-                .zip(&layout)
-                .filter(|(_, w)| -w.approach < fracture::IMPACT_SPEED)
-                .map(|(&p, _)| p * SUBSTEPS as f32 / dt)
-                .fold(0.0f32, f32::max)
+            let held = |v: &[f32]| {
+                v.iter()
+                    .enumerate()
+                    .filter(|(at, _)| -layout[*at].approach < fracture::IMPACT_SPEED)
+                    .map(|(at, &p)| (at, p * SUBSTEPS as f32 / dt))
+                    .fold((usize::MAX, 0.0f32), |best, now| if now.1 > best.1 { now } else { best })
+            };
+            let (_, by_peak) = held(&peak);
+            let (at, by_settled) = held(&settled);
+            // Which contact the settled maximum sits on, because that is what
+            // decides whether the floor can be lowered at all: a floor contact
+            // of the bottom cube is a landing the discriminator could in
+            // principle see, and a contact *between* two cubes falling
+            // together is one it cannot -- their relative closing speed is
+            // genuinely ~0 while they transmit the whole landing.
+            let who = layout.get(at).map_or_else(
+                || "-".to_owned(),
+                |w| {
+                    format!(
+                        "b{}<->{} n.y{:+.2} appr{:+.4}",
+                        w.body,
+                        w.other.map_or_else(|| "world".to_owned(), |o| format!("b{o}")),
+                        w.normal_y,
+                        w.approach
+                    )
+                },
+            );
+            (by_peak, by_settled, who)
         }
 
         // The crush fixture, with the floor unbreakable so the press runs the
-        // whole way. Returns the largest held force it reached and whether the
-        // pressed body was awake at the end -- a sleeping body raises no
-        // contacts at all, so a crush gate passing against a sleeper would be
-        // passing for a reason that has nothing to do with the threshold.
-        let press = |dt: f32| -> (f32, u32, bool) {
+        // whole way. Returns the largest held force by each reading and
+        // whether the pressed body was awake at the end -- a sleeping body
+        // raises no contacts at all, so a crush gate passing against a
+        // sleeper would be passing for a reason that has nothing to do with
+        // the threshold.
+        let press = |dt: f32| -> (f32, f32, bool) {
             let materials = materials();
             let world = slab_of(64, 0..8, unbreakable);
             let field = DistanceField::build(&world);
@@ -3357,7 +3404,7 @@ mod tests {
             let mut bodies = vec![placed(cube_of(4, 4, unbreakable), centre, Quat::IDENTITY)];
             assert!(recompute(&mut bodies[0], &materials));
             let mut grab = Joint::grab(&bodies[0], centre);
-            let (mut force, mut at) = (0.0f32, 0u32);
+            let (mut by_peak, mut by_settled) = (0.0f32, 0.0f32);
             for tick in 0..ticks(PRESS_SECONDS, dt) {
                 grab.anchor_b = centre - Vec3::Y * (tick as f32 * dt * CREEP);
                 trace::arm();
@@ -3372,19 +3419,18 @@ mod tests {
                     &mut [],
                 );
                 assert!(out.fractures.is_empty(), "the unbreakable fixture broke");
-                let f = held_force(dt);
-                if f > force {
-                    force = f;
-                    at = tick;
-                }
+                let (p, s, _) = held_force(dt);
+                by_peak = by_peak.max(p);
+                by_settled = by_settled.max(s);
             }
-            (force, at, !bodies[0].asleep)
+            (by_peak, by_settled, !bodies[0].asleep)
         };
 
-        // `resting_weight_breaks_nothing`'s stack, at whatever height.
-        // Returns the largest held force any contact in it reached and how
-        // many of its bodies ended asleep.
-        let stack = |n: u32, dt: f32| -> (f32, u32, usize) {
+        // `resting_weight_breaks_nothing`'s stack, at whatever height. Returns
+        // the largest held force by each reading, the tick each landed on, and
+        // how many bodies ended asleep. `show` prints the first `show` ticks,
+        // which is where a landing is.
+        let stack = |n: u32, dt: f32, show: u32| -> (f32, u32, f32, u32, usize) {
             let materials = materials();
             let world = slab_of(64, 0..8, unbreakable);
             let field = DistanceField::build(&world);
@@ -3397,56 +3443,77 @@ mod tests {
                     )
                 })
                 .collect();
-            let (mut force, mut at) = (0.0f32, 0u32);
+            if show > 0 {
+                println!("\n  {n}-high at {:.0} Hz, first {show} ticks:", 1.0 / dt);
+                println!(
+                    "    tick |     by `peak` |  by `settled` | ratio | where the settled \
+                     maximum sits"
+                );
+            }
+            let (mut by_peak, mut at_peak) = (0.0f32, 0u32);
+            let (mut by_settled, mut at_settled) = (0.0f32, 0u32);
             for tick in 1..=ticks(REST_SECONDS, dt) {
                 trace::arm();
                 let out =
                     step(&mut bodies, &world, &field, &materials, Air::VACUUM, dt, None, &mut []);
                 assert!(out.fractures.is_empty(), "the unbreakable fixture broke");
-                let f = held_force(dt);
-                if f > force {
-                    force = f;
-                    at = tick;
+                let (p, s, who) = held_force(dt);
+                if tick <= show {
+                    println!(
+                        "    {tick:>4} | {p:>13.0} | {s:>13.0} | {:>5.1} | {who}",
+                        if s > 0.0 { p / s } else { f32::INFINITY }
+                    );
+                }
+                if p > by_peak {
+                    by_peak = p;
+                    at_peak = tick;
+                }
+                if s > by_settled {
+                    by_settled = s;
+                    at_settled = tick;
                 }
             }
-            (force, at, bodies.iter().filter(|b| b.asleep).count())
+            (by_peak, at_peak, by_settled, at_settled, bodies.iter().filter(|b| b.asleep).count())
         };
 
+        // The per-tick detail first, at 64 Hz, which is where the landing
+        // residue is visible if it is anywhere.
+        for n in [3, 4, 8] {
+            stack(n, DT, 12);
+        }
+
         println!(
-            "\n   Hz |    press force | at | awake |      3-high held |      4-high held |      \
-             8-high held"
+            "\n   Hz |  press by peak | press settled | awake |        3-high peak / settled \
+             |        4-high peak / settled |        8-high peak / settled"
         );
-        println!(
-            "  ----+----------------+----+-------+------------------+------------------+--------\
-             ----------"
-        );
-        let (mut ceiling, mut floor_3, mut floor_4) = (f32::INFINITY, 0.0f32, 0.0f32);
+        let (mut ceiling, mut floors) = (f32::INFINITY, Vec::new());
         for (hz, dt) in [(64, DT), (128, DT / 2.0), (256, DT / 4.0), (512, DT / 8.0)] {
-            let (p, p_at, awake) = press(dt);
-            let (three, at3, slept3) = stack(3, dt);
-            let (four, at4, slept4) = stack(4, dt);
-            let (eight, at8, slept8) = stack(8, dt);
-            println!(
-                "  {hz:>3} | {p:>14.0} | {p_at:>2} | {awake:>5} | {three:>10.0} @{at3:>3} \
-                 ({slept3}) | {four:>10.0} @{at4:>3} ({slept4}) | {eight:>10.0} @{at8:>3} \
-                 ({slept8})"
-            );
-            ceiling = ceiling.min(p);
+            let (pp, ps, awake) = press(dt);
+            let rows: Vec<_> = [3u32, 4, 8].iter().map(|&n| stack(n, dt, 0)).collect();
+            print!("  {hz:>3} | {pp:>14.0} | {ps:>13.0} | {awake:>5} |");
+            for (p, ap, s, as_, slept) in &rows {
+                print!(" {p:>10.0}@{ap:<3} / {s:>9.0}@{as_:<3} ({slept}) |");
+            }
+            println!();
+            ceiling = ceiling.min(ps);
             if hz == 64 {
-                floor_3 = three;
-                floor_4 = four;
+                floors = rows.iter().map(|r| r.2).collect();
             }
             assert!(awake, "the pressed body was asleep at {hz} Hz, so it raised no contacts");
         }
         println!(
-            "\n  the press's floor over the rates is {ceiling:.0}. `resting_weight_breaks_\
-             nothing` runs at 64 Hz only and needs {floor_3:.0}; a four-high stack there needs \
-             {floor_4:.0}. So a crush threshold has {:.2}x to work in against the three-cube \
-             stack and {:.2}x against the four.",
-            ceiling / floor_3,
-            ceiling / floor_4
+            "\n  by `settled`: the press's floor over the rates is {ceiling:.0}; at 64 Hz, the \
+             rate `resting_weight_breaks_nothing` runs at, three cubes need {:.0}, four need \
+             {:.0} and eight need {:.0}. Windows: {:.2}x / {:.2}x / {:.2}x.",
+            floors[0],
+            floors[1],
+            floors[2],
+            ceiling / floors[0],
+            ceiling / floors[1],
+            ceiling / floors[2]
         );
     }
+
     /// **What the tick rate does to the blow.** Not a gate: it prints a table.
     ///
     /// The threshold `break_what_gave_way` reads is `peak[at]`, the largest
