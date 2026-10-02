@@ -670,6 +670,60 @@ mod tests {
     use super::*;
     use crate::scenes::demo_scene;
 
+    /// The physics runs at a fixed rate, and it is the rate the suite tests at.
+    ///
+    /// **This gate exists because the agreement is otherwise a coincidence.**
+    /// `physics_system` is registered in `FixedUpdate`, and inside that schedule
+    /// Bevy rebinds the generic clock to `Time<Fixed>`
+    /// (`bevy_time/src/fixed.rs`: `*world.resource_mut::<Time>() =
+    /// world.resource::<Time<Fixed>>().as_generic()`). So the `time.delta_secs()`
+    /// that `physics_system` hands the solver is Bevy's fixed step, not the frame
+    /// delta — which is the whole reason this engine does not suffer the
+    /// rate-dependence it would otherwise have.
+    ///
+    /// That matters more than it looks. The blow the fracture threshold reads is
+    /// the accumulated contact impulse, which for a *held* contact is force x dt:
+    /// measured on 2026-10-02 at 365,906 at 64 Hz and 93,512 at 512 Hz, a factor
+    /// of four. Every strength in the table is calibrated against 64 Hz. Move
+    /// `physics_system` to `Update`, or call `Time::<Fixed>::from_hz(..)`, and
+    /// the calibration silently stops describing the app while every test keeps
+    /// passing — because the tests pass their own `DT` and never ask what the app
+    /// uses.
+    ///
+    /// `the_same_collision_breaks_at_any_tick_rate` guards the *latent* property.
+    /// This guards the thing that keeps it latent.
+    #[test]
+    fn the_physics_runs_at_the_rate_the_tests_assume() {
+        // Spelled as `1.0 / 64.0` in three private test modules that cannot be
+        // reached from here: `solver.rs`, `sleep.rs` and `joint.rs` each carry
+        // `const DT: f32 = 1.0 / 64.0`. If this ever moves, those move with it.
+        const TESTED_DT: f32 = 1.0 / 64.0;
+
+        let step = Time::<Fixed>::default().timestep().as_secs_f32();
+        assert_eq!(
+            step, TESTED_DT,
+            "physics ticks at {step} s but every gate in bevox_physics is written \
+             against {TESTED_DT} s, and material strengths are calibrated at that rate",
+        );
+
+        // The rate above only reaches the solver if the system is in `FixedUpdate`.
+        // Read from the source, as `tests/map.rs` reads constants from it: Bevy's
+        // schedule graph does not expose membership cheaply, and the registration
+        // is one line that must not quietly change.
+        //
+        // Only the part before the test module is searched. The needle appears
+        // literally in the assertion below, so searching the whole file matches
+        // this test's own source and the gate passes however the app is wired --
+        // which it did, until the deliberate break caught it.
+        let source = include_str!("main.rs");
+        let app_code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            app_code.contains("add_systems(FixedUpdate, physics_system)"),
+            "physics_system is no longer registered in FixedUpdate, so it reads the \
+             frame delta instead of the fixed step and every strength is wrong",
+        );
+    }
+
     /// The demo floor has an ice strip and a rubber patch, so dropping bodies
     /// shows friction and bounce without editing anything.
     #[test]

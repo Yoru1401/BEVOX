@@ -1,6 +1,25 @@
 # Update Log
 
 ## 2026-10-02
+* **Creation**: `the_physics_runs_at_the_rate_the_tests_assume`, which pins the
+  fact that keeps BEVOX's rate-dependence latent. `physics_system` sits in
+  `FixedUpdate`, and inside that schedule Bevy rebinds the generic clock to
+  `Time<Fixed>` — so the `time.delta_secs()` the solver receives is **64 Hz, not
+  the frame delta**. Every material strength is calibrated at that rate, and the
+  fracture blow for a held contact is force x dt (365,906 at 64 Hz, 93,512 at
+  512). Move the system to `Update` or call `Time::<Fixed>::from_hz`, and the
+  calibration stops describing the app **while every test keeps passing**,
+  because the tests pass their own `DT` and never ask what the app uses.
+  `the_same_collision_breaks_at_any_tick_rate` guards the latent property; this
+  guards the thing that keeps it latent.
+* **Fix**: and the gate's first draft was broken, caught by its own deliberate
+  break. It searched `include_str!("main.rs")` for
+  `add_systems(FixedUpdate, physics_system)` — a string that **appears literally
+  in the assertion itself**, so the file always contained it and the gate passed
+  with the system moved to `Update`. It now searches only the source before
+  `#[cfg(test)]`. A self-referential source check is a gate that cannot fail, and
+  nothing but the break would have shown it.
+
 * **Creation**: the stress scene, drift F4's first half —
   `solver::tests::forty_nine_cubes_tumble_without_escaping_diverging_or_sinking`.
   49 glass 2x2x2 cubes in a closed hollow box with two-voxel walls, gravity
