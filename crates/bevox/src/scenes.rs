@@ -122,16 +122,28 @@ pub(crate) fn demo_scene() -> (Contree, MaterialTable) {
 }
 
 /// Stone, brick, ice and rubber.
+///
+/// **Strengths are impulses**, as `Material::strength` has been since fracture
+/// stopped thresholding a closing speed. These were 45, 25 and 12 — speeds in
+/// voxels a second — and nothing in the suite reads this palette, so they
+/// survived the change in units and turned the demo into a scene where a body
+/// landing anywhere set off a chain reaction that took the map apart.
+///
+/// They are rescaled by a single factor, 350_000 / 12, which puts the weakest
+/// of them exactly on `fixtures::GLASS_STRENGTH` — the one strength in this
+/// project measured against what a resting stack actually carries (331_306) —
+/// and leaves stone and brick in the same proportion to it they always had.
+/// `the_demo_palette_outlasts_a_resting_stack` is the gate that was missing.
 pub(crate) fn palette() -> MaterialTable {
     let mut materials = MaterialTable::new();
     materials
-        .push(Material { color: [140, 140, 150, 255], density: 2600, friction: 60, restitution: 5, strength: 45.0 })
+        .push(Material { color: [140, 140, 150, 255], density: 2600, friction: 60, restitution: 5, strength: 1_312_500.0 })
         .unwrap(); // 1: stone
     materials
-        .push(Material { color: [180, 90, 70, 255], density: 1900, friction: 70, restitution: 5, strength: 25.0 })
+        .push(Material { color: [180, 90, 70, 255], density: 1900, friction: 70, restitution: 5, strength: 729_167.0 })
         .unwrap(); // 2: brick
     materials
-        .push(Material { color: [170, 210, 235, 255], density: 900, friction: 4, restitution: 10, strength: 12.0 })
+        .push(Material { color: [170, 210, 235, 255], density: 900, friction: 4, restitution: 10, strength: 350_000.0 })
         .unwrap(); // 3: ice
     materials
         .push(Material {
@@ -325,6 +337,43 @@ fn brick(size: UVec3, corner: Vec3, materials: &MaterialTable) -> Body {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every breakable material the player actually meets outlasts a stack of
+    /// itself standing still.
+    ///
+    /// This gate exists because its absence shipped a broken game. `strength`
+    /// became an impulse when fracture stopped thresholding a closing speed,
+    /// `fixtures::materials()` was recalibrated with it, and this palette was
+    /// not — because no test read it. In the app, 45 against an impulse of
+    /// 331_306 meant a body landing anywhere took the whole map apart, which is
+    /// exactly what Flori saw and the suite did not.
+    ///
+    /// The floor is the resting load itself, measured on 2026-10-02 against a
+    /// clean three-cube glass stack and recorded in
+    /// `docs/concepts/fracture-load-window.md`. It is spelled here because
+    /// `bevox_physics::fixtures` is `pub(crate)` and this crate cannot reach
+    /// `GLASS_STRENGTH`; if the measurement is ever redone, both move together
+    /// or this gate fires, which is the outcome worth having.
+    #[test]
+    fn the_demo_palette_outlasts_a_resting_stack() {
+        /// What a settled three-cube glass stack carries, measured.
+        const RESTING_LOAD: f32 = 331_306.0;
+        let materials = palette();
+        let floor = RESTING_LOAD;
+        for id in 1..=4 {
+            let m = materials.get(MaterialId(id));
+            if m.strength == bevox_core::material::UNBREAKABLE {
+                continue;
+            }
+            assert!(
+                m.strength >= floor,
+                "material {id} has strength {} -- below the {floor} a resting stack already \
+                 carries. A strength under that breaks under its own weight and the whole scene \
+                 comes apart. Did the units change again?",
+                m.strength,
+            );
+        }
+    }
     use bevox_physics::Air;
     use bevox_core::distance_field::DistanceField;
     use bevox_physics::joint::follow;

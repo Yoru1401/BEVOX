@@ -1,6 +1,24 @@
 # Update Log
 
 ## 2026-10-02
+* **Fix**: the demo palette was never rescaled when `strength` became an impulse,
+  and **Flori found it by playing**: a body landing anywhere set off a chain
+  reaction that took the whole map apart. `fixtures::materials()` was
+  recalibrated with the units change; `scenes::palette()` was not, because
+  **nothing in the suite reads it** — so stone, brick and ice stayed at 45, 25
+  and 12, speeds in voxels a second, against a resting impulse of **331,306**.
+  Everything broke on contact with anything. Rescaled by one factor,
+  `350_000 / 12`, which puts the weakest exactly on the measured floor and keeps
+  the three in the proportion they always had.
+* **Creation**: `the_demo_palette_outlasts_a_resting_stack`, the gate whose
+  absence shipped that. It asserts every breakable material the player actually
+  meets is stronger than the load a resting stack carries, and its deliberate
+  break prints *"below the 331306 a resting stack already carries… Did the units
+  change again?"* **The lesson is not the number.** The physics crate's fixtures
+  and the app's palette are two material tables, only one of them is tested, and
+  the tested one is not the one the game runs on.
+
+## 2026-10-02
 * **Fix**: two overclaims the review wave's own fix introduced, both in
   [the convergence page](concepts/solver-convergence-is-a-setting.md), one
   mirrored into `lib.rs`. The page had blamed the non-monotone wander
