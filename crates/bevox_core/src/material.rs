@@ -70,8 +70,12 @@ pub const DEFAULT_RESTITUTION: u8 = 5;
 /// shatter says so.
 ///
 /// Well clear of resting load, which is the constraint an impulse threshold
-/// has and a speed does not: a three-cube stack of that same body leans on its
-/// bottom contact with a measured 331,306, so this leaves a factor of eight.
+/// has and a speed does not: a three-cube stack of that same body reaches a
+/// measured 331,306 on its bottom contact as it *settles*, so this leaves a
+/// factor of eight against the worst of it. That figure is a landing transient
+/// and not a weight -- the load the same stack then holds is 18,798 -- but the
+/// transient is the number a strength has to clear, which is why it is the one
+/// quoted. `docs/concepts/fracture-load-window.md` has both.
 pub const DEFAULT_STRENGTH: f32 = 2_800_000.0;
 
 /// A material that never fractures, however hard it is hit.

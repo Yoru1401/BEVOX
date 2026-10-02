@@ -182,10 +182,13 @@ then fail, and **no value of `SIZE_CAP` above 1 saves them**:
 | gate | blow | struck body | largest factor it tolerates |
 |---|---|---|---|
 | `a_slow_crush_breaks_what_it_presses` | 365,906 | static world, saturated at `SIZE_CAP` | 1.046 |
-| `a_collision_breaks_the_same_things_whichever_body_is_listed_first` | 375,223 | 8-voxel glass pebble | 1.072 |
+| `a_collision_breaks_the_same_things_whichever_body_is_listed_first` | 405,054 | 8-voxel glass pebble | 1.157 |
 | `the_same_collision_breaks_at_any_tick_rate`, at 60 | 1,047,814 | 64-voxel glass cube | 2.994 |
 
-The first two are 4.5% and 7.2% of headroom over 350,000. A multiplicative
+The first two are 4.5% and 15.7% of headroom over 350,000. Both re-measured
+2026-10-02 after review; the pebble's blow was first recorded as 375,223 and
+7.2%, which is wrong — the contact carries 405,054, and the raw rule's factor
+on eight voxels is `cbrt(8) = 2`, so the gate fails either way. A multiplicative
 term spanning three needs three hundred per cent of it, and this window is
 ten.
 

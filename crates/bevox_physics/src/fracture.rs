@@ -104,8 +104,14 @@ pub struct Fracture {
 ///
 /// Dwyer's 2D rule is `sqrt(min(area, 7))`, commented as making small objects
 /// break sooner; the 3D analogue of a length from an area is a length from a
-/// volume, so it is `cbrt(min(voxels, SIZE_CAP))`. 27 makes that span a factor
-/// of three, the same span his 1 -> 2.65 covers.
+/// volume, so the shape of it is `cbrt(min(voxels, SIZE_CAP))`. 27 makes that
+/// span a factor of three, the same span his 1 -> 2.65 covers.
+///
+/// **What ships is that divided by `cbrt(SIZE_CAP)`**, so the factor runs
+/// 1/3 -> 1 rather than 1 -> 3 and the span is the only thing the cap sets.
+/// `size_factor` is the rule as shipped and its doc has the measurements that
+/// forced the normalisation; `docs/map/physics-constants.md` records it the
+/// same way.
 pub const SIZE_CAP: u32 = 27;
 
 /// What a body of `voxels` voxels multiplies its material's strength by: a
@@ -129,8 +135,8 @@ pub const SIZE_CAP: u32 = 27;
 ///   saturates at `SIZE_CAP`, so any factor past 1.046 there stops the crush
 ///   breaking anything.
 /// - `a_collision_breaks_the_same_things_whichever_body_is_listed_first` throws
-///   an eight-voxel glass pebble, blow 375,223, 7.2% over. Any factor past
-///   1.072 on eight voxels stops it.
+///   an eight-voxel glass pebble, blow 405,054, 15.7% over. Any factor past
+///   1.157 on eight voxels stops it, and the raw rule's `cbrt(8)` is 2.
 ///
 /// Normalising puts the calibration point at the cap instead of at one voxel,
 /// which is where it was measured. Nothing at or past the cap moves at all;
@@ -159,6 +165,17 @@ pub fn over_strength(blow: f32, strength: f32, voxels: u32) -> Option<f32> {
     if !blow.is_finite() || strength == bevox_core::material::UNBREAKABLE {
         return None;
     }
+    // A count of zero scales every strength to zero, which makes the body
+    // infinitely fragile and `over` an infinity that `reach_of` and `planes_of`
+    // then saturate on. Nothing in production reaches here with one -- every
+    // constructor calls `mass::recompute` and drops the body when it returns
+    // `false` -- but `Body::voxel_count` is 0 until that call, so the ordering
+    // is what makes this safe rather than the type.
+    debug_assert!(
+        voxels > 0 || strength == 0.0,
+        "a body with no voxels was tested against a strength of {strength}: its count was \
+         never recomputed, so its threshold is zero and any blow at all shatters it"
+    );
     // Multiplied, not divided into the blow: `UNBREAKABLE` is an infinity and
     // scaling it stays infinite, so an unbreakable material in a body of any
     // size is still unbreakable. The guard above catches it first; this keeps
@@ -314,14 +331,25 @@ mod tests {
     /// The same blow against the same material: a single voxel gives way and a
     /// `SIZE_CAP` body does not.
     ///
-    /// Dwyer's rule, at the level of the arithmetic. The factor runs 1 -> 3 and
-    /// stops, so a blow between one and three times the raw strength separates
-    /// the two, and a bigger body than `SIZE_CAP` is no tougher than one at it.
+    /// Dwyer's rule, at the level of the arithmetic. The factor runs 1/3 -> 1
+    /// and stops, so a blow between a third of the raw strength and the whole
+    /// of it separates the two -- 20 against a strength of 40 below -- and a
+    /// bigger body than `SIZE_CAP` is no tougher than one at it.
     #[test]
     fn a_small_body_takes_less_than_a_large_one() {
         assert_eq!(size_factor(SIZE_CAP), 1.0, "a body at the cap is not the unscaled case");
         assert_eq!(size_factor(u32::MAX), 1.0, "the size term is not capped");
-        assert_eq!(size_factor(0), 0.0, "a body with no voxels should scale to nothing");
+        // Zero, which makes a body whose count was never recomputed infinitely
+        // fragile rather than merely weak: its threshold is 0 and `over` comes
+        // out an infinity. `over_strength` carries a `debug_assert!` against
+        // it, and what contains it in release is ordering -- every production
+        // constructor calls `mass::recompute` and drops the body when it
+        // returns `false`, so no body with a live count of 0 reaches a contact.
+        assert_eq!(
+            size_factor(0),
+            0.0,
+            "a body with no voxels should scale to nothing, which is the case              `over_strength`'s debug assertion exists to catch"
+        );
         assert!(
             (size_factor(1) - 1.0 / 3.0).abs() < 1e-6,
             "a single voxel scaled by {}, want a third",

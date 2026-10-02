@@ -1818,8 +1818,14 @@ mod tests {
     }
 
     /// A narrow hammer of unbreakable material driven straight down onto
-    /// `target`, which sits on an unbreakable floor. Returns every fracture and
-    /// the largest blow any contact carried.
+    /// `target`, which sits on an unbreakable floor. Returns every fracture,
+    /// the largest blow any contact carried, and how fast the hammer was still
+    /// descending when the strike tick ended.
+    ///
+    /// The hammer is unbreakable, which is what makes that last number worth
+    /// reading: it never comes apart, so the body whose speed is measured is
+    /// the same body before and after, and what changed it is the contact
+    /// alone.
     ///
     /// The floor takes the load, so what a contact reads is the hammer's
     /// momentum rather than the target's own mass. That is the whole point of
@@ -1829,7 +1835,7 @@ mod tests {
     /// the same speed, which would swamp any size term.
     ///
     /// No gravity: the strike is the only thing under test.
-    fn hammered(target: Contree, speed: f32) -> (Vec<Fracture>, f32) {
+    fn hammered(target: Contree, speed: f32) -> (Vec<Fracture>, f32, f32) {
         let world = slab_of(64, 0..8, MaterialId(7));
         let field = DistanceField::build(&world);
         let materials = materials();
@@ -1849,13 +1855,18 @@ mod tests {
 
         let mut fractures = Vec::new();
         let mut hardest = 0.0f32;
-        for _ in 0..8 {
+        // The strike is the first tick; later ticks only settle what it left.
+        let mut left = 0.0;
+        for tick in 0..8 {
             let out =
                 step(&mut bodies, &world, &field, &materials, Air::STILL, DT, None, &mut []);
             hardest = hardest.max(out.peak_impulse);
             fractures.extend(out.fractures);
+            if tick == 0 {
+                left = -bodies[1].velocity.y;
+            }
         }
-        (fractures, hardest)
+        (fractures, hardest, left)
     }
 
     /// Dwyer's rule, and the reason it exists: a small thing breaks under a
@@ -1873,8 +1884,8 @@ mod tests {
         // make the large target survive for a reason that has nothing to do
         // with its size. The bar's middle voxel is the only one struck, and it
         // sits exactly where the small target's single voxel does.
-        let (small, small_blow) = hammered(cube_of(1, 4, MaterialId(6)), HAMMER_SPEED);
-        let (large, large_blow) = hammered(block(1, 1, 27, 64, MaterialId(6)), HAMMER_SPEED);
+        let (small, small_blow, _) = hammered(cube_of(1, 4, MaterialId(6)), HAMMER_SPEED);
+        let (large, large_blow, _) = hammered(size_cap_bar(), HAMMER_SPEED);
         // Not equal blows -- the bar's own mass means the same hammer leaves a
         // *larger* impulse on it, 638,388 against 387,507 -- and that is the
         // stronger statement: the large target survives a harder blow than the
@@ -1896,6 +1907,101 @@ mod tests {
             !large.iter().any(|f| f.body.is_some()),
             "a twenty-seven-voxel glass body broke under the same blow of {large_blow:.0}: the \
              size term is not reaching the threshold"
+        );
+    }
+
+    /// A one-voxel-thick bar of exactly `SIZE_CAP` glass voxels: the smallest
+    /// body the size term treats as large, so its threshold is the material's
+    /// own strength unscaled.
+    ///
+    /// Derived from the constant rather than written out, so a retune of
+    /// `SIZE_CAP` carries the fixture with it instead of silently leaving a
+    /// body that no longer spans the term.
+    fn size_cap_bar() -> Contree {
+        assert!(
+            fracture::SIZE_CAP % 2 == 1 && fracture::SIZE_CAP <= 64,
+            "a `SIZE_CAP` of {} does not fit this fixture: an even one leaves the bar no \
+             middle voxel, and the claim that the struck voxel sits exactly where the \
+             single-voxel target's does depends on there being one",
+            fracture::SIZE_CAP
+        );
+        block(1, 1, fracture::SIZE_CAP, 64, MaterialId(6))
+    }
+
+    /// A strike that passes the threshold and almost nothing more: `over` is
+    /// 1.069, a blow of 373,976 against `GLASS_STRENGTH`.
+    const BARELY_OVER_SPEED: f32 = 100.0;
+
+    /// A strike far past it: `over` is 2.687, a blow of 940,572.
+    ///
+    /// The two speeds bracket 2.5, which is where a fixed 0.6 hand-back and
+    /// the excess coincide -- `1 - 1/2.5 == 0.6`. A fixed fraction is therefore
+    /// too generous on one of these strikes and too mean on the other, and
+    /// cannot be right about both.
+    const FAR_OVER_SPEED: f32 = 250.0;
+
+    /// The hand-back is the excess, so it scales with how far past strength the
+    /// blow went: a hammer barely over the threshold is left nearly stopped,
+    /// and one far over carries most of its speed on through.
+    ///
+    /// This is what a fixed fraction cannot do, and it is the gate the fixed
+    /// fraction `REBOUND = 0.6` had to fail. `breaking_something_does_not_stop_
+    /// you` only asks that *something* comes back, which 0.6 satisfied for the
+    /// whole life of the old rule; this asks that the amount be the right one
+    /// for the collision.
+    ///
+    /// Both strikes use the same unbreakable hammer on the same `SIZE_CAP` bar,
+    /// so the only thing that differs is how far over strength the blow landed.
+    /// The hammer never breaks, so the body being measured is the same body
+    /// throughout and nothing detaches out from under the reading.
+    ///
+    /// Read as a fraction of the approach speed rather than as an impulse: the
+    /// two strikes carry different momentum, and the question is what share of
+    /// it survives the contact.
+    #[test]
+    fn the_hand_back_scales_with_how_far_past_strength_the_blow_went() {
+        let (barely, barely_blow, barely_left) = hammered(size_cap_bar(), BARELY_OVER_SPEED);
+        let (far, far_blow, far_left) = hammered(size_cap_bar(), FAR_OVER_SPEED);
+        let over_of = |f: &[Fracture]| f.iter().map(|f| f.over).fold(0.0f32, f32::max);
+        let (barely_over, far_over) = (over_of(&barely), over_of(&far));
+
+        // Both must break, or there is no hand-back to measure.
+        assert!(
+            barely_over > 1.0,
+            "the gentler strike left {barely_blow:.0} and broke nothing: it is under the \
+             threshold, so this gate is measuring two hand-backs of zero"
+        );
+        assert!(
+            far_over > 2.5 && barely_over < 2.5,
+            "the two strikes read {barely_over:.3} and {far_over:.3} times over strength and \
+             do not bracket 2.5, where a fixed 0.6 and the excess agree: a fixed fraction \
+             could sit between them and pass"
+        );
+
+        let (barely_share, far_share) =
+            (barely_left / BARELY_OVER_SPEED, far_left / FAR_OVER_SPEED);
+        assert!(
+            barely_share < 0.08,
+            "a hammer {barely_over:.3} times over the threshold kept {:.1}% of its speed \
+             ({barely_left:.2} of {BARELY_OVER_SPEED}): breaking something it barely had the \
+             momentum to break cost it almost nothing, so the hand-back is a fixed share \
+             rather than the excess",
+            barely_share * 100.0
+        );
+        assert!(
+            far_share > 0.35,
+            "a hammer {far_over:.3} times over the threshold kept only {:.1}% of its speed \
+             ({far_left:.2} of {FAR_OVER_SPEED}), blow {far_blow:.0}: a blow far past what the \
+             material could take is being charged most of itself for the break",
+            far_share * 100.0
+        );
+        assert!(
+            far_share > barely_share * 10.0,
+            "the far strike kept {:.1}% of its speed and the barely-over one {:.1}%: the \
+             hand-back is not scaling with how far past strength the blow went, which is \
+             what a fixed fraction looks like",
+            far_share * 100.0,
+            barely_share * 100.0
         );
     }
 

@@ -119,7 +119,11 @@ precisely the failure BEVOX hit on 2026-09-28 when a 240:1 mass ratio diverged.
 
 # Where this lands in the drift ledger
 
-- **C1**, the fracture threshold: BEVOX's closing speed is not his design. See
+- **C1**, the size term on the fracture threshold: it is calibrated at
+  cap-sized bodies rather than at one voxel, which his rule is not. The
+  threshold itself *is* his — an accumulated contact impulse. BEVOX read a
+  closing speed until 2026-10-02, and that was the deviation this row used to
+  record; it is closed. See
   [the respec](../superpowers/specs/2026-09-30-bevox-fracture-and-detection-design.md).
 - **E2**, the speed ceiling: he has none, and his substepped detection is what
   replaces it.

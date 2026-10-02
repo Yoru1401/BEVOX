@@ -364,6 +364,17 @@ mod tests {
         /// **This gate is a floor and there is no ceiling.** A grab can press
         /// with at most about 5.9e5, so every material here except ice is
         /// silently uncrushable and nothing fails for it.
+        ///
+        /// **And it compares the raw table strength, which is the effective
+        /// threshold only at or past `fracture::SIZE_CAP`; smaller bodies
+        /// carry proportionally less.** Since Task 3 a sub-cap body's
+        /// threshold is as low as a third of the table figure, so a body of
+        /// eight voxels clears this floor on paper and not in the solver. The
+        /// number stays as it is on purpose: self-weight load scales with
+        /// voxel count while the threshold scales with its cube root, so a
+        /// small body gets *safer* under its own weight, not more fragile.
+        /// The sub-cap case this would have to cover is a small body holding
+        /// up a large one, which no scene here builds.
         const RESTING_LOAD: f32 = 331_306.0;
         let materials = palette();
         let floor = RESTING_LOAD;

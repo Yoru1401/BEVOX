@@ -1,6 +1,37 @@
 # Update Log
 
 ## 2026-10-02
+* **Update**: the hand-back has a gate of its own.
+  `the_hand_back_scales_with_how_far_past_strength_the_blow_went` strikes the
+  same `SIZE_CAP` glass bar twice with the same unbreakable hammer, once
+  1.069 times over strength and once 2.687, and asks what share of its
+  approach speed the hammer keeps: 2% and 55%. The two speeds bracket 2.5,
+  where `1 - 1/over` equals the retired `REBOUND = 0.6`, so a fixed fraction
+  is too generous on one strike and too mean on the other. **Restoring
+  `0.6 * peak[at]` fails it at 52.2% on the gentler strike and fails nothing
+  else in the suite**, which is why it had to exist —
+  `breaking_something_does_not_stop_you` only ever asked that *something* come
+  back.
+* **Correction**: the eight-voxel pebble in
+  `a_collision_breaks_the_same_things_whichever_body_is_listed_first` carries
+  **405,054**, 15.7% over `GLASS_STRENGTH`, not the 375,223 and 7.2% recorded
+  earlier today. Re-measured; the crush figure (365,906, 4.5%) reproduced
+  exactly. The conclusion is untouched — the raw rule's factor on eight voxels
+  is `cbrt(8) = 2`, well past either bound.
+* **Correction**: substituting the plan's raw `cbrt(min(voxels, SIZE_CAP))` at
+  `ff269c5` leaves the suite at **117 passed / 7 failed**, not the 120 / 4
+  recorded in the task report. The four calibration gates that report named do
+  all fail; the three it missed are `a_small_body_breaks_before_a_large_one`
+  and the two `fracture` unit tests, all three written by that same task
+  against the normalised arithmetic and so unable to pass under the raw form.
+  The count was measured before those gates existed and reported against the
+  commit that has them. **The deviation itself still holds** — it rests on the
+  four gates, and they fail.
+* **Correction**: 331,306 is a **landing transient**, not a load a resting
+  stack carries. `docs/reference/dwyer-drift.md` and
+  `bevox_core::material::DEFAULT_STRENGTH` both said the latter; the load the
+  same stack then holds is 18,798, and the rest of the tree already recorded
+  it that way.
 * **Update**: a material's strength is scaled by the size of the body that holds
   it, after Dwyer's `sqrt(min(area, 7))` — `cbrt(min(voxels, SIZE_CAP))` with
   `SIZE_CAP = 27`, so a chip of glass gives way under a load a sheet of it
@@ -12,7 +43,7 @@
   **The factor had to be normalised to run 1/3 → 1 rather than 1 → 3**, and that
   was measured rather than chosen: every strength in every table was calibrated
   against bodies at or past the cap, the crush gate has 4.5% of headroom over
-  `GLASS_STRENGTH` and the list-order gate's eight-voxel pebble 7.2%, and no
+  `GLASS_STRENGTH` and the list-order gate's eight-voxel pebble 15.7%, and no
   `SIZE_CAP` above 1 passes both. The ten-per-cent fracture load window is the
   real constraint — [the load window](concepts/fracture-load-window.md) has the
   table — and it is an open defect, not this change's to fix.

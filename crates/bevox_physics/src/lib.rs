@@ -233,7 +233,7 @@ pub(crate) mod fixtures {
     /// (`resting_weight_breaks_nothing`) and above the 190,512 a body arriving
     /// at 8 lands (`the_same_collision_breaks_at_any_tick_rate` requires that
     /// to survive). It sits below the 365,906 a grab presses with at 64 Hz
-    /// (`a_slow_crush_breaks_what_it_presses`), the 375,223 of the two-body
+    /// (`a_slow_crush_breaks_what_it_presses`), the 405,054 of the two-body
     /// collision gate, and the 968,836 that arriving at 60 lands.
     ///
     /// 350,000 is the geometric middle of the binding pair, 331,306 and
