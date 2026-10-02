@@ -620,6 +620,59 @@ pub fn create_march_target(
     commands.insert_resource(MarchTarget { image: handle, width, height });
 }
 
+/// Keeps the march target the size of the window.
+///
+/// `create_march_target` runs once, at startup, so without this both the storage
+/// texture and the sprite keep whatever size the window had when the app opened.
+/// Launch under a tiling compositor — the window is half the screen — then go
+/// fullscreen, and the march is still the old rectangle drawn at its old size in
+/// the middle of a larger window, with the rest of it black. Flori hit this on
+/// Hyprland, where a tiled launch makes it happen every time rather than only
+/// when someone drags an edge.
+///
+/// **Three things are stale together and must move together.** The texture is
+/// what the shader writes, `MarchTarget`'s recorded size is what
+/// `dispatch_march` turns into a workgroup count, and the sprite's `custom_size`
+/// is how much of the window the result covers. Fixing only the sprite stretches
+/// a low-resolution image to fit; fixing only the texture leaves the borders.
+///
+/// Reallocating is left undebounced: the equality check above it is the whole
+/// cost on a steady frame, and the case this exists for — a tile becoming a
+/// fullscreen — changes size once rather than continuously. Dragging a floating
+/// window's edge will reallocate per frame, which is 8 MB at 1920x1080 and
+/// stutters without breaking. Add hysteresis when that is the complaint, not
+/// before.
+pub fn resize_march_target(
+    windows: Query<&Window>,
+    mut target: ResMut<MarchTarget>,
+    mut images: ResMut<Assets<Image>>,
+    mut sprites: Query<&mut Sprite>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let (width, height) = (window.physical_width().max(1), window.physical_height().max(1));
+    if (width, height) == (target.width, target.height) {
+        return;
+    }
+    // Before the resource is updated: a missing image means the asset is gone,
+    // and recording a size the texture does not have would make `dispatch_march`
+    // cover an area nothing wrote.
+    let Some(mut image) = images.get_mut(&target.image) else {
+        return;
+    };
+    image.resize(Extent3d { width, height, depth_or_array_layers: 1 });
+
+    for mut sprite in &mut sprites {
+        if sprite.image == target.image {
+            sprite.custom_size = Some(Vec2::new(width as f32, height as f32));
+        }
+    }
+
+    target.width = width;
+    target.height = height;
+}
+
 /// Builds the shader uniform from a camera and the volume being drawn.
 ///
 /// `offset_from_clip` is camera-relative, as `ExtractedMarchCamera` describes:
@@ -1382,6 +1435,68 @@ mod tests {
     /// rebuilt. Rebuilding would also put the new transform in the table, so
     /// the table alone cannot tell the right path from the expensive one: the
     /// change tick on `GpuSceneData` is what says no rebuild happened.
+    /// A window that grows takes the texture, the recorded size and the sprite
+    /// with it.
+    ///
+    /// All three are asserted because fixing one of them alone produces a
+    /// different bug, not a fix: the texture alone leaves black borders, the
+    /// sprite alone stretches a stale low-resolution image over the window, and
+    /// `MarchTarget`'s size alone has `dispatch_march` cover pixels the texture
+    /// does not have.
+    #[test]
+    fn a_resized_window_takes_the_march_target_with_it() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<Assets<Image>>()
+            .add_systems(Update, resize_march_target);
+
+        let mut image = Image::new_fill(
+            Extent3d { width: 960, height: 1080, depth_or_array_layers: 1 },
+            TextureDimension::D2,
+            &[0, 0, 0, 255],
+            TextureFormat::Rgba8Unorm,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        );
+        image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST
+            | TextureUsages::STORAGE_BINDING;
+        let handle = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+
+        app.world_mut().spawn(Sprite {
+            image: handle.clone(),
+            custom_size: Some(Vec2::new(960.0, 1080.0)),
+            ..default()
+        });
+        app.insert_resource(MarchTarget { image: handle.clone(), width: 960, height: 1080 });
+
+        // A tiled half-width window going fullscreen, which is the case this
+        // exists for.
+        let mut window = Window::default();
+        window.resolution.set_physical_resolution(1920, 1080);
+        app.world_mut().spawn(window);
+
+        app.update();
+
+        let target = app.world().resource::<MarchTarget>();
+        assert_eq!((target.width, target.height), (1920, 1080), "the recorded size did not follow");
+
+        let size = app.world().resource::<Assets<Image>>().get(&handle).unwrap().texture_descriptor.size;
+        assert_eq!((size.width, size.height), (1920, 1080), "the texture did not follow");
+
+        let sprite = app
+            .world_mut()
+            .query::<&Sprite>()
+            .iter(app.world())
+            .next()
+            .expect("the sprite went missing")
+            .clone();
+        assert_eq!(
+            sprite.custom_size,
+            Some(Vec2::new(1920.0, 1080.0)),
+            "the sprite still covers the old rectangle, so the rest of the window stays black",
+        );
+    }
+
     #[test]
     fn a_moved_body_refreshes_the_table_without_a_geometry_rebuild() {
         let mut app = App::new();

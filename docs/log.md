@@ -1,6 +1,20 @@
 # Update Log
 
 ## 2026-10-02
+* **Fix**: the window's size was read once, at startup, and never again —
+  `create_march_target` is a `Startup` system, so the storage texture, the size
+  `dispatch_march` turns into a workgroup count, and the sprite's `custom_size`
+  all kept whatever the window was when the app opened. **Flori found it on
+  Hyprland**, where launching from a terminal tiles the window to half the screen
+  and going fullscreen then leaves the march drawn in the old rectangle with the
+  rest of the window black. `resize_march_target` moves all three together, and
+  `a_resized_window_takes_the_march_target_with_it` asserts all three, because
+  fixing one alone is a different bug rather than a fix: the texture alone leaves
+  the borders, the sprite alone stretches a stale low-resolution image, and the
+  recorded size alone dispatches over pixels nothing wrote. Proven by two
+  separate breaks. The beam buffer needed nothing — `BEAM_CAPACITY` is sized for
+  7680x4320.
+
 * **Fix**: the demo palette was never rescaled when `strength` became an impulse,
   and **Flori found it by playing**: a body landing anywhere set off a chain
   reaction that took the whole map apart. `fixtures::materials()` was

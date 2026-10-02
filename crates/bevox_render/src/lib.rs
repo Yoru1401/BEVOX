@@ -48,7 +48,10 @@ impl Plugin for BevoxRenderPlugin {
         if app.get_sub_app(RenderApp).is_none() {
             return;
         }
-        app.add_systems(Startup, upload::create_march_target);
+        app.add_systems(Startup, upload::create_march_target)
+            // After creation, and every frame: the window's size is not known
+            // when the target is built and can change at any time after.
+            .add_systems(Update, upload::resize_march_target);
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
