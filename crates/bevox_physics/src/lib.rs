@@ -260,6 +260,7 @@ pub(crate) mod fixtures {
                 friction: 60,
                 restitution: 0,
                 strength: bevox_core::material::DEFAULT_STRENGTH,
+                crush: bevox_core::material::DEFAULT_CRUSH,
             })
             .unwrap();
         table
@@ -269,6 +270,7 @@ pub(crate) mod fixtures {
                 friction: 60,
                 restitution: 0,
                 strength: bevox_core::material::DEFAULT_STRENGTH,
+                crush: bevox_core::material::DEFAULT_CRUSH,
             })
             .unwrap();
         table
@@ -278,6 +280,7 @@ pub(crate) mod fixtures {
                 friction: 0,
                 restitution: 0,
                 strength: bevox_core::material::DEFAULT_STRENGTH,
+                crush: bevox_core::material::DEFAULT_CRUSH,
             })
             .unwrap();
         table
@@ -287,6 +290,7 @@ pub(crate) mod fixtures {
                 friction: 60,
                 restitution: 80,
                 strength: bevox_core::material::DEFAULT_STRENGTH,
+                crush: bevox_core::material::DEFAULT_CRUSH,
             })
             .unwrap();
         table
@@ -296,6 +300,7 @@ pub(crate) mod fixtures {
                 friction: 60,
                 restitution: 99,
                 strength: bevox_core::material::DEFAULT_STRENGTH,
+                crush: bevox_core::material::DEFAULT_CRUSH,
             })
             .unwrap();
         // 6: glass. Breaks under a load a little past what a short stack of
@@ -307,6 +312,7 @@ pub(crate) mod fixtures {
                 friction: 60,
                 restitution: 0,
                 strength: GLASS_STRENGTH,
+                crush: bevox_core::material::DEFAULT_CRUSH,
             })
             .unwrap();
         // 7: the same in every way except that it never breaks, so a test can
@@ -318,6 +324,7 @@ pub(crate) mod fixtures {
                 friction: 60,
                 restitution: 0,
                 strength: bevox_core::material::UNBREAKABLE,
+                crush: bevox_core::material::DEFAULT_CRUSH,
             })
             .unwrap();
         table

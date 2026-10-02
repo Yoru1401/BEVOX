@@ -2762,13 +2762,13 @@ mod tests {
     /// plate, 48,000 for the heavy body -- exactly 240x, and inside `u16`. The
     /// ratio comes from density alone, at equal volume, not from extra voxels.
     fn load_materials() -> MaterialTable {
-        use bevox_core::material::{DEFAULT_STRENGTH, Material};
+        use bevox_core::material::{DEFAULT_CRUSH, DEFAULT_STRENGTH, Material};
         let mut table = MaterialTable::new();
         table
-            .push(Material { color: [160, 160, 160, 255], density: 200, friction: 60, restitution: 0, strength: DEFAULT_STRENGTH })
+            .push(Material { color: [160, 160, 160, 255], density: 200, friction: 60, restitution: 0, strength: DEFAULT_STRENGTH, crush: DEFAULT_CRUSH })
             .unwrap();
         table
-            .push(Material { color: [120, 40, 40, 255], density: 48_000, friction: 60, restitution: 0, strength: DEFAULT_STRENGTH })
+            .push(Material { color: [120, 40, 40, 255], density: 48_000, friction: 60, restitution: 0, strength: DEFAULT_STRENGTH, crush: DEFAULT_CRUSH })
             .unwrap();
         table
     }

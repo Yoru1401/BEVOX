@@ -111,6 +111,7 @@ than each caller remembering. See
 | `DEFAULT_RESTITUTION` | 5 | Hundredths. Barely bouncy, which is what most solids are. |
 | `DEFAULT_STRENGTH` | 2 800 000 | The largest contact impulse a material survives. An impulse, so it is read against a body: a four-voxel stone cube cracks terrain at about 150 voxels a second. Well clear of the 331 306 a three-cube stack leans with. |
 | `UNBREAKABLE` | `f32::INFINITY` | A material that never fractures, however hard it is hit. |
+| `DEFAULT_CRUSH` | `f32::INFINITY` | The largest contact *force* a material survives while resting, as opposed to `strength`'s impulse on an impact. Nothing reads it yet, so every table sets it to `UNBREAKABLE`. |
 
 # Read next
 

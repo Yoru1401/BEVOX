@@ -126,6 +126,7 @@ pub fn import_scene(data: &DotVoxData) -> Result<(Contree, MaterialTable), VoxEr
                 friction: DEFAULT_FRICTION,
                 restitution: DEFAULT_RESTITUTION,
                 strength: crate::material::DEFAULT_STRENGTH,
+                crush: crate::material::DEFAULT_CRUSH,
             })
             .expect("at most 255 entries are pushed");
     }
@@ -173,6 +174,7 @@ pub fn import_model(
                 friction: DEFAULT_FRICTION,
                 restitution: DEFAULT_RESTITUTION,
                 strength: crate::material::DEFAULT_STRENGTH,
+                crush: crate::material::DEFAULT_CRUSH,
             })
             .expect("at most 255 entries are pushed");
     }

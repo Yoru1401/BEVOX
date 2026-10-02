@@ -46,6 +46,22 @@ pub struct Material {
     /// the same material at a lower speed, which is what an impulse means.
     /// `physics::fracture` has the measurements.
     pub strength: f32,
+    /// The largest normal force a contact on this material may hold *while
+    /// resting*, in the solver's own units. `UNBREAKABLE` survives anything.
+    ///
+    /// A force, where `strength` is an impulse, because the two gate
+    /// different kinds of contact. `strength` judges an impact: a collision
+    /// that resolves inside one tick, where the impulse exchanged does not
+    /// depend on the tick rate and the force it implies does. `crush` judges
+    /// a contact that is *not* an impact -- a held load, several ticks wide,
+    /// where no single tick's impulse means anything but the force the
+    /// contact carries tick after tick does. `IMPACT_SPEED` is the
+    /// closing-speed threshold that tells the two apart; below it a contact
+    /// is read as a crush, at or above it as an impact.
+    ///
+    /// Nothing reads this field yet -- the regime split is a later change --
+    /// so every table in this codebase sets it to `UNBREAKABLE`.
+    pub crush: f32,
 }
 
 /// The density a material gets when its source says nothing about mass, such
@@ -81,6 +97,12 @@ pub const DEFAULT_STRENGTH: f32 = 2_800_000.0;
 /// A material that never fractures, however hard it is hit.
 pub const UNBREAKABLE: f32 = f32::INFINITY;
 
+/// What a material's `crush` is when its source says nothing: unbreakable.
+/// Nothing reads `crush` yet, so this is the only value any table uses; a
+/// material unbreakable by crush is the conservative default for a field
+/// with no reader to notice a wrong number.
+pub const DEFAULT_CRUSH: f32 = UNBREAKABLE;
+
 /// The friction between two surfaces: the geometric mean, so the slipperier one
 /// dominates and anything against a frictionless surface slides free.
 pub fn combine_friction(a: u8, b: u8) -> f32 {
@@ -105,8 +127,14 @@ impl MaterialTable {
         // break. Nothing reads it -- empty space raises no contacts -- and if
         // anything ever does, it fails toward no fracture rather than toward
         // one on every touch.
-        let empty =
-            Material { color: [0, 0, 0, 0], density: 0, friction: 0, restitution: 0, strength: UNBREAKABLE };
+        let empty = Material {
+            color: [0, 0, 0, 0],
+            density: 0,
+            friction: 0,
+            restitution: 0,
+            strength: UNBREAKABLE,
+            crush: UNBREAKABLE,
+        };
         Self { entries: vec![empty] }
     }
 
@@ -169,6 +197,7 @@ mod tests {
                 friction: 5,
                 restitution: 80,
                 strength: 25.0,
+                crush: DEFAULT_CRUSH,
             })
             .unwrap();
         assert_eq!(table.get(id).friction, 5);
@@ -194,9 +223,28 @@ mod tests {
                 friction: DEFAULT_FRICTION,
                 restitution: DEFAULT_RESTITUTION,
                 strength: 150.5,
+                crush: DEFAULT_CRUSH,
             })
             .unwrap();
         assert_eq!(table.get(id).strength, 150.5);
+    }
+
+    /// `crush`, unlike `strength`, is a force: nothing reads it yet, but it
+    /// has to round-trip through the table like every other column.
+    #[test]
+    fn a_material_keeps_its_crush_force() {
+        let mut table = MaterialTable::new();
+        let id = table
+            .push(Material {
+                color: [1, 2, 3, 255],
+                density: 900,
+                friction: DEFAULT_FRICTION,
+                restitution: DEFAULT_RESTITUTION,
+                strength: DEFAULT_STRENGTH,
+                crush: 1.5e6,
+            })
+            .unwrap();
+        assert_eq!(table.get(id).crush, 1.5e6);
     }
 
     /// Friction combines as the geometric mean, so ice against stone is
@@ -222,6 +270,7 @@ mod tests {
          friction: DEFAULT_FRICTION,
          restitution: DEFAULT_RESTITUTION,
          strength: DEFAULT_STRENGTH,
+         crush: DEFAULT_CRUSH,
      })
      .unwrap();
         assert_eq!(table.get(id).density, 2600);
@@ -238,6 +287,7 @@ mod tests {
                 friction: DEFAULT_FRICTION,
                 restitution: DEFAULT_RESTITUTION,
                 strength: DEFAULT_STRENGTH,
+                crush: DEFAULT_CRUSH,
             })
             .unwrap();
         let gpu = table.to_gpu();
@@ -254,6 +304,7 @@ mod tests {
          friction: DEFAULT_FRICTION,
          restitution: DEFAULT_RESTITUTION,
          strength: DEFAULT_STRENGTH,
+         crush: DEFAULT_CRUSH,
      })
      .unwrap();
         let gpu = table.to_gpu();
@@ -290,6 +341,7 @@ mod tests {
          friction: DEFAULT_FRICTION,
          restitution: DEFAULT_RESTITUTION,
          strength: DEFAULT_STRENGTH,
+         crush: DEFAULT_CRUSH,
      })
      .unwrap();
         let b = table
@@ -299,6 +351,7 @@ mod tests {
          friction: DEFAULT_FRICTION,
          restitution: DEFAULT_RESTITUTION,
          strength: DEFAULT_STRENGTH,
+         crush: DEFAULT_CRUSH,
      })
      .unwrap();
         assert_eq!(a, MaterialId(1));
@@ -316,6 +369,7 @@ mod tests {
                 friction: DEFAULT_FRICTION,
                 restitution: DEFAULT_RESTITUTION,
                 strength: DEFAULT_STRENGTH,
+                crush: DEFAULT_CRUSH,
             }).is_some());
         }
         assert!(table.push(Material {
@@ -324,6 +378,7 @@ mod tests {
             friction: DEFAULT_FRICTION,
             restitution: DEFAULT_RESTITUTION,
             strength: DEFAULT_STRENGTH,
+            crush: DEFAULT_CRUSH,
         }).is_none());
     }
 }

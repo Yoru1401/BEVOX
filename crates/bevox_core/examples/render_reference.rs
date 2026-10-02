@@ -22,6 +22,7 @@ fn main() {
         friction: DEFAULT_FRICTION,
         restitution: DEFAULT_RESTITUTION,
         strength: bevox_core::material::DEFAULT_STRENGTH,
+        crush: bevox_core::material::DEFAULT_CRUSH,
     }).unwrap();
     let brick = table.push(Material {
         color: [180, 90, 70, 255],
@@ -29,6 +30,7 @@ fn main() {
         friction: DEFAULT_FRICTION,
         restitution: DEFAULT_RESTITUTION,
         strength: bevox_core::material::DEFAULT_STRENGTH,
+        crush: bevox_core::material::DEFAULT_CRUSH,
     }).unwrap();
 
     let tree = build_scene(stone, brick);
