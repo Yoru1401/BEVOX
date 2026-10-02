@@ -58,6 +58,7 @@ lifted out of the plan that produced it.
 
 * [BEVOX ray-marcher core](superpowers/specs/2026-09-13-bevox-raymarcher-core-design.md) - A sparse voxel world ray marched on the GPU, with a CPU reference the shader is held to pixel for pixel.
 * [Body composition in ray order](superpowers/specs/2026-09-29-bevox-body-composition-design.md) - cut the primary half of a body's cost by rejecting with the bounding sphere the shadow path already has, then visiting bodies in ray order.
+* [Fracture in two regimes](superpowers/specs/2026-10-02-bevox-fracture-regimes-design.md) - a landing and a crush are 1.06x apart in impulse and 18,000x apart in closing speed, so switch on the speed and threshold a force for a held contact.
 * [Fracture and detection, as he built them](superpowers/specs/2026-09-30-bevox-fracture-and-detection-design.md) - expose the solver's iteration counts, revert the closing-speed threshold to a size-scaled impulse, and replace the speed cap with substepped detection. In that order, because the iteration count sets the impulse the threshold reads.
 * [BEVOX Rigid Bodies](superpowers/specs/2026-09-15-bevox-rigid-bodies-design.md) - Voxel chunks that detach from the static world, fall, tumble and come to rest, rendered by the same ray marcher that draws everything else.
 
