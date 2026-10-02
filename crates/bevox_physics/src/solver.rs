@@ -21,7 +21,7 @@ use super::{
 use bevox_core::body::{Body, BodyId, occupied_bounds};
 use bevox_core::contree::Contree;
 use bevox_core::distance_field::DistanceField;
-use bevox_core::material::MaterialTable;
+use bevox_core::material::{Material, MaterialTable};
 use glam::{Mat3, Quat, UVec3, Vec2, Vec3};
 use std::collections::{HashMap, HashSet};
 pub use bevox_core::body::ContactImpulse;
@@ -235,7 +235,7 @@ pub fn step_with(
     }
 
     apply_restitution(bodies, &joined, &mut impulses, &approach);
-    let fractures = break_what_gave_way(bodies, tree, materials, &joined, &peak);
+    let fractures = break_what_gave_way(bodies, tree, materials, &joined, &peak, &approach, dt);
     sleep::settle(bodies, &joints, &radii, dt);
     StepOutcome {
         rebuild: bodies.len() != before,
@@ -249,12 +249,24 @@ pub fn step_with(
 ///
 /// Both sides of a contact are tested: a crate dropped on ice can break the
 /// crate, the ice, or both, and both are asked about the same blow.
+///
+/// **Two regimes, told apart by `approach[at]`, the closing speed at
+/// detection.** At or above `fracture::IMPACT_SPEED` the contact is an impact:
+/// the blow is `peak[at]`, the accumulated normal impulse, read against
+/// `Material::strength`, which is what this has always done. Below it the
+/// contact is *held*, the blow is that impulse as a force -- `peak[at] *
+/// SUBSTEPS / dt` -- and it is read against `Material::crush`. The regimes are
+/// 1.06x apart in impulse and 18,000x apart in closing speed, so the speed is
+/// the only thing that can sort them; `fracture::IMPACT_SPEED` has the
+/// measurements and `docs/concepts/fracture-load-window.md` the tables.
 fn break_what_gave_way(
     bodies: &mut [Body],
     tree: &Contree,
     materials: &MaterialTable,
     joined: &[Joined],
     peak: &[f32],
+    approach: &[f32],
+    dt: f32,
 ) -> Vec<Fracture> {
     let mut fractures = Vec::new();
     let mut give_back = Vec::new();
@@ -265,34 +277,6 @@ fn break_what_gave_way(
         // names the lowest threshold. That is the threshold breaking cost, and
         // the rest of the impulse is the contact's to give back.
         let mut weakest_over = 0.0f32;
-        // The most the contact carried at any point in the tick, which is what
-        // a material's strength is written in.
-        //
-        // Dwyer's devlog 28, and his argument against a force is kept: a
-        // collision resolves inside one tick, so the force it reports depends
-        // on the tick rate, and the impulse it exchanges does not.
-        // `the_same_collision_breaks_at_any_tick_rate` holds that.
-        //
-        // The impulse rather than the closing speed, which this used to be,
-        // because a closing speed cannot see a crush. The grab is a joint with
-        // an enormous force limit driving toward a velocity goal, so a body
-        // pressed into something leans on it with up to `GRAB_MAX_FORCE` while
-        // the contact holds both surfaces still: the approach speed is ~0
-        // however hard the press. `a_slow_crush_breaks_what_it_presses` is
-        // that gate.
-        //
-        // The units are why the first attempt at this failed. An impulse grows
-        // with the mass a contact holds up, so a settled stack carries a large
-        // one for standing there -- warm starting even seeds each tick from the
-        // last -- and `strength` in the tens broke everything.
-        // `resting_weight_breaks_nothing` is that gate, and every strength in
-        // the tables is now calibrated above the resting load it measures.
-        // It is read as the impulse itself, never divided by a mass: a contact
-        // belongs to whichever body the scene lists first, so a quotient would
-        // read one collision two ways, which
-        // `a_collision_breaks_the_same_things_whichever_body_is_listed_first`
-        // holds against.
-        let blow = peak[at];
         // Inert for any positive strength, and kept for two smaller reasons.
         //
         // It used to carry the argument that a speculative contact which never
@@ -307,12 +291,52 @@ fn break_what_gave_way(
         if peak[at] <= 0.0 {
             continue;
         }
-        // The struck voxel's material, scaled by the size of the body that
-        // holds it: `voxels` is that body's whole volume, not anything local to
-        // the impact. Dwyer's rule, and it is why a chip of glass gives way
-        // under a load a sheet of it holds.
-        let mut side = |voxel: [u32; 3], body: Option<BodyId>, strength: f32, voxels: u32| {
-            if let Some(over) = fracture::over_strength(blow, strength, voxels) {
+        // Which regime this contact is in, and so which quantity is the blow
+        // and which column it is read against.
+        //
+        // An **impact** -- the surfaces were closing when the contact was
+        // detected -- is Dwyer's case and his argument against a force holds
+        // for it unchanged: a collision resolves inside one tick, so the force
+        // it reports depends on the tick rate and the impulse it exchanges
+        // does not. `the_same_collision_breaks_at_any_tick_rate` is that gate,
+        // and this branch is bit for bit what the whole function used to do.
+        //
+        // A **held** contact is the case he never had, because nothing in his
+        // engine presses indefinitely. The grab is a joint with an enormous
+        // force limit driving toward a velocity goal, so a body pressed into
+        // something leans on it with up to `GRAB_MAX_FORCE` while the contact
+        // holds both surfaces still: the closing speed is ~0 however hard the
+        // press, and the *impulse* is force x dt and so moves with the tick --
+        // measured 365,906 at 64 Hz against 93,512 at 512.
+        // `a_slow_crush_breaks_what_it_presses_at_any_rate` is that gate, and
+        // for this contact his own stated preference, the maximum force a
+        // material takes, is the thing that is actually available.
+        //
+        // Never the closing speed as the *magnitude* in either branch: a
+        // contact belongs to whichever body the scene lists first, and the
+        // blow must not depend on that.
+        // `a_collision_breaks_the_same_things_whichever_body_is_listed_first`
+        // holds it, and the speed is read here only as a sign of which regime
+        // this is.
+        //
+        let held = held_contact(approach[at], dt);
+        // `Fracture::blow` is what the rule read and `Fracture::impulse` what
+        // the contact carried. Until this branch existed they were the same
+        // number; on a held contact they are a force and an impulse, which is
+        // the parting the field's own documentation reserved.
+        let blow = if held { peak[at] * SUBSTEPS as f32 / dt } else { peak[at] };
+        // The struck voxel's material. On the impact branch the threshold is
+        // scaled by the size of the body that holds the voxel -- `voxels` is
+        // that body's whole volume, not anything local to the impact, and it
+        // is why a chip of glass gives way under a load a sheet of it holds.
+        // The held branch has no size term; `fracture::over_crush` says why.
+        let mut side = |voxel: [u32; 3], body: Option<BodyId>, material: Material, voxels: u32| {
+            let over = if held {
+                fracture::over_crush(blow, material.crush)
+            } else {
+                fracture::over_strength(blow, material.strength, voxels)
+            };
+            if let Some(over) = over {
                 weakest_over = weakest_over.max(over);
                 fractures.push(Fracture {
                     at: c.world_point,
@@ -329,7 +353,7 @@ fn break_what_gave_way(
         side(
             c.key.mine,
             Some(mine.id),
-            materials.get(mine.volume.get(UVec3::from(c.key.mine))).strength,
+            materials.get(mine.volume.get(UVec3::from(c.key.mine))),
             mine.voxel_count,
         );
         match j.other {
@@ -342,7 +366,7 @@ fn break_what_gave_way(
             None => side(
                 c.key.theirs,
                 None,
-                materials.get(tree.get(UVec3::from(c.key.theirs))).strength,
+                materials.get(tree.get(UVec3::from(c.key.theirs))),
                 fracture::SIZE_CAP,
             ),
             Some(o) => {
@@ -351,7 +375,7 @@ fn break_what_gave_way(
                 side(
                     c.key.theirs,
                     Some(other.id),
-                    materials.get(material).strength,
+                    materials.get(material),
                     other.voxel_count,
                 );
             }
@@ -360,7 +384,13 @@ fn break_what_gave_way(
             // What the contact carried past the weakest threshold it met.
             // `over` is the blow over that threshold, so the threshold is the
             // blow over `over`, and the excess is what is left.
-            give_back.push((at, blow - blow / weakest_over));
+            let excess = blow - blow / weakest_over;
+            // Back into an impulse on the held branch, where the blow is a
+            // force: `push` moves momentum, and `fracture::hand_back` clamps
+            // the excess against what the contact actually carried, which is
+            // an impulse. Dividing the two units against each other would
+            // make that clamp meaningless in both directions.
+            give_back.push((at, if held { excess * dt / SUBSTEPS as f32 } else { excess }));
         }
     }
 
@@ -377,6 +407,31 @@ fn break_what_gave_way(
         push(a, b, &j.contact, -j.contact.normal * fracture::hand_back(excess, peak[at]));
     }
     fractures
+}
+
+/// Whether a contact closing at `approach` is **held** rather than struck, and
+/// so read as a force against `Material::crush` instead of as an impulse
+/// against `Material::strength`.
+///
+/// Negative `approach` closes, so the test is on `-approach`. A separating
+/// contact -- a settled stack's, which reads a small positive -- is held, and
+/// that is right: it is carrying a load, it is simply not taking a new one.
+///
+/// **`dt` is in here only as a guard.** The held blow divides by it, so a
+/// non-positive or non-finite tick is read as an impact rather than divided
+/// by: an infinity or a NaN reaching `over_crush` is thrown away there, which
+/// would stop a held contact being judged *at all*, silently, for as long as
+/// the caller passed a dead tick. The impact branch at least still asks
+/// `strength`. `a_dead_tick_is_read_as_an_impact` is the gate.
+///
+/// **A very small *positive* `dt` is not guarded and cannot be from here.** It
+/// is a legal tick length, and the force it reports is only wrong because
+/// warm starting carries the previous tick's impulse into it -- a 1/dt on a
+/// load accumulated over a tick that was not that long. Nothing in the engine
+/// changes `dt` between ticks, and a caller that did would have the same
+/// problem in every rate-dependent quantity in the solver, not only this one.
+fn held_contact(approach: f32, dt: f32) -> bool {
+    -approach < fracture::IMPACT_SPEED && dt > 0.0 && dt.is_finite()
 }
 
 /// Every contact in the scene: each body against the world, then each pair of
@@ -2590,18 +2645,29 @@ mod tests {
         );
     }
 
-    /// Pressing a held body into brittle material breaks it, however slowly it
-    /// is pressed.
+    /// The crush fixture at whatever tick rate: a held body pressed slowly into
+    /// a glass floor, run for the same wall clock however often the physics
+    /// ticks. Returns what broke and the fastest the body moved before anything
+    /// did, and whether it was **awake** on the tick that broke something.
     ///
-    /// The symptom this whole rule change exists for. The mouse grab is a joint
-    /// with an enormous force limit driving toward a *velocity* goal, so a
-    /// grabbed body leaning on something presses with up to `GRAB_MAX_FORCE`
-    /// while the contact holds it still: the two surfaces are closing at
-    /// essentially nothing. A threshold on closing speed therefore reads a
-    /// slow crush as no blow at all, and a player can lean a rock through a
-    /// window without marking it.
-    #[test]
-    fn a_slow_crush_breaks_what_it_presses() {
+    /// That last one is not decoration. A sleeping body raises no contacts at
+    /// all -- `collect_contacts` skips it -- so the held branch cannot fire on
+    /// one, and a crush gate that passed while its target slept would be
+    /// passing for a reason that has nothing to do with the threshold. The
+    /// grab wakes what it holds every tick, so this is expected to be true;
+    /// what it rules out is the gate going green on an empty contact list.
+    ///
+    /// The target creeps at a rate per *second*, not per tick -- 0.002 a tick
+    /// at 64 Hz is an eighth of a voxel a second -- so the press travels the
+    /// same distance in the same time at every rate. That is what makes the
+    /// rates comparable at all; the same tick count would press a quarter as
+    /// far at `DT / 4`.
+    fn press_into_glass(dt: f32) -> (Vec<Fracture>, f32, bool) {
+        /// The 6.25 seconds the 400 ticks at `DT` this was written with cover.
+        const SECONDS: f32 = 400.0 / 64.0;
+        /// 0.002 a tick at 64 Hz, as a rate per second.
+        const CREEP: f32 = 0.002 * 64.0;
+
         let materials = materials();
         // Glass floor, unbreakable body: only one of the two can give way, so
         // what breaks is not in question.
@@ -2614,29 +2680,52 @@ mod tests {
 
         let mut broke = Vec::new();
         let mut fastest = 0.0f32;
-        for tick in 0..400 {
-            // The target creeps down into the floor: 0.002 a tick is an eighth
-            // of a voxel a second, far below anything that reads as an impact.
-            grab.anchor_b = centre - Vec3::Y * (tick as f32 * 0.002);
+        let mut awake = false;
+        for tick in 0..(SECONDS / dt).round() as u32 {
+            // The target creeps down into the floor, far below anything that
+            // reads as an impact.
+            grab.anchor_b = centre - Vec3::Y * (tick as f32 * dt * CREEP);
             // Before the step, and only while nothing has broken: the tick
             // that breaks the floor hands impulse back and drops the body into
-            // the hole, and neither says how gently it was pressing.
-            if broke.is_empty() {
+            // the hole, and neither says how gently it was pressing. The same
+            // for whether it was awake -- read going into the tick that broke
+            // something, not after that tick's hand-back has woken it.
+            let first = broke.is_empty();
+            if first {
                 fastest = fastest.max(bodies[0].velocity.length());
             }
+            let asleep = bodies[0].asleep;
             let out = step(
                 &mut bodies,
                 &world,
                 &field,
                 &materials,
                 Air::VACUUM,
-                DT,
+                dt,
                 Some(&mut grab),
                 &mut [],
             );
+            if first && !out.fractures.is_empty() {
+                awake = !asleep;
+            }
             broke.extend(out.fractures);
         }
+        (broke, fastest, awake)
+    }
 
+    /// Pressing a held body into brittle material breaks it, however slowly it
+    /// is pressed.
+    ///
+    /// The symptom this whole rule change exists for. The mouse grab is a joint
+    /// with an enormous force limit driving toward a *velocity* goal, so a
+    /// grabbed body leaning on something presses with up to `GRAB_MAX_FORCE`
+    /// while the contact holds it still: the two surfaces are closing at
+    /// essentially nothing. A threshold on closing speed therefore reads a
+    /// slow crush as no blow at all, and a player can lean a rock through a
+    /// window without marking it.
+    #[test]
+    fn a_slow_crush_breaks_what_it_presses() {
+        let (broke, fastest, awake) = press_into_glass(DT);
         assert!(
             fastest < 1.0,
             "the body moved at {fastest} voxels a second before anything broke, so this is an \
@@ -2652,6 +2741,118 @@ mod tests {
             broke.iter().any(|f| f.body.is_none()),
             "something broke, but not the glass floor being pressed on"
         );
+        assert!(
+            awake,
+            "the floor broke while the body pressing on it was asleep, which raises no \
+             contacts at all: this gate went green on an empty contact list"
+        );
+    }
+
+    /// Which regime a contact is in, and the guard on `dt`.
+    ///
+    /// **The guard is the half worth a test.** The held blow is `peak[at] *
+    /// SUBSTEPS / dt`, so a dead tick makes it an infinity or a NaN, and
+    /// `over_crush` throws both away -- which would stop a held contact being
+    /// judged *at all*, silently, for as long as a caller passed a dead `dt`.
+    /// Reading it as an impact instead means `strength` still answers.
+    ///
+    /// Tested on the predicate rather than through `step`, and **that is a
+    /// weaker test than it looks, deliberately so.** Measured while writing
+    /// this: `step` with `dt = 0` detects no contacts at all -- `cap_speed`
+    /// gives a travel of NaN, the speculative margin goes with it, and
+    /// `break_what_gave_way` is handed an empty list. So the guard is
+    /// unreachable through the public call at exactly zero, the behavioural
+    /// assertion below can only say the tick is survived, and the predicate is
+    /// the only place the decision itself is visible. The guard is defence in
+    /// depth against a future caller, not a live path.
+    #[test]
+    fn a_dead_tick_is_read_as_an_impact() {
+        // The regime split itself: four orders of magnitude between a landing
+        // and a press, and the boundary between them.
+        assert!(!held_contact(-5.3639, DT), "a four-high stack landing read as held");
+        assert!(held_contact(-0.0003, DT), "a saturated grab read as an impact");
+        assert!(held_contact(0.0003, DT), "a settled stack, separating, read as an impact");
+        assert!(
+            !held_contact(-fracture::IMPACT_SPEED, DT),
+            "exactly at `IMPACT_SPEED` is an impact, not held"
+        );
+
+        // The guard. A press that would be held at a live tick is an impact at
+        // a dead one, whichever way it is dead.
+        for (name, dt) in [("zero", 0.0f32), ("negative zero", -0.0), ("negative", -DT), ("NaN", f32::NAN), ("infinite", f32::INFINITY)] {
+            assert!(
+                !held_contact(-0.0003, dt),
+                "a {name} tick sent a held contact to the branch that divides by it"
+            );
+        }
+        assert!(held_contact(-0.0003, f32::MIN_POSITIVE), "a denormal tick is still a tick");
+
+        // And the tick is survived: `step` neither panics nor reports a blow
+        // that is not a number. Weak, for the reason in the doc above.
+        let materials = materials();
+        let world = slab_of(64, 0..8, MaterialId(6));
+        let field = DistanceField::build(&world);
+        let mut bodies = vec![placed(
+            cube_of(4, 4, MaterialId(6)),
+            Vec3::new(32.0, 10.0, 32.0),
+            Quat::IDENTITY,
+        )];
+        assert!(recompute(&mut bodies[0], &materials));
+        for dt in [0.0f32, -DT, f32::NAN] {
+            let out =
+                step(&mut bodies, &world, &field, &materials, Air::VACUUM, dt, None, &mut []);
+            for f in &out.fractures {
+                assert!(
+                    f.blow.is_finite() && f.over.is_finite(),
+                    "a dt of {dt} reported a blow of {} and {} times over",
+                    f.blow,
+                    f.over
+                );
+            }
+        }
+    }
+
+    /// The same press, at three tick rates. A held load is rate-independent as
+    /// a *force* and nothing else, so this is the gate that says which quantity
+    /// the held branch reads.
+    ///
+    /// `a_slow_crush_breaks_what_it_presses` runs only at `DT`, and until
+    /// 2026-10-02 the blow it read was `peak[at]`, an impulse -- which for a
+    /// contact that is *held* rather than struck is force x dt. Measured by
+    /// `what_the_tick_rate_does_to_the_blow`: the crush load is 365,906 at 64
+    /// Hz, 308,430 at 128 and 93,512 at 512, proportional to the tick, while
+    /// `GLASS_STRENGTH` is a constant. So the one case the whole rule exists
+    /// for stopped breaking anything the moment the tick rate doubled, and the
+    /// gate did not notice because it only ever ran at 64 Hz.
+    #[test]
+    fn a_slow_crush_breaks_what_it_presses_at_any_rate() {
+        for (hz, dt) in [(64, DT), (128, DT / 2.0), (256, DT / 4.0)] {
+            let (broke, fastest, awake) = press_into_glass(dt);
+            assert!(
+                fastest < 1.0,
+                "at {hz} Hz the body moved at {fastest} voxels a second before anything broke, \
+                 so this is an impact and not a crush"
+            );
+            assert!(
+                !broke.is_empty(),
+                "at {hz} Hz a body pressed into glass with up to {} of force, at under \
+                 {fastest:.3} voxels a second, broke nothing: the held branch is reading a \
+                 quantity that moves with the tick",
+                crate::GRAB_MAX_FORCE
+            );
+            assert!(
+                broke.iter().any(|f| f.body.is_none()),
+                "at {hz} Hz something broke, but not the glass floor being pressed on"
+            );
+            // A sleeping body raises no contacts, so the held branch cannot
+            // fire on one. Without this the gate could go green at a rate
+            // where the press never woke anything.
+            assert!(
+                awake,
+                "at {hz} Hz the floor broke while the body pressing on it was asleep, so this \
+                 gate passed on an empty contact list"
+            );
+        }
     }
 
     #[test]
@@ -3098,6 +3299,154 @@ mod tests {
         );
     }
 
+    /// **What a press and a resting stack deliver as a *force*.** Not a gate:
+    /// it prints the two numbers `Material::crush` is calibrated between.
+    ///
+    /// The held branch's blow is `peak[at] * SUBSTEPS / dt`, so `crush` has to
+    /// sit above the largest force any *held* contact of a stack standing
+    /// there ever carries, and below the smallest force a saturated grab can
+    /// press with at any rate the engine might run at. Only held contacts are
+    /// counted -- a landing closes at 5.36 v/s and goes to the impact branch
+    /// against `strength`, so its force is not a bound on anything here.
+    ///
+    /// Every material is the unbreakable fixture, so nothing fractures and no
+    /// measured load is perturbed by the scene coming apart. The rates are
+    /// interleaved in this one invocation.
+    #[test]
+    #[ignore]
+    fn what_a_press_delivers_as_a_force() {
+        const PRESS_SECONDS: f32 = 400.0 / 64.0;
+        const REST_SECONDS: f32 = 1200.0 / 64.0;
+        /// 0.002 a tick at 64 Hz, as a rate per second.
+        const CREEP: f32 = 0.002 * 64.0;
+        let unbreakable = MaterialId(7);
+        let ticks = |seconds: f32, dt: f32| (seconds / dt).round() as u32;
+
+        /// The largest force any **held** contact carried in the tick just
+        /// stepped: the trace's own per-contact peak accumulated impulse times
+        /// `SUBSTEPS / dt`, over the contacts whose closing speed at detection
+        /// was under `fracture::IMPACT_SPEED`. This is the quantity
+        /// `break_what_gave_way` computes, assembled from the trace rather
+        /// than from a number the solver reports, because `StepOutcome` has
+        /// only the scene-wide maximum and that is dominated by impacts.
+        fn held_force(dt: f32) -> f32 {
+            let (rows, layout) = trace::take();
+            let mut peak = vec![0.0f32; layout.len()];
+            for r in &rows {
+                if r.at < peak.len() {
+                    peak[r.at] = peak[r.at].max(r.after);
+                }
+            }
+            peak.iter()
+                .zip(&layout)
+                .filter(|(_, w)| -w.approach < fracture::IMPACT_SPEED)
+                .map(|(&p, _)| p * SUBSTEPS as f32 / dt)
+                .fold(0.0f32, f32::max)
+        }
+
+        // The crush fixture, with the floor unbreakable so the press runs the
+        // whole way. Returns the largest held force it reached and whether the
+        // pressed body was awake at the end -- a sleeping body raises no
+        // contacts at all, so a crush gate passing against a sleeper would be
+        // passing for a reason that has nothing to do with the threshold.
+        let press = |dt: f32| -> (f32, u32, bool) {
+            let materials = materials();
+            let world = slab_of(64, 0..8, unbreakable);
+            let field = DistanceField::build(&world);
+            let centre = Vec3::new(32.0, 10.0, 32.0);
+            let mut bodies = vec![placed(cube_of(4, 4, unbreakable), centre, Quat::IDENTITY)];
+            assert!(recompute(&mut bodies[0], &materials));
+            let mut grab = Joint::grab(&bodies[0], centre);
+            let (mut force, mut at) = (0.0f32, 0u32);
+            for tick in 0..ticks(PRESS_SECONDS, dt) {
+                grab.anchor_b = centre - Vec3::Y * (tick as f32 * dt * CREEP);
+                trace::arm();
+                let out = step(
+                    &mut bodies,
+                    &world,
+                    &field,
+                    &materials,
+                    Air::VACUUM,
+                    dt,
+                    Some(&mut grab),
+                    &mut [],
+                );
+                assert!(out.fractures.is_empty(), "the unbreakable fixture broke");
+                let f = held_force(dt);
+                if f > force {
+                    force = f;
+                    at = tick;
+                }
+            }
+            (force, at, !bodies[0].asleep)
+        };
+
+        // `resting_weight_breaks_nothing`'s stack, at whatever height.
+        // Returns the largest held force any contact in it reached and how
+        // many of its bodies ended asleep.
+        let stack = |n: u32, dt: f32| -> (f32, u32, usize) {
+            let materials = materials();
+            let world = slab_of(64, 0..8, unbreakable);
+            let field = DistanceField::build(&world);
+            let mut bodies: Vec<Body> = (0..n)
+                .map(|i| {
+                    placed(
+                        cube_of(4, 4, unbreakable),
+                        Vec3::new(32.0, 10.2 + i as f32 * 4.0, 32.0),
+                        Quat::IDENTITY,
+                    )
+                })
+                .collect();
+            let (mut force, mut at) = (0.0f32, 0u32);
+            for tick in 1..=ticks(REST_SECONDS, dt) {
+                trace::arm();
+                let out =
+                    step(&mut bodies, &world, &field, &materials, Air::VACUUM, dt, None, &mut []);
+                assert!(out.fractures.is_empty(), "the unbreakable fixture broke");
+                let f = held_force(dt);
+                if f > force {
+                    force = f;
+                    at = tick;
+                }
+            }
+            (force, at, bodies.iter().filter(|b| b.asleep).count())
+        };
+
+        println!(
+            "\n   Hz |    press force | at | awake |      3-high held |      4-high held |      \
+             8-high held"
+        );
+        println!(
+            "  ----+----------------+----+-------+------------------+------------------+--------\
+             ----------"
+        );
+        let (mut ceiling, mut floor_3, mut floor_4) = (f32::INFINITY, 0.0f32, 0.0f32);
+        for (hz, dt) in [(64, DT), (128, DT / 2.0), (256, DT / 4.0), (512, DT / 8.0)] {
+            let (p, p_at, awake) = press(dt);
+            let (three, at3, slept3) = stack(3, dt);
+            let (four, at4, slept4) = stack(4, dt);
+            let (eight, at8, slept8) = stack(8, dt);
+            println!(
+                "  {hz:>3} | {p:>14.0} | {p_at:>2} | {awake:>5} | {three:>10.0} @{at3:>3} \
+                 ({slept3}) | {four:>10.0} @{at4:>3} ({slept4}) | {eight:>10.0} @{at8:>3} \
+                 ({slept8})"
+            );
+            ceiling = ceiling.min(p);
+            if hz == 64 {
+                floor_3 = three;
+                floor_4 = four;
+            }
+            assert!(awake, "the pressed body was asleep at {hz} Hz, so it raised no contacts");
+        }
+        println!(
+            "\n  the press's floor over the rates is {ceiling:.0}. `resting_weight_breaks_\
+             nothing` runs at 64 Hz only and needs {floor_3:.0}; a four-high stack there needs \
+             {floor_4:.0}. So a crush threshold has {:.2}x to work in against the three-cube \
+             stack and {:.2}x against the four.",
+            ceiling / floor_3,
+            ceiling / floor_4
+        );
+    }
     /// **What the tick rate does to the blow.** Not a gate: it prints a table.
     ///
     /// The threshold `break_what_gave_way` reads is `peak[at]`, the largest

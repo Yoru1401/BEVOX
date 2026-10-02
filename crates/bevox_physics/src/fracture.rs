@@ -7,11 +7,33 @@
 //! matter of **deleting the right voxels** and letting detachment do what it
 //! already does.
 //!
-//! The threshold is **never on force**, and that part is his. A collision
-//! resolves inside one tick, so the same collision at 10 ms a tick and at 5 ms
-//! reports twice the force; a force threshold breaks differently at 30 and 60
-//! frames a second, which is a physics bug that looks like a gameplay feature.
-//! `the_same_collision_breaks_at_any_tick_rate` holds that.
+//! **There are two thresholds, chosen by the closing speed at detection.**
+//! `IMPACT_SPEED` is the discriminator and it is not a tuned number: a
+//! four-cube stack lands closing at 5.36 voxels a second and a saturated mouse
+//! grab presses at 0.0003, four orders apart, while the two deliver impulses
+//! **1.06x** apart -- 744,901 against 790,924. So no threshold on the blow can
+//! separate them and the speed separates them trivially.
+//!
+//! | Regime | Test | Blow | Threshold |
+//! |---|---|---|---|
+//! | **Impact** | `-approach[at] >= IMPACT_SPEED` | `peak[at]`, the accumulated normal impulse | `Material::strength` |
+//! | **Held** | otherwise | `peak[at] * SUBSTEPS / dt`, a force | `Material::crush` |
+//!
+//! For an **impact** the threshold is **never on force**, and that part is
+//! his. A collision resolves inside one tick, so the same collision at 10 ms a
+//! tick and at 5 ms reports twice the force; a force threshold breaks
+//! differently at 30 and 60 frames a second, which is a physics bug that looks
+//! like a gameplay feature. `the_same_collision_breaks_at_any_tick_rate` holds
+//! that.
+//!
+//! For a **held** contact the argument inverts exactly, and this is not a
+//! departure from him: read the scope of what he argues, *"a collision
+//! resolves within one tick"*. He never considers a sustained contact because
+//! nothing in his engine presses indefinitely -- his mouse grab arrives two
+//! devlogs after his fracture -- and he says plainly that real materials break
+//! on maximum *force*, following a stress-strain curve, and that force is not
+//! available to him. For a press it is. The impulse there is force x dt and
+//! the force is what does not move.
 //!
 //! **The blow is the accumulated contact impulse**, which is his, and never a
 //! quotient of it: dividing by a mass to recover a speed has to choose a mass,
@@ -33,27 +55,40 @@
 //! a stack carries a large one for doing nothing much -- warm starting seeds
 //! each tick's impulse from the last. `resting_weight_breaks_nothing` is that
 //! gate, and the first attempt at this rule failed it by 61,134 fractures.
-//! Every strength is now calibrated above that load, and three things about
-//! the window it leaves are open defects rather than solved problems:
+//! Every strength is calibrated above that load.
+//!
+//! **The regime split closed the rate-dependence and left the rest.** The
+//! crush load was proportional to `dt` -- 365,906 at 64 Hz, 308,430 at 128,
+//! 93,512 at 512 -- so a *held* load read as an impulse was a force wearing an
+//! impulse's units, the one property Dwyer's argument rejects, and above 64 Hz
+//! the crush gate's own case fell under `GLASS_STRENGTH` and stopped breaking.
+//! `a_slow_crush_breaks_what_it_presses_at_any_rate` is the gate that says it
+//! does not any more. A *collision*'s exchanged momentum was flat to 1.3% over
+//! the same range all along, so the impulse rule was sound for impacts and is
+//! unchanged. These are still open:
 //!
 //! - **The 331,306 a three-cube glass stack is calibrated against is a
 //!   *landing*, not weight.** It peaks at tick 5 -- the fixture starts 0.2
-//!   voxels above where it settles, and `peak[at]` counts the bias's push-out.
-//!   The load the same stack then holds is 18,798.
+//!   voxels above where it settles. The load the same stack then holds is
+//!   18,798. (It is momentum and not the bias: measured 0.0%.)
 //! - **A four-high glass stack destroys itself**, at 356,751 against a
 //!   strength of 350,000, on the same landing. `a_four_high_glass_stack_stands`
-//!   records it and fails.
-//! - **The crush load is proportional to `dt`** -- 365,906 at 64 Hz, 308,430 at
-//!   128, 93,512 at 512 -- so for a *held* load this threshold is a force
-//!   wearing an impulse's units, which is the one property Dwyer's argument
-//!   rejects. Above 64 Hz the crush gate's own case falls under
-//!   `GLASS_STRENGTH` and stops breaking. A *collision*'s exchanged momentum is
-//!   flat to 1.3% over the same range, so the rule is sound for impacts.
+//!   records it and fails. Raising `GLASS_STRENGTH` is now possible, because it
+//!   only ever sat at 350,000 to stay under a 365,906 crush ceiling that no
+//!   longer exists -- but it has not been done.
+//! - **The held branch's own floor is a landing too, and it is not flat in the
+//!   rate.** `GLASS_CRUSH` is calibrated between what a press delivers as a
+//!   force and what a stack's largest *held* contact carries, and that second
+//!   number peaks at the landing tick at every rate -- 35,823,928 at 64 Hz
+//!   against 243,368,384 at 512 for three cubes. The ceiling only doubles over
+//!   the same range. So the held threshold is calibrated at 64 Hz and is not
+//!   calibrated at 512, and the suite would not say so. `GLASS_CRUSH` has the
+//!   table.
 //!
-//! `what_the_tick_rate_does_to_the_blow` is the sweep, and
-//! `docs/concepts/fracture-load-window.md` has the whole table, what the grab's
-//! per-substep impulse clamp has to do with it, and the two candidate fixes.
-//! Neither is done.
+//! `what_the_tick_rate_does_to_the_blow` is the impulse sweep,
+//! `what_a_press_delivers_as_a_force` the force one, and
+//! `docs/concepts/fracture-load-window.md` has the whole table and what the
+//! grab's per-substep impulse clamp has to do with it.
 //!
 //! **The threshold is scaled by the size of the body that holds the struck
 //! voxel**, which is also his: a chip of glass gives way under a load a sheet of
@@ -132,8 +167,11 @@ pub const SIZE_CAP: u32 = 27;
 ///
 /// - `a_slow_crush_breaks_what_it_presses` presses the static world's glass
 ///   floor with a measured 365,906, 4.5% over `GLASS_STRENGTH`. The world
-///   saturates at `SIZE_CAP`, so any factor past 1.046 there stops the crush
-///   breaking anything.
+///   saturates at `SIZE_CAP`, so any factor past 1.046 there stopped the crush
+///   breaking anything. **That bound has since lifted** -- a press is judged
+///   by `over_crush`, which has no size term and reads `Material::crush` --
+///   but the second one below has not, and the normalisation stands on it
+///   alone until something measures the term for collisions.
 /// - `a_collision_breaks_the_same_things_whichever_body_is_listed_first` throws
 ///   an eight-voxel glass pebble, blow 405,054, 15.7% over. Any factor past
 ///   1.157 on eight voxels stops it, and the raw rule's `cbrt(8)` is 2.
@@ -185,6 +223,85 @@ pub fn over_strength(blow: f32, strength: f32, voxels: u32) -> Option<f32> {
         return None;
     }
     Some(blow / threshold)
+}
+
+/// The closing speed, in voxels a second, at or above which a contact is read
+/// as an **impact** and below which it is read as **held**.
+///
+/// **Not a tuned constant, and the measurements are why.** Measured 2026-10-02
+/// by `solver::tests::what_the_closing_speed_says_in_each_regime`: a four-high
+/// stack landing closes at **-5.3639** voxels a second, a saturated mouse grab
+/// at **-0.0003**, and the same stack once settled at **+0.0003**, which is
+/// separating. The two regimes are **four orders of magnitude apart**, so any
+/// value from about 0.001 to 1 sorts every event in the suite the same way;
+/// 0.1 is near the middle of that in log space and nothing depends on its
+/// being 0.1 rather than 0.05 or 0.5. **Verified by rebuilding, not by a
+/// test:** the whole of `cargo test -p bevox_physics --lib` is green at 0.001
+/// and at 1.0, three orders apart, 131 passed either way. There is no gate for
+/// it because this is a `const` and varying it would mean threading it through
+/// `step` for a test's sake -- so the claim is recorded here and in the task
+/// report rather than defended by the suite, which is the honest weaker
+/// version of it.
+///
+/// It is a **discriminator, not a dial**.
+///
+/// Two things that are not implied by that, both measured the same day. At
+/// **100** everything becomes held and `resting_weight_breaks_nothing` and
+/// `the_same_collision_breaks_at_any_tick_rate` both fail -- the break that
+/// proves the branch is live. At **0** the crush gate still *passes*, which
+/// was not expected: the test is `-approach < IMPACT_SPEED`, so a
+/// **separating** contact -- which a saturated press has, and which carries
+/// load -- stays held at every value down to zero. It takes -1.0 to turn every
+/// contact into an impact and fail the crush gate. So zero is not how to force
+/// the impact branch; `held_contact` returning `false` is.
+///
+/// Which is the whole argument for switching on it at all. The same two events
+/// are **1.06x apart in impulse** -- 744,901 for the landing against 790,924
+/// for the press, summed over one substep's floor contacts -- so no threshold
+/// on the blow, however the impulse is counted, can separate them.
+/// `docs/concepts/fracture-load-window.md` has the tables.
+pub const IMPACT_SPEED: f32 = 0.1;
+
+/// Whether a held contact pressing with this much **force** crushes that
+/// material, and by how much.
+///
+/// The held half of the two regimes, and `over_strength` is the impact half.
+/// Dwyer's devlog 28 argues the threshold must be an impulse and not a force,
+/// and it is right about what it argues about: *"a collision resolves within
+/// one tick"*, so the force a collision reports depends on the tick rate and
+/// the momentum it exchanges does not. For a contact that is **held** the
+/// argument inverts exactly -- the impulse is force x dt, and it is the force
+/// that does not move. Measured 2026-10-02 across four tick rates: the crush
+/// load read as an impulse is 365,906 at 64 Hz and 93,512 at 512, proportional
+/// to `dt`, so the one case the fracture rule exists for was rate-dependent.
+/// He never considers a sustained contact because nothing in his engine
+/// presses indefinitely; his mouse grab arrives two devlogs after his
+/// fracture.
+///
+/// **No size term, deliberately.** `size_factor` is his separate rule about a
+/// chip of a material giving way under a load a sheet of it holds, and every
+/// number behind it was measured against collisions. Nothing has measured it
+/// for a press, and the crush gate's own target is the static world, which
+/// saturates at `SIZE_CAP` and so reads a factor of 1 whichever way the rule
+/// runs -- so a size term here would be arithmetic with no calibration under
+/// it. There is no gate for that and there cannot usefully be one: the
+/// signature takes no voxel count, so the absence is in the type rather than
+/// in a test that could not fail. It is a decision rather than an oversight,
+/// and this is where it is written down.
+///
+/// `None` for a material that holds, for `UNBREAKABLE` whatever the force, and
+/// for a non-finite force: a NaN compares false against everything, so
+/// `force <= crush` would silently let it through as "did not break" rather
+/// than raising the error it is. The same reasoning as `over_strength`'s, for
+/// the same reason.
+pub fn over_crush(force: f32, crush: f32) -> Option<f32> {
+    if !force.is_finite() || crush == bevox_core::material::UNBREAKABLE {
+        return None;
+    }
+    if force <= crush {
+        return None;
+    }
+    Some(force / crush)
 }
 
 /// How much of a fracturing contact's impulse is handed back to the bodies:
@@ -369,6 +486,47 @@ mod tests {
             (over - 3.0).abs() < 1e-5,
             "a blow at a capped body's threshold read {over} times over on one voxel, want 3"
         );
+    }
+
+    /// The held half, at the level of the arithmetic: a force under the crush
+    /// holds, one past it gives way, and the ratio is what sizes the cracks.
+    ///
+    /// No size term, which is the one difference from `over_strength` worth a
+    /// gate -- `over_crush` takes no voxel count, so the same force crushes
+    /// the same material whatever body holds it. The doc comment there has
+    /// why.
+    #[test]
+    fn a_material_crushes_only_past_its_crush_force() {
+        assert_eq!(over_crush(39.0, 40.0), None);
+        assert_eq!(over_crush(40.0, 40.0), None, "exactly at the crush force is not past it");
+        assert_eq!(over_crush(80.0, 40.0), Some(2.0));
+        assert_eq!(over_crush(1e30, UNBREAKABLE), None, "unbreakable was crushed");
+        // The same guard as `over_strength`'s and for the same reason: a NaN
+        // compares false against everything, so `force <= crush` would read
+        // as "held" rather than as the error it is. An infinity is what
+        // `break_what_gave_way` would hand over if it ever divided by a zero
+        // tick, which is the case its own guard exists to prevent.
+        assert_eq!(over_crush(f32::NAN, 40.0), None, "a NaN force crushed something");
+        assert_eq!(over_crush(f32::INFINITY, 40.0), None, "an infinite force crushed something");
+        assert_eq!(
+            over_crush(f32::NEG_INFINITY, 40.0),
+            None,
+            "a negative-infinite force crushed something"
+        );
+    }
+
+    /// The two regimes read different columns, so a material breakable by one
+    /// and not the other has to be expressible -- which is the whole point of
+    /// there being two numbers.
+    #[test]
+    fn a_material_can_give_way_to_one_regime_and_not_the_other() {
+        // Tough against a blow, soft under a press: a thick pane that a thrown
+        // pebble bounces off and a held weight goes through.
+        assert_eq!(over_strength(100.0, 1000.0, SIZE_CAP), None);
+        assert_eq!(over_crush(100.0, 40.0), Some(2.5));
+        // And the reverse.
+        assert_eq!(over_strength(100.0, 40.0, SIZE_CAP), Some(2.5));
+        assert_eq!(over_crush(100.0, 1000.0), None);
     }
 
     /// A NaN blow compares false against everything, so without an explicit

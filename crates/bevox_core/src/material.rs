@@ -59,8 +59,11 @@ pub struct Material {
     /// closing-speed threshold that tells the two apart; below it a contact
     /// is read as a crush, at or above it as an impact.
     ///
-    /// Nothing reads this field yet -- the regime split is a later change --
-    /// so every table in this codebase sets it to `UNBREAKABLE`.
+    /// Read by `physics::solver::break_what_gave_way` on any contact whose
+    /// closing speed at detection is under `IMPACT_SPEED`. The demo palette
+    /// still sets it to `UNBREAKABLE` throughout, so a crush reaches the
+    /// physics fixtures' glass and nothing a player can see; the palette is a
+    /// later change.
     pub crush: f32,
 }
 
@@ -98,9 +101,13 @@ pub const DEFAULT_STRENGTH: f32 = 2_800_000.0;
 pub const UNBREAKABLE: f32 = f32::INFINITY;
 
 /// What a material's `crush` is when its source says nothing: unbreakable.
-/// Nothing reads `crush` yet, so this is the only value any table uses; a
-/// material unbreakable by crush is the conservative default for a field
-/// with no reader to notice a wrong number.
+///
+/// A material unbreakable by crush is the conservative default -- a wrong
+/// number here would have a player's held rock sink through a wall, where this
+/// only means it does not. Every table in this codebase still uses it except
+/// the physics fixtures' glass, which has a measured `GLASS_CRUSH`; giving the
+/// demo palette a real column is a later change, so a crush reaches the
+/// fixture glass and nothing a player can see.
 pub const DEFAULT_CRUSH: f32 = UNBREAKABLE;
 
 /// The friction between two surfaces: the geometric mean, so the slipperier one

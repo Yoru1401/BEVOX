@@ -63,9 +63,12 @@ body sags and drags and the grab cannot force anything through terrain.
 |---|---|---|
 | `BUDGET` | 20 000 | Voxels a detachment walk visits before giving up and calling the piece grounded. A cut into a mountainside must not walk the mountain. |
 | `fracture::SIZE_CAP` | 27 | Voxels past which a body stops counting as small. Its material's strength is scaled by `cbrt(min(voxels, SIZE_CAP) / SIZE_CAP)`, so a chip gives way under a load a sheet holds; the static world saturates it. |
+| `fracture::IMPACT_SPEED` | 0.1 | Closing speed, in voxels a second, at or above which a contact is an **impact** — blow `peak[at]`, threshold `strength` — and below which it is **held** — blow `peak[at] * SUBSTEPS / dt`, a force, threshold `crush`. Not tuned: a landing closes at 5.36 and a saturated grab at 0.0003, so anything from 0.001 to 1 sorts them alike. A discriminator, not a dial. |
 
-A material's own `density`, `friction`, `restitution` and `strength` are not
-here: they are in `bevox_core::material`, per material, and are read per voxel
-— so a body half on ice drags on one side only.
+A material's own `density`, `friction`, `restitution`, `strength` and `crush`
+are not here: they are in `bevox_core::material`, per material, and are read
+per voxel — so a body half on ice drags on one side only. `strength` is an
+impulse and `crush` a force, and `IMPACT_SPEED` above chooses which of them a
+contact is read against.
 
 See [bevox_physics on one page](physics.md) for where each of these is used.

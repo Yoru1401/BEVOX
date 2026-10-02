@@ -239,14 +239,59 @@ pub(crate) mod fixtures {
     /// 350,000 is the geometric middle of the binding pair, 331,306 and
     /// 365,906 -- five per cent of headroom either way.
     ///
-    /// **Both of those bounds are measured at 64 Hz and only one of them stays
-    /// there.** The crush bound is proportional to `dt` and the landing bound
-    /// is not, so at 128 Hz the crush falls to 308,430, under this number, and
-    /// the window is gone. A four-high stack is already over it at 356,751.
-    /// `solver::tests::what_the_tick_rate_does_to_the_blow` is the sweep and
-    /// `docs/concepts/fracture-load-window.md` is what it means; read it before
-    /// moving this.
+    /// **The crush half of that window is gone, and this number has not moved
+    /// yet.** Since the regime split a press is judged as a force against
+    /// `GLASS_CRUSH`, so the 365,906 ceiling no longer applies to `strength`
+    /// at all and the crush gate does not care what this is. What still binds
+    /// it is landings: the series is 126,129 / 246,227 / 331,306 / 356,751 /
+    /// 391,195 / 414,166 for stacks of one to eight, and a four-high stack is
+    /// already over this at 356,751, which is why
+    /// `a_four_high_glass_stack_stands` is `#[ignore]`d and fails. Raising
+    /// this is the next change and the measurements above are what it is
+    /// against. `solver::tests::what_the_tick_rate_does_to_the_blow` is the
+    /// sweep and `docs/concepts/fracture-load-window.md` is what it means.
     pub const GLASS_STRENGTH: f32 = 350_000.0;
+
+    /// What the brittle fixture material takes as a **force**, while a contact
+    /// on it is held rather than struck. `GLASS_STRENGTH` is the impact half
+    /// and this is the held half; `fracture::IMPACT_SPEED` chooses between
+    /// them.
+    ///
+    /// **Measured, not chosen.** `solver::tests::what_a_press_delivers_as_a_
+    /// force` prints the two bounds, in the solver's own force units:
+    ///
+    /// | | 64 Hz | 128 | 256 | 512 |
+    /// |---|---|---|---|---|
+    /// | a saturated grab pressing | 93,671,928 | 157,916,064 | 181,859,088 | 191,513,456 |
+    /// | a three-cube stack's largest *held* force | 35,823,928 | 63,646,924 | 142,583,312 | 243,368,384 |
+    /// | a four-cube stack's | 52,490,500 | 92,412,784 | 204,522,992 | 451,801,568 |
+    ///
+    /// The press's **weakest** rate is the ceiling, 93,671,928, because the
+    /// crush gate must break at every rate. The floor is what a stack must
+    /// survive at the rate `resting_weight_breaks_nothing` actually runs,
+    /// which is 64 Hz: 35,823,928 for its three cubes, and 52,490,500 for the
+    /// four `a_four_high_glass_stack_stands` will stand once Task 3 raises the
+    /// impact strengths. **70,000,000 is the geometric middle of 52,490,500
+    /// and 93,671,928** -- 1.33x above the four-cube floor, 1.95x above the
+    /// three-cube one, and 1.34x below the press. A third either way, against
+    /// the five per cent `GLASS_STRENGTH` has.
+    ///
+    /// **What the floor is is not weight, and that is the one surprise in the
+    /// measurement.** A settled three-cube stack holds 18,798 as an impulse at
+    /// 64 Hz, which is 4,812,288 as a force -- seven times under this number.
+    /// The 35,823,928 lands at **tick 5**, and at ticks 9, 17 and 33 at the
+    /// finer rates: the same 78 ms, which is the *landing* from the 0.2 voxels
+    /// the fixture starts above the floor. So the held branch catches a sliver
+    /// of the landing whose closing speed at detection has already been killed
+    /// by an earlier tick while its warm-started impulse has not, and that
+    /// sliver is what the floor is made of. It is the same artefact
+    /// `docs/concepts/fracture-load-window.md` records for every "resting
+    /// load" figure in its history, arriving in the new branch. It is also why
+    /// the floor is **not** flat in the rate -- it grows 6.8x from 64 Hz to
+    /// 512 while the ceiling grows 2.0x -- so a held threshold calibrated at
+    /// 64 Hz is not calibrated at 512, and nothing in the suite would say so.
+    /// That is an open bound on this number, not a reason to move it.
+    pub const GLASS_CRUSH: f32 = 70_000_000.0;
 
     /// Material 1 weighs 1000 and grips; 2 weighs 3000 and grips; 3 is
     /// frictionless ice; 4 is bouncy; 5 is nearly elastic; 6 is brittle; 7
@@ -304,7 +349,10 @@ pub(crate) mod fixtures {
             })
             .unwrap();
         // 6: glass. Breaks under a load a little past what a short stack of
-        // it leans with: see `GLASS_STRENGTH`.
+        // it leans with (`GLASS_STRENGTH`), and under a press of
+        // `GLASS_CRUSH`. The only fixture material with either: the rest keep
+        // `DEFAULT_CRUSH`, so no gate here meets the held branch except the
+        // two that are about it.
         table
             .push(Material {
                 color: [200, 230, 255, 255],
@@ -312,7 +360,7 @@ pub(crate) mod fixtures {
                 friction: 60,
                 restitution: 0,
                 strength: GLASS_STRENGTH,
-                crush: bevox_core::material::DEFAULT_CRUSH,
+                crush: GLASS_CRUSH,
             })
             .unwrap();
         // 7: the same in every way except that it never breaks, so a test can
