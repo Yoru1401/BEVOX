@@ -133,7 +133,8 @@ bit-identical — or, for a feature, once its cost has been accepted knowingly.
 | `STORAGE_BUFFERS_DECLARED` | 10 | How many of those are storage buffers — the one budget that has ever been binding. |
 | `SHADER_PATH` | `shaders/march.wgsl` | Loaded at run time, which is what makes A/B/A of two shader sources possible. |
 | `SUN_DIRECTION` | (0.4, 1, 0.25) | Where the sun is, shared by the renderer and the parity tests. |
-| `SUN_SLOTS` | 2 097 152 | Slots in the per-voxel sun store, a power of two so a probe masks. More than 1080p has pixels, and a measured 118 215 distinct voxel faces fill 18% of it — the duplicate inserts, not the faces, are what load it. |
+| `SUN_SLOTS` | 2 097 152 | Slots in the per-voxel sun store, a power of two so a probe masks. More than 1080p has pixels, and a measured 118 423 distinct voxel faces — one slot each — fill 5.7% of it. |
+| `SUN_STAMP_BITS` | 8 | Bits of a claim word the frame stamp takes; the other 24 are a tag cut from the key, so one compare-exchange settles both "free?" and "mine?" and an insert has no race to lose. `next_sun_stamp` cycles 1..255, never 0. |
 | `SUN_PIXEL_CAPACITY` | 8 294 400 | Pixels the store's per-pixel slot region holds, 3840x2160. Sized for a window rather than resized with one, as the beam buffer is; a pixel past it writes nothing. |
 
 # Read next

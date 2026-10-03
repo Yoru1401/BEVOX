@@ -69,13 +69,16 @@ var<private> hit_body: u32;
 struct GpuBodyRect { min: vec2<u32>, max: vec2<u32> };
 @group(0) @binding(9) var<storage, read> body_rects: array<GpuBodyRect>;
 
-// Sun visibility store, claim words: one frame stamp per slot.
+// Sun visibility store, claim words: a frame stamp and a tag per slot, in one
+// word.
 //
 // Atomic because every pixel covering the same voxel face races to claim the
 // same slot. Core WGSL has `atomic<u32>` and `atomic<i32>` and nothing wider,
-// and the key is 39 bits, so the key itself cannot be the atomic: the stamp is
-// claimed here with a compare-exchange and the full key is written to
-// `sun_table` after, to be verified by whoever reads it.
+// and the key is 39 bits, so the key itself cannot be the atomic. What fits is
+// the stamp beside 24 bits of the key's hash, and that is enough for one
+// compare-exchange to settle both "free?" and "mine?" with nothing written
+// afterwards for a racing lane to half-read. The full 39-bit key goes to
+// `sun_table` for whoever reads the store to verify.
 //
 // Stamped, never cleared. A slot whose stamp is not this frame's is free, so no
 // pass has to walk the table to empty it -- a clear would give back part of what
@@ -101,6 +104,16 @@ const SUN_PROBES: u32 = 8u;
 /// usable entry carries. Not a valid index, so a reader cannot mistake it for
 /// slot 0.
 const SUN_NO_SLOT: u32 = 0xFFFFFFFFu;
+/// Bits of a claim word the frame stamp takes, at the top; the rest is a tag
+/// derived from the key.
+///
+/// Stamp and tag share one word so that the compare-exchange that claims a slot
+/// is atomic over **both**, which is what makes an insert race-free: there is
+/// nothing written after the claim for a losing lane to miss. 8 bits of stamp
+/// and 24 of tag. `pipeline::SUN_STAMP_BITS` is the other half of this split and
+/// a gate pins the two together.
+const SUN_STAMP_SHIFT: u32 = 24u;
+const SUN_TAG_MASK: u32 = 0xFFFFFFu;
 
 const BRICK_EDGE: u32 = 4u;
 const CHILDREN: u32 = 64u;
@@ -1152,7 +1165,9 @@ fn shadow_origin(hit: Hit, id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
 /// How many slots the store holds. A power of two, so a probe wraps with a mask
 /// rather than a modulo.
 fn sun_slots() -> u32 { return view.ao_params.y; }
-/// This frame's stamp. Never 0: 0 is a slot that was never used.
+/// This frame's stamp, 1 to 255. Never 0: 0 is a slot that was never used. It
+/// sits in the top `32 - SUN_STAMP_SHIFT` bits of a claim word, so it is shifted
+/// at the one place that builds one.
 fn sun_stamp() -> u32 { return view.ao_params.z; }
 /// Pixels the per-pixel slot region holds, so a window past it writes nothing
 /// rather than off the end of the buffer.
@@ -1204,25 +1219,59 @@ fn sun_hash(lo: u32, hi: u32) -> u32 {
     return h;
 }
 
+/// A tag for a key: 24 bits of a *second*, independent mix.
+///
+/// Independent of `sun_hash` on purpose. A tag cut from the same mix would share
+/// its low bits with the slot index, so two faces landing in one slot would
+/// already agree on 21 of the tag's 24 bits and collide one time in eight. Mixed
+/// apart, a slot collision carries no information about the tag and two faces
+/// share a slot about once in sixteen million.
+fn sun_key_tag(lo: u32, hi: u32) -> u32 {
+    var h = (lo * 0x85EBCA6Bu) ^ (hi + 0xC2B2AE35u);
+    h ^= h >> 13u;
+    h *= 0xCC9E2D51u;
+    h ^= h >> 16u;
+    h *= 0x1B873593u;
+    h ^= h >> 13u;
+    return h;
+}
+
 /// Claims a slot for this hit's (voxel, face) and returns it, or `SUN_NO_SLOT`.
 ///
-/// Claim with a compare-exchange on the stamp, write the full key after, verify
-/// the full key on any later read. The verification is not belt and braces: the
-/// hash folds 39 bits into 21, so two different voxel faces sharing a slot is
-/// the normal case and not a rare one, and the stored key is the only thing that
-/// tells them apart. Probe linearly on collision.
+/// Claim stamp and tag together with one compare-exchange; write the full key
+/// after, and verify the full key on any later read.
 ///
-/// A loser of the race re-examines the same slot rather than advancing, so it
-/// sees the winner's stamp on the next turn and compares keys there.
+/// **The claim word is the whole decision.** It holds this frame's stamp and the
+/// key's 24-bit tag, so one atomic compare-exchange settles both "is this slot
+/// free" and "is it mine". A lane that loses the exchange re-reads the word and
+/// sees the winner's stamp and tag at once: equal means the same face, and it
+/// takes that slot. Nothing is written after the claim that the loser could
+/// read half of, which is the whole point -- the earlier form claimed the stamp
+/// and wrote the 39-bit key after, and a workgroup's lanes read that key at the
+/// instruction step the winner wrote it. They saw a fresh stamp beside a stale
+/// key, called it someone else's slot, and probed on to claim another for the
+/// same face: 3.20 slots a face at 1080p, measured, all of them correct and all
+/// but one of them waste. `reintroducing_the_insert_race_costs_slots_per_face`
+/// is that form, kept as the break.
 ///
-/// The key write is not ordered against another invocation's read of the stamp,
-/// so a racing inserter can see this frame's stamp beside a key left by an
-/// earlier frame. It then compares keys and either probes on -- a second slot
-/// for the same face, which costs capacity and no correctness -- or, if that
-/// stale key happens to equal its own, settles on a slot whose key the winner
-/// then overwrites. That slot's key no longer matches the face that returned it,
-/// which is exactly what the read-side verification catches: the pixel marches
-/// its own ray. Wrong pixels are not reachable through it.
+/// A matching claim word returns the slot **without reading the key**, and that
+/// is deliberate: reading it is what the race was. So two faces whose tags
+/// collide -- about one pair in sixteen million, and they must land in the same
+/// slot as well -- come away with one slot between them, holding whichever key
+/// its claimer wrote. **The full key in `sun_table` is what tells them apart,
+/// and it is checked by whoever reads the store**, who marches its own ray on a
+/// mismatch exactly as every pixel does today. A wrong answer is not reachable
+/// through it.
+///
+/// The stamp is 8 bits and wraps every 255 frames. A slot still carrying a stamp
+/// from exactly 255 frames ago reads as this frame's: with a different tag it is
+/// skipped, which costs one slot of capacity, and with the same tag -- one in
+/// sixteen million again -- it is taken, and the key verification on read is
+/// what makes that safe. `pipeline::next_sun_stamp` never returns 0, because a
+/// zero-initialised claim word is a slot that was never used.
+///
+/// Probe linearly on collision, `SUN_PROBES` times, then give up. Giving up is
+/// correct: the pixel marches its own shadow ray, and only the saving degrades.
 ///
 /// A body hit gets no slot. Its `voxel` is a coordinate in the body's own
 /// volume and means nothing against the static grid, so keying it would alias
@@ -1235,23 +1284,27 @@ fn sun_insert(hit: Hit) -> u32 {
     let stamp = sun_stamp();
     let lo = sun_key_lo(hit.voxel);
     let hi = sun_key_hi(hit.voxel, sun_face(hit.face_normal));
+    let want = (stamp << SUN_STAMP_SHIFT) | (sun_key_tag(lo, hi) & SUN_TAG_MASK);
     var slot = sun_hash(lo, hi) & mask;
     for (var probe = 0u; probe < SUN_PROBES; probe = probe + 1u) {
         let held = atomicLoad(&sun_claims[slot]);
-        if held == stamp {
-            // Taken this frame. Ours only if the full key says so.
-            if sun_table[slot * 2u] == lo && sun_table[slot * 2u + 1u] == hi {
-                return slot;
-            }
+        if held == want {
+            return slot;
+        }
+        if (held >> SUN_STAMP_SHIFT) == stamp {
+            // This frame's, and another face's. Probe on.
             slot = (slot + 1u) & mask;
             continue;
         }
-        let claimed = atomicCompareExchangeWeak(&sun_claims[slot], held, stamp);
+        let claimed = atomicCompareExchangeWeak(&sun_claims[slot], held, want);
         if claimed.exchanged {
             sun_table[slot * 2u] = lo;
             sun_table[slot * 2u + 1u] = hi;
             return slot;
         }
+        // Lost the exchange. Re-examine this same slot rather than advancing:
+        // next turn its claim word is the winner's, and `held == want` above is
+        // what decides whether that winner is this face.
     }
     return SUN_NO_SLOT;
 }

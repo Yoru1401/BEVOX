@@ -1481,6 +1481,60 @@ fn the_static_march_is_measured() {
 /// separately, against the parent revision's shader, when they were added.
 const SUN_INSERT_CALL: &str = "        sun_remember(hit, id, size);\n";
 
+/// The one line that builds a claim word out of the stamp and the key's tag.
+const SUN_CLAIM_WORD: &str =
+    "    let want = (stamp << SUN_STAMP_SHIFT) | (sun_key_tag(lo, hi) & SUN_TAG_MASK);";
+
+/// The source with the tag dropped from the claim word, so every face this frame
+/// claims the same word and any slot claimed this frame reads as its own.
+fn without_the_key_tag(shader: &str) -> String {
+    assert_eq!(
+        shader.matches(SUN_CLAIM_WORD).count(),
+        1,
+        "the claim word moved; the sun-store breaks edit it by text and must be updated with it",
+    );
+    shader.replace(SUN_CLAIM_WORD, "    let want = stamp << SUN_STAMP_SHIFT;")
+}
+
+/// The source with the insert race back: the claim word is the stamp alone, and
+/// the insert reads the full key out of `sun_table` to decide whether a slot
+/// claimed this frame is its own. That read is what the race was.
+fn with_the_insert_race(shader: &str) -> String {
+    let mine = "        if held == want {\n            return slot;\n        }\n";
+    assert_eq!(
+        shader.matches(mine).count(),
+        1,
+        "the insert's ownership test moved; this break edits it by text and must be updated \
+         with it",
+    );
+    // The "this frame, another face" branch goes too, which the tag-less form
+    // never had: with no tag it cannot fire, and leaving dead code in the loop
+    // is exactly the kind of thing this project has watched move a frame by
+    // tens of percent.
+    let other = concat!(
+        "        if (held >> SUN_STAMP_SHIFT) == stamp {\n",
+        "            // This frame's, and another face's. Probe on.\n",
+        "            slot = (slot + 1u) & mask;\n",
+        "            continue;\n",
+        "        }\n",
+    );
+    assert_eq!(
+        shader.matches(other).count(),
+        1,
+        "the insert's probe-on branch moved; this break edits it by text",
+    );
+    without_the_key_tag(shader).replace(other, "").replace(
+        mine,
+        "        if held == want {\n\
+         \x20           if sun_table[slot * 2u] == lo && sun_table[slot * 2u + 1u] == hi {\n\
+         \x20               return slot;\n\
+         \x20           }\n\
+         \x20           slot = (slot + 1u) & mask;\n\
+         \x20           continue;\n\
+         \x20       }\n",
+    )
+}
+
 /// The source with the insert removed and everything else, bindings included,
 /// left where it is.
 fn without_the_sun_store(shader: &str) -> String {
@@ -1640,26 +1694,26 @@ fn what_the_sun_store_costs() {
     }
 }
 
-/// Two different voxel faces sharing one slot is what the stored key guards, and
-/// the guard is load-bearing rather than defensive.
+/// The claim word's tag is what tells one face's slot from another's, and
+/// reporting every tag equal is the break that shows it.
 ///
-/// The hash folds a 39-bit key into 21 bits. Forcing every key comparison to
-/// report equal makes an insert accept the first occupied slot a probe lands on,
-/// whoever owns it, so every face that collided is swallowed by the face that
-/// got there first. The number swallowed is the number of voxel faces that would
-/// read another voxel's answer, and it is reported here rather than asserted
-/// away.
+/// A claim word is this frame's stamp over 24 bits of the key's hash. Forcing
+/// the tag to the same value for every face -- here by dropping it from the word
+/// -- makes an insert accept the first slot claimed this frame that a probe
+/// lands on, whoever owns it, so every face that collided is swallowed by the
+/// face that got there first.
 ///
-/// It is a birthday count, `n^2 / 2m` for `n` faces in `m` slots -- about 2,100
-/// of 94,000 faces at 1280x720 against 2^21 slots. **Not "most", which is what a
-/// table at a 4.5% load factor buys**, and not nothing either: without the
-/// stored key those thousands of faces are wrong, and at 1080p there are four
-/// times as many.
+/// The number swallowed is the number of faces that would read another voxel's
+/// answer, and it is reported rather than asserted away: a birthday count,
+/// `n^2 / 2m` for `n` faces in `m` slots, about 2,100 of 94,000 at 1280x720
+/// against 2^21 slots. **Not "most", which is what a table at a 4.5% load factor
+/// in faces buys**, and not nothing either -- without the tag those thousands of
+/// faces share an answer, and at 1080p there are four times as many.
 ///
-/// **This revision cannot show that as a broken image, and saying otherwise
-/// would be a lie:** nothing reads the store yet, so no pixel can depend on it.
-/// What it shows is the sharing itself, in the store. The image break belongs to
-/// the task that adds the read.
+/// The full key in `sun_table` is the second guard and it is checked by whoever
+/// reads the store. Nothing reads it yet, so this revision cannot show either
+/// guard as a broken image, and saying otherwise would be a lie. What it shows
+/// is the sharing itself.
 #[test]
 fn forcing_every_key_to_match_shares_slots_between_voxels() {
     let Some((device, queue)) = gpu_device() else {
@@ -1669,14 +1723,7 @@ fn forcing_every_key_to_match_shares_slots_between_voxels() {
     let (tree, extent) = bench_scene();
     let (eye, offset_from_clip) = bench_camera(extent);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
-
-    let needle = "if sun_table[slot * 2u] == lo && sun_table[slot * 2u + 1u] == hi {";
-    assert_eq!(
-        shader.matches(needle).count(),
-        1,
-        "the key verification moved; this break edits it by text and must be updated with it",
-    );
-    let blind = shader.replace(needle, "if true {");
+    let blind = without_the_key_tag(&shader);
 
     let (w, h) = (1280u32, 720u32);
     let build = |source: &str| {
@@ -1692,20 +1739,85 @@ fn forcing_every_key_to_match_shares_slots_between_voxels() {
     let expected = honest.distinct_keys.pow(2) as f64 / (2.0 * slots);
 
     eprintln!(
-        "keys verified: {} faces in {} slots. Keys reported equal: {} faces, so {swallowed} \
-         voxel faces took a slot another voxel owns -- a birthday count predicts {expected:.0}.",
+        "tags kept: {} faces in {} slots. Every tag equal: {} faces, so {swallowed} voxel \
+         faces took a slot another voxel owns -- a birthday count predicts {expected:.0}.",
         honest.distinct_keys, honest.occupied, shared.distinct_keys,
     );
     assert!(
         swallowed > 0,
-        "with every key reported equal, no face took another's slot; either nothing collides \
-         or the comparison is not what decides a slot's owner",
+        "with every tag reported equal, no face took another's slot; either nothing collides \
+         or the tag is not what decides a slot's owner",
     );
     // Half the prediction, not the prediction: the count is a race between
     // pixels and the exact number moves between runs.
     assert!(
         (swallowed as f64) > expected * 0.5,
         "{swallowed} faces shared a slot against about {expected:.0} predicted; the collision \
-         the key guards is not happening at the rate the capacity implies",
+         the tag guards is not happening at the rate the capacity implies",
+    );
+}
+
+/// One slot per distinct face, and the race that cost three.
+///
+/// The insert's contract is one slot per distinct `(voxel, face)`. It holds
+/// because the claim word carries the stamp and the key's tag together, so the
+/// compare-exchange that claims a slot settles both questions at once and
+/// nothing is written after it for a losing lane to half-read.
+///
+/// The break puts the earlier form back: the claim word is the stamp alone, and
+/// an insert that finds this frame's stamp reads the 39-bit key out of
+/// `sun_table` to decide whether the slot is its own. That read is unordered
+/// against the winner's write of the same key, so a workgroup's lanes -- which
+/// cover about seven faces between sixty-four of them -- see a fresh stamp
+/// beside a stale key, call it someone else's slot, and probe on to claim
+/// another for the same face. Every duplicate is correct and all but one is
+/// waste: a pass dispatched over occupied slots would march every one of them.
+///
+/// **A measurement break, not an image break, and that is the honest shape for
+/// this defect: it never changed a pixel.** It cost about 2.4 ms of the 8.36 ms
+/// the shadow march is worth, which is not something an image can show.
+#[test]
+fn reintroducing_the_insert_race_costs_slots_per_face() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let raced = with_the_insert_race(&shader);
+
+    let (w, h) = (1280u32, 720u32);
+    let build = |source: &str| {
+        Prepared::new(
+            &device, source, "march", &tree, offset_from_clip, eye, w, h, march_flags::DEFAULT,
+            &[],
+        )
+    };
+    let fixed = build(&shader).sun_store(&device, &queue);
+    let before = build(&raced).sun_store(&device, &queue);
+    let per_face = |s: &SunStore| s.occupied as f64 / s.distinct_keys.max(1) as f64;
+
+    eprintln!(
+        "claim word carries the tag: {:.3} slots a face ({} slots, {} faces). Key read back \
+         after the claim instead: {:.3} slots a face ({} slots, {} faces).",
+        per_face(&fixed),
+        fixed.occupied,
+        fixed.distinct_keys,
+        per_face(&before),
+        before.occupied,
+        before.distinct_keys,
+    );
+    assert!(
+        per_face(&fixed) < 1.02,
+        "{:.3} slots a face: the insert is claiming more than one slot per distinct face, \
+         which is work a pass over occupied slots would repeat",
+        per_face(&fixed),
+    );
+    assert!(
+        per_face(&before) > 1.5,
+        "putting the race back cost only {:.3} slots a face, so this break does not reproduce \
+         the defect it guards and the gate above is not known to test anything",
+        per_face(&before),
     );
 }

@@ -67,7 +67,28 @@ pub const SUN_SLOTS: u32 = 1 << 21;
 /// renders correctly and loses only the saving.
 pub const SUN_PIXEL_CAPACITY: u32 = 3840 * 2160;
 
-/// Words in `sun_claims`: one stamp per slot.
+/// Bits of a claim word the frame stamp takes; the other 24 are a tag cut from
+/// the key, so that the compare-exchange claiming a slot is atomic over both.
+///
+/// Eight, which wraps every 255 frames. A slot still carrying a stamp from
+/// exactly 255 frames ago reads as this frame's, and `march.wgsl`'s `sun_insert`
+/// says what that costs -- a slot of capacity, or, once in sixteen million, an
+/// entry whose key the reader rejects. `the_shader_and_the_stamp_agree_on_the_split`
+/// pins this against the shader's own `SUN_STAMP_SHIFT`.
+pub const SUN_STAMP_BITS: u32 = 8;
+
+/// The next frame's stamp for the sun store, from the last one.
+///
+/// Cycles 1 to 255 and never returns 0, because a zero-initialised claim word
+/// means "never used" and a stamp of 0 would read as free and as this frame's at
+/// once. One spelling, so the rule is testable rather than inlined at the call
+/// site where it was first needed.
+pub fn next_sun_stamp(previous: u32) -> u32 {
+    let last = (1 << SUN_STAMP_BITS) - 1;
+    previous % last + 1
+}
+
+/// Words in `sun_claims`: one claim word per slot.
 pub const fn sun_claim_words() -> u32 {
     SUN_SLOTS
 }
@@ -459,16 +480,8 @@ pub fn prepare_march_buffers(
         return;
     };
     // This frame's stamp for the sun store, advanced once per prepared frame.
-    //
-    // Never 0: a zero-initialised claim word means "never used", so a stamp of
-    // 0 would read as free and as this frame's at once. On wrap the stamp
-    // returns to 1 rather than 0, which at 60 fps is 2.3 years away and would
-    // at worst let one stale entry read as fresh -- the key verification is
-    // what catches that, as it catches a collision.
-    *sun_stamp = sun_stamp.wrapping_add(1);
-    if *sun_stamp == 0 {
-        *sun_stamp = 1;
-    }
+    // `next_sun_stamp` holds the rule and why it never returns 0.
+    *sun_stamp = next_sun_stamp(*sun_stamp);
     // The rectangles are in the pixels of the texture `dispatch_march` binds,
     // which the shader measures with `textureDimensions`: read from that same
     // `GpuImage`, not from `MarchTarget`'s recorded size, which could lag it.
@@ -771,6 +784,53 @@ mod tests {
     /// `sun_insert` wraps a probe with `& (slots - 1)`, which is the mask only
     /// for a power of two. A capacity that is not one sends every probe past
     /// the end of the table.
+    /// The stamp's width is spelled in `march.wgsl` as a shift and here as a
+    /// bit count, and the insert is wrong in a way no picture shows if they
+    /// part: a stamp wider than the shader's field would overwrite the tag.
+    ///
+    /// Break that must fail this: change either number alone.
+    #[test]
+    fn the_shader_and_the_stamp_agree_on_the_split() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/shaders/march.wgsl"
+        ))
+        .expect("shader missing");
+        let shift: u32 = source
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("const SUN_STAMP_SHIFT: u32 = "))
+            .and_then(|rest| rest.trim_end_matches(";").trim_end_matches("u").parse().ok())
+            .expect("march.wgsl declares no SUN_STAMP_SHIFT");
+        assert_eq!(
+            shift,
+            32 - SUN_STAMP_BITS,
+            "the shader keeps {shift} bits for the tag and this crate stamps \
+             {SUN_STAMP_BITS} bits; a stamp past the shader's field overwrites the tag"
+        );
+    }
+
+    /// A stamp of 0 reads as "never used" **and** as this frame's at once, which
+    /// is the bug class this whole store is stamped to avoid.
+    ///
+    /// Break that must fail this: make `next_sun_stamp` `previous + 1`.
+    #[test]
+    fn the_stamp_cycles_without_ever_being_zero() {
+        let mut stamp = 0;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..1000 {
+            stamp = next_sun_stamp(stamp);
+            assert_ne!(stamp, 0, "a stamp of 0 reads as a slot that was never used");
+            assert!(
+                stamp < (1 << SUN_STAMP_BITS),
+                "{stamp} does not fit {SUN_STAMP_BITS} bits and would overwrite the tag"
+            );
+            seen.insert(stamp);
+        }
+        // Every value the field holds except 0, so a slot is free again as soon
+        // as the stamp has been round once.
+        assert_eq!(seen.len(), (1 << SUN_STAMP_BITS) - 1);
+    }
+
     #[test]
     fn the_sun_store_is_a_power_of_two() {
         assert!(SUN_SLOTS.is_power_of_two(), "SUN_SLOTS is {SUN_SLOTS}, and the shader masks");

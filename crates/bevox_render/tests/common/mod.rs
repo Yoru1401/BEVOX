@@ -218,7 +218,8 @@ pub fn read_texture(
 /// Full-resolution pixels per beam sample, per axis. Must match BEAM_SCALE.
 pub const BEAM_SCALE: u32 = 8;
 
-/// The sun store's frame stamp in the harness: one fixed non-zero value.
+/// The sun store's frame stamp in the harness: one fixed non-zero value, in the
+/// 1..255 the 8-bit stamp field holds.
 ///
 /// The app advances a stamp per frame so a slot from the last frame reads as
 /// free; a harness dispatches the same frame over and over, so a fixed stamp is
@@ -788,8 +789,11 @@ impl Prepared {
 
         let mut occupied = 0usize;
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for (slot, &stamp) in claims.iter().enumerate() {
-            if stamp != SUN_STAMP {
+        let shift = 32 - bevox_render::pipeline::SUN_STAMP_BITS;
+        for (slot, &claim) in claims.iter().enumerate() {
+            // A claim word is the stamp over the key's tag, so the stamp comes
+            // out of the top bits rather than the whole word.
+            if claim >> shift != SUN_STAMP {
                 continue;
             }
             occupied += 1;
