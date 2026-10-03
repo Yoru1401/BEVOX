@@ -1375,6 +1375,7 @@ fn the_march_is_measured_at_both_resolutions() {
     }
 }
 
+#[test]
 #[ignore]
 fn the_static_march_is_measured() {
     let Some((device, queue)) = gpu_device() else {
