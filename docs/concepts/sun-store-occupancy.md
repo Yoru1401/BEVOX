@@ -90,6 +90,11 @@ because the width is spelled as a shift in `march.wgsl` and a bit count in
 `pipeline.rs`, and a stamp wider than the shader's field would overwrite the tag
 with no picture to show it.
 
+**Both of those are now exercised.** The read side is `march_composite` and its
+key check is an image break — see [the sun pass was
+lane-bound](sun-pass-is-lane-bound.md), which also carries what the store
+collected once something read it.
+
 # What the store costs when nothing reads it
 
 Five invocations, each A/B/A interleaved, insert on against off, GPU clock,

@@ -59,13 +59,34 @@ pub const STORAGE_BUFFERS_DECLARED: u32 = 10;
 /// per-pixel region past them taking the one binding to 58 MB in all.
 pub const SUN_SLOTS: u32 = 1 << 21;
 
-/// Pixels the store's per-pixel slot region holds.
+/// Pixels the store's per-pixel record region holds.
 ///
 /// 3840x2160. Sized for a window rather than resized with one, the way the beam
-/// buffer is: these buffers are built with the scene and the window is not. A
-/// pixel past it writes nothing -- the shader checks -- so a larger window
-/// renders correctly and loses only the saving.
+/// buffer is: these buffers are built with the scene and the window is not.
+///
+/// **A window past this falls back to the single-pass `march`**, in
+/// `dispatch_march`. Before Task 2 a pixel past the region simply wrote no slot
+/// and lost the saving; now the region carries the shading the composite pass
+/// reads, so a pixel without one would be black. The fallback is in Rust rather
+/// than a branch in the composite because a branch a benchmark never takes has
+/// twice cost this project tens of percent of a frame -- see
+/// `docs/concepts/gpu-codegen-cliff.md`.
 pub const SUN_PIXEL_CAPACITY: u32 = 3840 * 2160;
+
+/// Words one pixel's record takes: slot, key lo, key hi with the material and
+/// the done flag, the shading normal, the ambient occlusion.
+///
+/// `march.wgsl`'s `SUN_PIXEL_WORDS` is the other half of this and
+/// `the_shader_and_the_record_agree_on_its_width` pins the two together: the
+/// stride is spelled in two languages and a disagreement would have one pass
+/// reading another pixel's record, with nothing but a wrong image to show it.
+pub const SUN_PIXEL_WORDS: u32 = 7;
+
+/// Invocations per workgroup in the sun pass, matching its `@workgroup_size`.
+///
+/// One dimension, not 8x8: the pass is indexed by slot, and a slot is a
+/// one-dimensional thing.
+pub const SUN_PASS_WORKGROUP: u32 = 64;
 
 /// Bits of a claim word the frame stamp takes; the other 24 are a tag cut from
 /// the key, so that the compare-exchange claiming a slot is atomic over both.
@@ -88,17 +109,28 @@ pub fn next_sun_stamp(previous: u32) -> u32 {
     previous % last + 1
 }
 
-/// Words in `sun_claims`: one claim word per slot.
+/// Words in `sun_claims`: one claim word per slot, and one past them holding
+/// how long the sun pass's work list is.
+///
+/// The counter lives here rather than in a buffer of its own because it is one
+/// word and `sun_claims` is already the atomic binding. It is cleared by the
+/// encoder once a frame: a slot can be stamped free, a counter cannot.
 pub const fn sun_claim_words() -> u32 {
-    SUN_SLOTS
+    SUN_SLOTS + 1
+}
+
+/// Byte offset of that counter inside `sun_claims`.
+pub const fn sun_work_count_offset() -> u64 {
+    SUN_SLOTS as u64 * 4
 }
 
 /// Words in `sun_table`: two key words and one visibility word per slot, then
-/// one slot index per pixel. The regions ride behind one binding at offsets the
-/// shader derives from `SUN_SLOTS`, the way the fullness grid rides behind the
-/// distance field.
+/// one `SUN_PIXEL_WORDS` record per pixel, then the sun pass's work list -- room
+/// for every slot, since every slot could be occupied. The regions ride behind
+/// one binding at offsets the shader derives from `SUN_SLOTS`, the way the
+/// fullness grid rides behind the distance field.
 pub const fn sun_table_words() -> u32 {
-    SUN_SLOTS * 3 + SUN_PIXEL_CAPACITY
+    SUN_SLOTS * 3 + SUN_PIXEL_CAPACITY * SUN_PIXEL_WORDS + SUN_SLOTS
 }
 
 /// Voxel data budget on the GPU. Checked at upload; exceeding it is an error,
@@ -283,6 +315,17 @@ pub struct MarchPipeline {
     pub views: Vec<CachedComputePipelineId>,
     /// Coarse pass, dispatched before the main one when the beam flag is set.
     pub beam: CachedComputePipelineId,
+    /// The lit view, split in three: march and insert, one shadow ray per
+    /// occupied slot, then shade from the store. `DebugView::Lit`'s own
+    /// pipeline is the single-pass `march` and stays the fallback for a window
+    /// past `SUN_PIXEL_CAPACITY` and for the frames before these three compile.
+    pub primary: CachedComputePipelineId,
+    /// Gathers the occupied slots into a dense work list. Its own pass because
+    /// the sparse dispatch it replaces was measured at 15.01 ms against the
+    /// 8.14 ms of shadow marching it was meant to collect.
+    pub compact: CachedComputePipelineId,
+    pub sun: CachedComputePipelineId,
+    pub composite: CachedComputePipelineId,
 }
 
 impl MarchPipeline {
@@ -459,7 +502,29 @@ pub fn init_march_pipeline(
         ..default()
     });
 
-    commands.insert_resource(MarchPipeline { layout, views, beam });
+    let queue_entry = |entry: &'static str| {
+        pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some(format!("bevox_{entry}").into()),
+            layout: vec![BindGroupLayoutDescriptor::new("bevox_march_layout", &entries)],
+            shader: shader.clone(),
+            entry_point: Some(entry.into()),
+            ..default()
+        })
+    };
+    let primary = queue_entry("march_primary");
+    let compact = queue_entry("sun_compact");
+    let sun = queue_entry("sun_pass");
+    let composite = queue_entry("march_composite");
+
+    commands.insert_resource(MarchPipeline {
+        layout,
+        views,
+        beam,
+        primary,
+        compact,
+        sun,
+        composite,
+    });
 }
 
 /// Uploads scene buffers and the per-frame uniform into the render world.
@@ -645,7 +710,8 @@ pub fn prepare_march_buffers(
         sun_claims: device.create_buffer(&BufferDescriptor {
             label: Some("bevox_sun_claims"),
             size: u64::from(sun_claim_words()) * 4,
-            usage: BufferUsages::STORAGE,
+            // COPY_DST for the one-word clear of the work-list counter.
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }),
         sun_table: device.create_buffer(&BufferDescriptor {
@@ -727,18 +793,64 @@ pub fn dispatch_march(
             1,
         );
     }
-    {
+    // The lit view in three passes, when the store can hold a record for every
+    // pixel and all three pipelines have compiled. Anything else -- a debug
+    // view, a window past the capacity, a pipeline still building -- takes the
+    // single-pass `march`, which shades every pixel on its own.
+    let split = (view == DebugView::Lit
+        && u64::from(target.width) * u64::from(target.height)
+            <= u64::from(SUN_PIXEL_CAPACITY))
+        .then(|| {
+            Some((
+                pipeline_cache.get_compute_pipeline(pipeline.primary)?,
+                pipeline_cache.get_compute_pipeline(pipeline.compact)?,
+                pipeline_cache.get_compute_pipeline(pipeline.sun)?,
+                pipeline_cache.get_compute_pipeline(pipeline.composite)?,
+            ))
+        })
+        .flatten();
+
+    let pixel_pass = |encoder: &mut CommandEncoder, label: &'static str, p: &ComputePipeline| {
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("bevox_march_pass"),
+            label: Some(label),
             timestamp_writes: None,
         });
-        pass.set_pipeline(compute);
+        pass.set_pipeline(p);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(
             target.width.div_ceil(WORKGROUP),
             target.height.div_ceil(WORKGROUP),
             1,
         );
+    };
+
+    match split {
+        Some((primary, compact, sun, composite)) => {
+            // The work list's length. A slot is stamped free, a counter is not,
+            // so this is the one word a frame that has to be cleared.
+            encoder.clear_buffer(&buffers.sun_claims, sun_work_count_offset(), Some(4));
+            pixel_pass(&mut encoder, "bevox_march_primary_pass", primary);
+            let slot_pass = |encoder: &mut CommandEncoder,
+                             label: &'static str,
+                             p: &ComputePipeline,
+                             invocations: u32| {
+                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some(label),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(p);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(invocations.div_ceil(SUN_PASS_WORKGROUP), 1, 1);
+            };
+            // The compaction scans the whole table; the sun pass walks the list
+            // it built, which cannot be longer than the pixels that inserted
+            // into it, so the dispatch is bounded by the smaller of the two.
+            slot_pass(&mut encoder, "bevox_sun_compact_pass", compact, SUN_SLOTS);
+            let pixels = target.width * target.height;
+            slot_pass(&mut encoder, "bevox_sun_pass", sun, pixels.min(SUN_SLOTS));
+            pixel_pass(&mut encoder, "bevox_march_composite_pass", composite);
+        }
+        None => pixel_pass(&mut encoder, "bevox_march_pass", compute),
     }
     queue.submit([encoder.finish()]);
 }
@@ -807,6 +919,52 @@ mod tests {
             "the shader keeps {shift} bits for the tag and this crate stamps \
              {SUN_STAMP_BITS} bits; a stamp past the shader's field overwrites the tag"
         );
+    }
+
+    /// The per-pixel record's stride is spelled in `march.wgsl` and here, and a
+    /// disagreement has one pass reading another pixel's record.
+    ///
+    /// Break that must fail this: change either number alone.
+    #[test]
+    fn the_shader_and_the_record_agree_on_its_width() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/shaders/march.wgsl"
+        ))
+        .expect("shader missing");
+        let words: u32 = source
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("const SUN_PIXEL_WORDS: u32 = "))
+            .and_then(|rest| rest.trim_end_matches(";").trim_end_matches("u").parse().ok())
+            .expect("march.wgsl declares no SUN_PIXEL_WORDS");
+        assert_eq!(
+            words, SUN_PIXEL_WORDS,
+            "the shader strides {words} words a pixel and this crate sizes the buffer for \
+             {SUN_PIXEL_WORDS}"
+        );
+    }
+
+    /// The sun pass is indexed by slot and dispatched from `SUN_SLOTS`, so its
+    /// `@workgroup_size` and `SUN_PASS_WORKGROUP` have to agree or the dispatch
+    /// covers the wrong part of the table.
+    ///
+    /// Break that must fail this: change either number alone.
+    #[test]
+    fn the_shader_and_the_sun_pass_agree_on_its_workgroup() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/shaders/march.wgsl"
+        ))
+        .expect("shader missing");
+        for entry in ["sun_compact", "sun_pass"] {
+        let declared =
+            format!("@compute @workgroup_size({SUN_PASS_WORKGROUP}, 1, 1)\nfn {entry}(");
+        assert!(
+            source.contains(&declared),
+            "march.wgsl does not declare `{declared}`, so the dispatch sized from \
+             SUN_PASS_WORKGROUP covers the wrong number of slots"
+        );
+        }
     }
 
     /// A stamp of 0 reads as "never used" **and** as this frame's at once, which

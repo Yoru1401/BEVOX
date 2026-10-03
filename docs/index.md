@@ -35,6 +35,7 @@ lifted out of the plan that produced it.
 * [Concepts](concepts/) - what was learned building this, out of the plans that learned it.
 * [Every gate is proven by a deliberate break](concepts/deliberate-breaks.md) - a test that has never failed is not known to test anything.
 * [No safe stale direction](concepts/stale-direction.md) - the distance field may lag, fullness may not, so every editing path recounts it.
+* [The sun pass was lane-bound, not ray-bound](concepts/sun-pass-is-lane-bound.md) - 118,423 shadow rays cost more than 1,092,019 until the occupied slots were packed into a dense work list.
 * [The GPU codegen cliff](concepts/gpu-codegen-cliff.md) - code the shader never runs can still cost tens of percent; re-bench every march.wgsl edit.
 * [One canonical tree, and a derived view for each job](concepts/derived-view-per-job.md) - six representations are derived from the Contree, each shaped for one job and each declaring where it may be stale.
 * [An inference is not an observation](concepts/an-inference-is-not-an-observation.md) - a claim about behaviour names the code that makes it true, because no gate can read prose.

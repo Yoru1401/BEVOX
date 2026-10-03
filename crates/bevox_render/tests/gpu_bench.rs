@@ -1820,3 +1820,344 @@ fn reintroducing_the_insert_race_costs_slots_per_face() {
         per_face(&before),
     );
 }
+
+/// The composite pass's key comparison, which is the only thing that tells two
+/// faces sharing a slot apart.
+const SUN_KEY_CHECK: &str =
+    "    if slot != SUN_NO_SLOT && sun_table[slot * 2u] == lo && sun_table[slot * 2u + 1u] == hi {";
+
+/// The source with the read side's key verification dropped: a slot is believed
+/// on the strength of the claim word's tag alone.
+fn without_the_key_check(shader: &str) -> String {
+    assert_eq!(
+        shader.matches(SUN_KEY_CHECK).count(),
+        1,
+        "the composite's key check moved; this break edits it by text and must be updated \
+         with it",
+    );
+    shader.replace(SUN_KEY_CHECK, "    if slot != SUN_NO_SLOT {")
+}
+
+/// The guard the compaction skips a free slot with, which is also where a break
+/// can switch the sun pass off: an empty work list is a sun pass with nothing
+/// to march.
+const SUN_PASS_GUARD: &str = "    if slot >= sun_slots() { return; }";
+
+/// The source with the compaction gathering nothing, so the sun pass is
+/// dispatched and marches no ray. `sun_stamp` is never 0, so this returns every
+/// time -- but it is a runtime value, so the code below it is not statically
+/// dead and the driver still compiles it. Removing it from the source instead
+/// would be measuring a different shader.
+fn with_the_sun_pass_silenced(shader: &str) -> String {
+    assert_eq!(
+        shader.matches(SUN_PASS_GUARD).count(),
+        1,
+        "the compaction's guard moved; this break edits it by text",
+    );
+    shader.replace(
+        SUN_PASS_GUARD,
+        "    if slot >= sun_slots() || sun_stamp() != 0u { return; }",
+    )
+}
+
+/// The three lines in the sun pass that actually march.
+const SUN_PASS_MARCH: &str = concat!(
+    "    var bit = 0u;\n",
+    "    if shadowed(sun_key_origin(lo, hi), view.sun_direction.xyz, max_ray_distance()) {\n",
+    "        bit = 1u;\n",
+    "    }\n",
+);
+
+/// The source with the sun pass writing a constant instead of marching.
+fn with_a_constant_sun(shader: &str) -> String {
+    assert_eq!(
+        shader.matches(SUN_PASS_MARCH).count(),
+        1,
+        "the sun pass's march moved; this break edits it by text",
+    );
+    shader.replace(SUN_PASS_MARCH, "    var bit = 1u;\n")
+}
+
+/// **The gate the whole plan rests on**: the three-pass lit path draws the same
+/// image as the single-pass one, pixel for pixel, at both resolutions, with
+/// bodies and without.
+///
+/// Sun visibility is already a per-voxel property -- `shadow_origin` snaps to
+/// the voxel centre and offsets along the axis-aligned face normal -- so
+/// computing it once per `(voxel, face)` and reading it back per pixel may not
+/// move a pixel. A differing pixel is not a trade-off: it means the key does
+/// not identify everything the ray depends on.
+///
+/// Both sides are the same shader module, so this cannot accidentally compare
+/// two builds. `march` is left byte for byte as it was for exactly this reason.
+///
+/// Not ignored.
+#[test]
+fn the_split_pass_changes_no_pixel() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let cube = body_cube();
+    let bodies = bench_bodies(eye, 120.0, &cube, 33.0);
+
+    for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
+        for (what, placed) in [("no bodies", &[][..]), ("sixteen bodies", &bodies[..])] {
+            let build = |entry: &str| {
+                Prepared::new(
+                    &device, &shader, entry, &tree, offset_from_clip, eye, w, h,
+                    march_flags::DEFAULT, placed,
+                )
+            };
+            let before = build("march").read_back(&device, &queue);
+            let after = build("march_composite").read_back(&device, &queue);
+            let differing = before
+                .chunks_exact(4)
+                .zip(after.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                differing, 0,
+                "{w}x{h}, {what}: the split pass moved {differing} pixels of {}; the key does \
+                 not identify what the shadow ray depends on",
+                w * h,
+            );
+        }
+    }
+}
+
+/// The read side's key check is load-bearing, and this is the image that shows
+/// it.
+///
+/// `sun_claim` returns a slot on a matching claim word **without reading the
+/// key**, because reading the key is what the insert race was. So until the
+/// composite compares the full 39-bit key, two faces are told apart by the claim
+/// word's 24-bit tag alone. Honestly tagged that is one pair in sixteen million
+/// and no image could show it, so this break drops the tag from the claim word
+/// as well -- which is Task 1's own break -- and thousands of faces then land in
+/// a slot another voxel owns.
+///
+/// Two halves, and both matter:
+///
+/// - **Tag dropped, key check kept: the image is bit-identical.** Every face
+///   that took another's slot sees the mismatch and marches its own ray, which
+///   is what the guard is for.
+/// - **Tag dropped, key check removed: the image changes.** Those faces read
+///   another voxel's sun.
+///
+/// Nothing else in the suite exercises the full key any more: the insert stopped
+/// reading keys when the race was fixed.
+///
+/// Not ignored.
+#[test]
+fn the_key_check_is_what_keeps_two_faces_apart() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let colliding = without_the_key_tag(&shader);
+    let blind = without_the_key_check(&colliding);
+
+    let (w, h) = (1280u32, 720u32);
+    let build = |source: &str| {
+        Prepared::new(
+            &device, source, "march_composite", &tree, offset_from_clip, eye, w, h,
+            march_flags::DEFAULT, &[],
+        )
+    };
+    let honest = build(&shader).read_back(&device, &queue);
+    let guarded = build(&colliding).read_back(&device, &queue);
+    let unguarded = build(&blind).read_back(&device, &queue);
+    let differing = |a: &[u8], b: &[u8]| {
+        a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(x, y)| x != y).count()
+    };
+
+    let kept = differing(&honest, &guarded);
+    let dropped = differing(&honest, &unguarded);
+    eprintln!(
+        "every tag reported equal, so thousands of faces share a slot: with the key check \
+         {kept} pixels differ of {}, without it {dropped}.",
+        w * h,
+    );
+    assert_eq!(
+        kept, 0,
+        "{kept} pixels moved with the key check in place; a face that took another's slot is \
+         supposed to see the mismatch and march its own ray",
+    );
+    assert!(
+        dropped > 0,
+        "dropping the key check moved no pixel, so nothing in this scene reads a shared slot \
+         and the guard is not known to be load-bearing",
+    );
+}
+
+/// A cached value nothing computes is not a cache: the sun pass is what the
+/// image depends on, twice over.
+///
+/// Writing a constant bit shadows everything the store answers for. Switching
+/// the pass off instead leaves the visibility words as the buffer was zeroed,
+/// so the same faces read *lit*. The two images differ from today's, and from
+/// each other -- which is what rules out a composite that quietly marched its
+/// own ray and never read the store at all.
+///
+/// Not ignored.
+#[test]
+fn the_sun_pass_is_what_the_image_depends_on() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let constant = with_a_constant_sun(&shader);
+    let silent = with_the_sun_pass_silenced(&shader);
+
+    let (w, h) = (1280u32, 720u32);
+    let build = |source: &str| {
+        Prepared::new(
+            &device, source, "march_composite", &tree, offset_from_clip, eye, w, h,
+            march_flags::DEFAULT, &[],
+        )
+    };
+    let honest = build(&shader).read_back(&device, &queue);
+    let all_dark = build(&constant).read_back(&device, &queue);
+    let all_lit = build(&silent).read_back(&device, &queue);
+    let differing = |a: &[u8], b: &[u8]| {
+        a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(x, y)| x != y).count()
+    };
+
+    let dark = differing(&honest, &all_dark);
+    let lit = differing(&honest, &all_lit);
+    let between = differing(&all_dark, &all_lit);
+    eprintln!(
+        "sun pass writing a constant 1: {dark} pixels differ of {}. Sun pass switched off: \
+         {lit}. Between those two: {between}.",
+        w * h,
+    );
+    assert!(dark > 0, "a sun pass writing a constant moved no pixel, so nothing reads its bit");
+    assert!(lit > 0, "switching the sun pass off moved no pixel, so nothing reads its bit");
+    assert_ne!(
+        dark, lit,
+        "the two breaks moved the same number of pixels, which a shadowed-everything and a \
+         lit-everything store should not",
+    );
+    assert!(
+        between > 0,
+        "shadowing everything and lighting everything drew the same image, so the composite \
+         is not reading the visibility word it claims to",
+    );
+}
+
+/// Median per-pass GPU time over seven readings, for one configuration:
+/// beam, primary, compaction, sun, main.
+fn pass_times(device: &wgpu::Device, queue: &wgpu::Queue, p: &Prepared) -> [f32; 5] {
+    p.dispatch(device, queue);
+    device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    let t: Vec<_> =
+        (0..7).map(|_| p.dispatch_timed(device, queue).expect("timestamps")).collect();
+    let at = |f: fn(&GpuTime) -> f32| {
+        let mut v: Vec<f32> = t.iter().map(f).collect();
+        median(&mut v)
+    };
+    [at(|g| g.beam), at(|g| g.primary), at(|g| g.compact), at(|g| g.sun), at(|g| g.main)]
+}
+
+/// **What the plan actually collects**: the three-pass lit path against the
+/// single-pass one, interleaved A/B/A in one invocation at both resolutions.
+///
+/// The ceiling is the 7.98-8.36 ms the shadow march costs at 1080p, measured by
+/// `what_the_sun_shadow_ray_costs`. Out of it come the store's own overhead
+/// (about +0.4 ms at 1080p, measured in Task 1 while nothing read it), the
+/// per-pixel record the primary pass writes and the composite reads, and the
+/// sun pass's dispatch over the whole table.
+///
+/// Three rows, so the sparse dispatch can be judged rather than assumed:
+///
+/// - the single-pass `march`, which is today;
+/// - the four passes;
+/// - the same four with the compaction gathering nothing, so the sun pass has an
+///   empty work list and marches no ray. The gap between that and the real one
+///   is the marching, separated from the rest of the restructure.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench collects --
+/// --ignored --nocapture`.
+#[test]
+#[ignore]
+fn what_the_split_sun_pass_collects() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    if !timestamps_supported(&device) {
+        eprintln!("adapter has no TIMESTAMP_QUERY, skipping");
+        return;
+    }
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let silent = with_the_sun_pass_silenced(&shader);
+
+    for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
+        let build = |source: &str, entry: &str| {
+            Prepared::new(
+                &device, source, entry, &tree, offset_from_clip, eye, w, h,
+                march_flags::DEFAULT, &[],
+            )
+        };
+        let single = build(&shader, "march");
+        let split = build(&shader, "march_composite");
+        let floor = build(&silent, "march_composite");
+
+        let (text, wall, gpu) = row_text(aba_both(&device, &queue, &single, &split));
+        println!("\n{w}x{h}  four passes against one:\n  {text}");
+        println!(
+            "  the split collects {:+.2} ms on the GPU clock ({:+.2} wall) of the 8.36 ms the \
+             shadow march is worth at 1080p",
+            -gpu, -wall,
+        );
+        let (text, _, floor_gpu) = row_text(aba_both(&device, &queue, &single, &floor));
+        println!("  the same four passes with the work list left empty:\n  {text}");
+        println!(
+            "  so the marching the sun pass does costs {:+.2} ms, and everything else about \
+             the split costs {floor_gpu:+.2}",
+            gpu - floor_gpu,
+        );
+
+        let one = pass_times(&device, &queue, &single);
+        let three = pass_times(&device, &queue, &split);
+        let empty = pass_times(&device, &queue, &floor);
+        println!(
+            "  per pass, GPU ms, median of 7:\n    \
+             one:  beam {:.2} + march {:.2} = {:.2}\n    \
+             four: beam {:.2} + primary {:.2} + compact {:.2} + sun {:.2} + composite {:.2} \
+             = {:.2}\n    \
+             with the work list left empty: compact {:.2} + sun {:.2}, over {} and {} \
+             workgroups",
+            one[0], one[4], one.iter().sum::<f32>(),
+            three[0], three[1], three[2], three[3], three[4], three.iter().sum::<f32>(),
+            empty[2], empty[3], split.compact_workgroups(), split.sun_workgroups(),
+        );
+
+        let store = {
+            let p = build(&shader, "march");
+            p.clear_sun_pixel_slots(&queue);
+            p.sun_store(&device, &queue)
+        };
+        println!(
+            "  the sun pass dispatches {} invocations for {} occupied slots: {:.2}% of them \
+             have a ray to march, and {} pixels share each answer",
+            bevox_render::pipeline::SUN_SLOTS,
+            store.occupied,
+            store.occupied as f64 / f64::from(bevox_render::pipeline::SUN_SLOTS) * 100.0,
+            store.pixels_with_slot / store.distinct_keys.max(1),
+        );
+    }
+}
+

@@ -49,3 +49,9 @@ tests — so the per-pixel body cost is two problems of equal size, not one. And
 the static march is 13.23 ms by itself, 79% of the frame before any body exists.
 Both numbers are in [the body cap](body-cap.md), and what to do about them is in
 [the drift ledger](../reference/dwyer-drift.md).
+
+**Since 2026-10-03 the static march is no longer 13.23 ms.** Computing sun
+visibility once per voxel face instead of once per pixel took it to about
+11.2 ms at 720p and 20.3 from 25.8 at 1080p — the numbers and what was left on
+the table are in [the sun pass was lane-bound](sun-pass-is-lane-bound.md). The
+body rows above are from before that change and have not been re-measured.

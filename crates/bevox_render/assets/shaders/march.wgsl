@@ -84,15 +84,20 @@ struct GpuBodyRect { min: vec2<u32>, max: vec2<u32> };
 // pass has to walk the table to empty it -- a clear would give back part of what
 // the store is for. Stamp 0 is "never used", which is what the zero-initialised
 // buffer starts as, so `sun_stamp` is never 0.
+// One claim word per slot, and one more word past them: the length of the work
+// list the sun pass marches. Cleared by the encoder, one word a frame, because a
+// counter cannot be stamped the way a slot can.
 @group(0) @binding(10) var<storage, read_write> sun_claims: array<atomic<u32>>;
-// The rest of the store, three regions behind one binding the way the fullness
+// The rest of the store, four regions behind one binding the way the fullness
 // grid rides behind the distance field: `slots` key pairs (lo, hi), then
-// `slots` visibility words, then one slot index per pixel.
+// `slots` visibility words, then one `SUN_PIXEL_WORDS` record per pixel, then
+// the work list -- `slots` room for the occupied slots, gathered dense.
 //
-// The visibility words are written by nobody in this revision and the slot
-// indices are read by nobody. This revision pays the store's whole cost and
-// collects none of its benefit, deliberately: that is the only way to measure
-// the overhead on its own.
+// The key pairs and the records are written by `march_primary`, the visibility
+// words by `sun_pass`, and all three are read by `march_composite`. Three
+// dispatches in that order, so each pass's writes are visible to the next --
+// and so the key read that the insert must never do is done where it is
+// ordered.
 @group(0) @binding(11) var<storage, read_write> sun_table: array<u32>;
 
 /// Slots an insert probes before it gives up.
@@ -114,6 +119,29 @@ const SUN_NO_SLOT: u32 = 0xFFFFFFFFu;
 /// a gate pins the two together.
 const SUN_STAMP_SHIFT: u32 = 24u;
 const SUN_TAG_MASK: u32 = 0xFFFFFFu;
+
+/// Words one pixel's record takes in the store's per-pixel region.
+///
+/// The primary pass marches the ray and leaves behind everything the composite
+/// needs, so the composite never marches a primary ray: the slot, the full
+/// 39-bit key, the material, the shading normal and the ambient occlusion.
+/// `pipeline::SUN_PIXEL_WORDS` is the other half of this and a gate pins them.
+///
+/// The normal is stored rather than recomputed because `implicit_normal` is six
+/// tree descents; the occlusion rides along beside it. The *origin* is not
+/// stored -- a static-world shadow ray starts at `vec3(voxel) + 0.5 +
+/// face_normal * 0.75`, which the key gives back exactly, so the fallback march
+/// costs no memory.
+const SUN_PIXEL_WORDS: u32 = 7u;
+/// Set in a record's packed word when the primary pass already wrote this
+/// pixel's colour and the composite must leave it alone: the sky, and body
+/// hits, which take the old per-pixel path.
+const SUN_DONE: u32 = 0x80000000u;
+/// The sky, as `march` draws it. `march` itself still carries the literal: it
+/// is the A side of every measurement in this plan and is left byte for byte
+/// where it was, so the bit-identity gate compares the split path against
+/// today's shader and not against an edited one.
+const SKY: vec3<f32> = vec3<f32>(0.35, 0.47, 0.70);
 
 const BRICK_EDGE: u32 = 4u;
 const CHILDREN: u32 = 64u;
@@ -1174,8 +1202,12 @@ fn sun_stamp() -> u32 { return view.ao_params.z; }
 fn sun_pixels() -> u32 { return view.ao_params.w; }
 /// Where the visibility bits start inside `sun_table`: past the key pairs.
 fn sun_vis_base() -> u32 { return sun_slots() * 2u; }
-/// Where the per-pixel slot indices start: past the keys and the bits.
+/// Where the per-pixel records start: past the keys and the bits.
 fn sun_pixel_base() -> u32 { return sun_slots() * 3u; }
+/// Where the sun pass's work list starts: past the records.
+fn sun_work_base() -> u32 { return sun_pixel_base() + sun_pixels() * SUN_PIXEL_WORDS; }
+/// The word holding how long that list is, past the last claim word.
+fn sun_work_count() -> u32 { return atomicLoad(&sun_claims[sun_slots()]); }
 
 /// Which of the six faces a hit's face normal names, 0..5 as axis * 2 + sign.
 ///
@@ -1280,10 +1312,19 @@ fn sun_insert(hit: Hit) -> u32 {
     if hit.from_body {
         return SUN_NO_SLOT;
     }
+    let lo = sun_key_lo(hit.voxel);
+    return sun_claim(lo, sun_key_hi(hit.voxel, sun_face(hit.face_normal)));
+}
+
+/// The claim loop itself, over a key already built.
+///
+/// Split out so `march_primary`, which has the key words in hand for the
+/// pixel's record, does not rebuild them. The loop below is the whole contract
+/// `sun_insert` documents, and the sun-store breaks in `tests/gpu_bench.rs`
+/// edit these lines by text.
+fn sun_claim(lo: u32, hi: u32) -> u32 {
     let mask = sun_slots() - 1u;
     let stamp = sun_stamp();
-    let lo = sun_key_lo(hit.voxel);
-    let hi = sun_key_hi(hit.voxel, sun_face(hit.face_normal));
     let want = (stamp << SUN_STAMP_SHIFT) | (sun_key_tag(lo, hi) & SUN_TAG_MASK);
     var slot = sun_hash(lo, hi) & mask;
     for (var probe = 0u; probe < SUN_PROBES; probe = probe + 1u) {
@@ -1318,8 +1359,222 @@ fn sun_remember(hit: Hit, id: vec3<u32>, size: vec2<u32>) {
     let slot = sun_insert(hit);
     let pixel = id.y * size.x + id.x;
     if pixel < sun_pixels() {
-        sun_table[sun_pixel_base() + pixel] = slot;
+        sun_table[sun_record_at(pixel)] = slot;
     }
+}
+
+/// Where a pixel's record starts inside `sun_table`.
+fn sun_record_at(pixel: u32) -> u32 {
+    return sun_pixel_base() + pixel * SUN_PIXEL_WORDS;
+}
+
+/// The voxel a key names. The inverse of `sun_key_lo`/`sun_key_hi`, exactly:
+/// 12 bits of x, 12 of y, 8 low bits of z in the low word and 4 high bits of z
+/// in the high one.
+fn sun_key_voxel(lo: u32, hi: u32) -> vec3<u32> {
+    return vec3<u32>(lo & 0xFFFu, (lo >> 12u) & 0xFFFu, (lo >> 24u) | ((hi & 0xFu) << 8u));
+}
+
+/// The face normal a key's face names: the inverse of `sun_face`.
+///
+/// Exact, which is what makes the composite's fallback march bit-identical to
+/// the per-pixel one. A static-world `face_normal` has exactly one component at
+/// +/-1 and zero elsewhere -- `entry_normal` returns one of six literals -- so a
+/// normal rebuilt from `axis * 2 + sign` is the same float vector the traversal
+/// returned, not an approximation of it.
+fn sun_face_normal(face: u32) -> vec3<f32> {
+    let axis = face >> 1u;
+    let s = select(-1.0, 1.0, (face & 1u) == 1u);
+    return vec3<f32>(
+        select(0.0, s, axis == 0u),
+        select(0.0, s, axis == 1u),
+        select(0.0, s, axis == 2u),
+    );
+}
+
+/// Where the shadow ray starts for a static-world key. `shadow_origin`'s world
+/// branch, from the key rather than from a `Hit`.
+fn sun_key_origin(lo: u32, hi: u32) -> vec3<f32> {
+    return vec3<f32>(sun_key_voxel(lo, hi)) + vec3<f32>(0.5)
+        + sun_face_normal((hi >> 4u) & 7u) * 0.75;
+}
+
+/// What the window shows for one shaded surface: palette colour, diffuse from
+/// the implicit normal, ambient darkened by occlusion.
+///
+/// One expression, used by `march_primary`'s body branch and by
+/// `march_composite`. `march` still carries its own copy, unedited, because it
+/// is the baseline every measurement in this plan is taken against; the
+/// bit-identity gate is what holds the two together.
+fn lit_colour(material: u32, n: vec3<f32>, occ: f32, blocked: bool) -> vec3<f32> {
+    var diffuse = max(dot(n, view.sun_direction.xyz), 0.0) * 0.75;
+    if blocked {
+        diffuse = 0.0;
+    }
+    // Ambient occlusion darkens the ambient light only: the sun's own is
+    // already answered by the shadow ray.
+    let ambient = 0.25 * (1.0 - occ);
+    return palette[material].rgb * (ambient + diffuse);
+}
+
+/// Marks this pixel finished: the primary pass wrote its colour and the
+/// composite must not touch it. Only the packed word is written, so the sky --
+/// about half the screen -- costs one word rather than seven.
+fn sun_mark_done(pixel: u32) {
+    sun_table[sun_record_at(pixel) + 2u] = SUN_DONE;
+}
+
+/// Pass 1 of 4: march to the hit, insert into the store, record what shading
+/// will need, and shade nothing the composite can shade.
+///
+/// The record is why the composite does not march a primary ray. Re-deriving
+/// the hit there would pay for the march twice and give back more than the
+/// shadow ray is worth.
+///
+/// Two kinds of pixel are finished here instead, and marked `SUN_DONE`:
+///
+/// - **The sky.** It has no face, so no key and no slot.
+/// - **A body hit**, which takes the old per-pixel path whole: its `voxel` is a
+///   coordinate in the body's own volume, so a key built from it would alias
+///   onto the static voxel at the same coordinates. It marches its own shadow
+///   ray here, from `shadow_origin`'s body branch, and nothing is inserted.
+///   Keeping that branch in this pass rather than in the composite is what
+///   leaves the composite with one fallback path instead of two.
+@compute @workgroup_size(8, 8, 1)
+fn march_primary(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(output);
+    if id.x >= size.x || id.y >= size.y { return; }
+    let pixel = id.y * size.x + id.x;
+
+    let hit = primary_hit(id, size);
+
+    if !hit.hit {
+        textureStore(output, vec2<i32>(id.xy), vec4<f32>(SKY, 1.0));
+        sun_mark_done(pixel);
+        return;
+    }
+
+    let n = shading_normal(hit);
+    let occ = occlusion(hit, id, size);
+
+    if hit.from_body {
+        let origin = shadow_origin(hit, id, size);
+        let blocked = shadowed(origin, view.sun_direction.xyz, max_ray_distance());
+        let colour = lit_colour(hit.material, n, occ, blocked);
+        textureStore(output, vec2<i32>(id.xy), vec4<f32>(colour, 1.0));
+        sun_mark_done(pixel);
+        return;
+    }
+
+    let lo = sun_key_lo(hit.voxel);
+    let hi = sun_key_hi(hit.voxel, sun_face(hit.face_normal));
+    let at = sun_record_at(pixel);
+    sun_table[at] = sun_claim(lo, hi);
+    sun_table[at + 1u] = lo;
+    // The key's high word is 7 bits, so the material and the done flag ride in
+    // the same word rather than taking one of their own.
+    sun_table[at + 2u] = hi | (hit.material << 8u);
+    sun_table[at + 3u] = bitcast<u32>(n.x);
+    sun_table[at + 4u] = bitcast<u32>(n.y);
+    sun_table[at + 5u] = bitcast<u32>(n.z);
+    sun_table[at + 6u] = bitcast<u32>(occ);
+}
+
+/// Pass 2 of 4: the occupied slots, gathered into a dense work list.
+///
+/// **This pass exists because the sparse dispatch was measured and was not
+/// affordable.** Marching one ray per slot over the whole table cost 15.01 ms
+/// at 1080p for 118,423 rays, against 8.14 ms for the 1,092,019 rays the
+/// per-pixel path marches -- 17x the cost a ray. The whole-table dispatch's own
+/// floor, every slot skipped, is 0.05 ms, so none of it was the empty
+/// invocations: at a 5.65% load factor a 64-lane workgroup holds about 3.6
+/// occupied slots, and a workgroup costs what its slowest lane costs. The waste
+/// was lanes, not instructions, and only packing the work fixes that.
+///
+/// The scan itself is the 0.05 ms already measured, plus one atomic increment
+/// per occupied slot.
+///
+/// A slot whose stamp is not this frame's is free. A slot carrying a stamp from
+/// exactly 255 frames ago is queued and marched for nothing -- one slot of two
+/// million -- and that is the safe direction: the alternative, appending from
+/// the insert on a winning compare-exchange, would skip such a slot and let the
+/// composite read a 255-frame-old bit.
+@compute @workgroup_size(64, 1, 1)
+fn sun_compact(@builtin(global_invocation_id) id: vec3<u32>) {
+    let slot = id.x;
+    if slot >= sun_slots() { return; }
+    if (atomicLoad(&sun_claims[slot]) >> SUN_STAMP_SHIFT) != sun_stamp() { return; }
+    sun_table[sun_work_base() + atomicAdd(&sun_claims[sun_slots()], 1u)] = slot;
+}
+
+/// Pass 3 of 4: one invocation per *occupied* slot, one shadow march, one bit.
+///
+/// Dispatched over as many invocations as there are pixels, which bounds the
+/// work list: a slot is occupied only because some pixel inserted it. Every
+/// invocation past the list's length does one load and leaves, and that tail was
+/// measured at 0.05 ms over the whole table.
+///
+/// A wrong answer is not reachable from here. The composite verifies the full
+/// 39-bit key before it believes a bit.
+@compute @workgroup_size(64, 1, 1)
+fn sun_pass(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= sun_work_count() { return; }
+    let slot = sun_table[sun_work_base() + id.x];
+
+    let lo = sun_table[slot * 2u];
+    let hi = sun_table[slot * 2u + 1u];
+    var bit = 0u;
+    if shadowed(sun_key_origin(lo, hi), view.sun_direction.xyz, max_ray_distance()) {
+        bit = 1u;
+    }
+    sun_table[sun_vis_base() + slot] = bit;
+}
+
+/// Pass 4 of 4: read this pixel's record, read its slot's bit, shade.
+///
+/// **The full 39-bit key is verified here, and a mismatch marches its own ray.**
+/// That is not belt and braces. `sun_claim` returns a slot on a matching claim
+/// word *without reading the key*, because reading the key is what the insert
+/// race was, so until something checks further, two faces are told apart only
+/// by the claim word's 24-bit tag. Two faces whose tags and slots both collide
+/// -- about one pair in sixteen million -- hold one slot between them and one
+/// key, and the same check covers a slot whose stamp came from exactly 255
+/// frames ago. This comparison is the only thing standing between that and a
+/// pixel reading another voxel's sun. `the_key_check_is_what_keeps_two_faces_apart`
+/// is the break.
+///
+/// The fallback is also the overflow path the spec requires: a pixel whose
+/// insert gave up carries `SUN_NO_SLOT` and marches exactly as every pixel does
+/// today.
+@compute @workgroup_size(8, 8, 1)
+fn march_composite(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(output);
+    if id.x >= size.x || id.y >= size.y { return; }
+
+    let at = sun_record_at(id.y * size.x + id.x);
+    let packed = sun_table[at + 2u];
+    if (packed & SUN_DONE) != 0u {
+        return;
+    }
+
+    let slot = sun_table[at];
+    let lo = sun_table[at + 1u];
+    let hi = packed & 0x7Fu;
+
+    var blocked = false;
+    if slot != SUN_NO_SLOT && sun_table[slot * 2u] == lo && sun_table[slot * 2u + 1u] == hi {
+        blocked = sun_table[sun_vis_base() + slot] != 0u;
+    } else {
+        blocked = shadowed(sun_key_origin(lo, hi), view.sun_direction.xyz, max_ray_distance());
+    }
+
+    let n = vec3<f32>(
+        bitcast<f32>(sun_table[at + 3u]),
+        bitcast<f32>(sun_table[at + 4u]),
+        bitcast<f32>(sun_table[at + 5u]),
+    );
+    let colour = lit_colour((packed >> 8u) & 0xFFu, n, bitcast<f32>(sun_table[at + 6u]), blocked);
+    textureStore(output, vec2<i32>(id.xy), vec4<f32>(colour, 1.0));
 }
 
 /// Shadow flag in red: 255 shadowed, 0 lit.

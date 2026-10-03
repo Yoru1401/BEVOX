@@ -236,15 +236,22 @@ pub struct Prepared {
     /// Present only when the beam flag is set, so the suite does not compile a
     /// prepass for the hundred dispatches that never run one.
     beam_pipeline: Option<wgpu::ComputePipeline>,
+    /// The three passes that run before `pipeline` when the entry point asked
+    /// for is `march_composite`: the primary march and insert, the compaction
+    /// of the occupied slots, then one shadow ray per slot in that list.
+    /// Present only for that entry point, so every other test compiles exactly
+    /// the one pipeline it names.
+    split: Option<[wgpu::ComputePipeline; 3]>,
     bind_group: wgpu::BindGroup,
     texture: wgpu::Texture,
     /// Kept so a test can apply an incremental update the way the app does.
     node_buffer: wgpu::Buffer,
     voxel_buffer: wgpu::Buffer,
     field_buffer: wgpu::Buffer,
-    /// Timestamps around each pass, when the device supports them. Four slots:
-    /// beam begin/end then main begin/end, so a beam-less configuration simply
-    /// leaves the first pair unwritten.
+    /// Timestamps around each pass, when the device supports them. Eight slots,
+    /// a begin/end pair per pass, assigned in the order the passes are encoded:
+    /// beam, primary, sun, main. A configuration without a pass leaves no hole,
+    /// because resolving a query that was never written is a validation error.
     timestamps: Option<Timestamps>,
     /// The body count the uniform carries, read back from the uniform itself.
     ///
@@ -273,7 +280,7 @@ struct Timestamps {
 
 /// Timestamp slots this configuration writes: two per pass that runs.
 fn used_slots(prepared: &Prepared) -> u32 {
-    if prepared.beam_pipeline.is_some() { 4 } else { 2 }
+    prepared.pass_count() * 2
 }
 
 /// GPU time for one dispatched frame, in milliseconds.
@@ -281,12 +288,21 @@ fn used_slots(prepared: &Prepared) -> u32 {
 pub struct GpuTime {
     /// The beam prepass, or 0.0 when the configuration has none.
     pub beam: f32,
+    /// The primary march-and-insert pass, or 0.0 for a single-pass
+    /// configuration.
+    pub primary: f32,
+    /// The pass that gathers the occupied slots into a work list.
+    pub compact: f32,
+    /// The pass that marches one shadow ray per entry of that list.
+    pub sun: f32,
+    /// The pass that writes the image: the whole march for a single-pass
+    /// configuration, the composite for a split one.
     pub main: f32,
 }
 
 impl GpuTime {
     pub fn total(&self) -> f32 {
-        self.beam + self.main
+        self.beam + self.primary + self.compact + self.sun + self.main
     }
 }
 
@@ -448,13 +464,18 @@ impl Prepared {
         // COPY_SRC, so a test can read the occupancy back.
         let sun_claims_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sun_claims"),
-            size: u64::from(bevox_render::pipeline::SUN_SLOTS) * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            size: u64::from(bevox_render::pipeline::sun_claim_words()) * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let sun_table_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sun_table"),
-            size: u64::from(bevox_render::pipeline::SUN_SLOTS * 3 + width * height) * 4,
+            size: u64::from(
+                bevox_render::pipeline::SUN_SLOTS * 4
+                    + width * height * bevox_render::pipeline::SUN_PIXEL_WORDS,
+            ) * 4,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -580,6 +601,22 @@ impl Prepared {
                 cache: None,
             })
         });
+        // The lit path split in three. Built here rather than by the caller so
+        // the thirty-odd call sites that name an entry point keep naming one:
+        // `march_composite` means "the three passes the app dispatches".
+        let split = (entry_point == "march_composite").then(|| {
+            let build = |entry: &str| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("march_split_pipeline"),
+                    layout: Some(&pipeline_layout),
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+            };
+            [build("march_primary"), build("sun_compact"), build("sun_pass")]
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &layout,
@@ -609,7 +646,10 @@ impl Prepared {
         });
 
         let timestamps = timestamps_supported(device).then(|| {
-            let slots = 4;
+            // Five passes at most -- beam, primary, compact, sun, main -- and
+            // a pair each. Over-allocating the set is free; resolving a slot
+            // nothing wrote is not, so `encode` packs them.
+            let slots = 10;
             Timestamps {
                 set: device.create_query_set(&wgpu::QuerySetDescriptor {
                     label: Some("march_timestamps"),
@@ -635,6 +675,7 @@ impl Prepared {
             workgroup,
             pipeline,
             beam_pipeline,
+            split,
             bind_group,
             texture,
             node_buffer,
@@ -654,27 +695,25 @@ impl Prepared {
     /// The prepass, when there is one, then the main pass. Separate passes, so
     /// the beam writes are visible to the reads that follow.
     fn encode(&self, encoder: &mut wgpu::CommandEncoder, timed: bool) {
-        let writes = |begin: u32, end: u32| {
+        // Slots are packed, not fixed: resolving a query that was never
+        // written is a validation error, so a configuration without a beam
+        // pass must not leave a hole at the start of the set. `next` hands them
+        // out in encode order, which is the order `dispatch_timed` reads them.
+        let mut next = 0u32;
+        let writes = |begin: u32| {
             self.timestamps.as_ref().filter(|_| timed).map(|t| wgpu::ComputePassTimestampWrites {
                 query_set: &t.set,
                 beginning_of_pass_write_index: Some(begin),
-                end_of_pass_write_index: Some(end),
+                end_of_pass_write_index: Some(begin + 1),
             })
         };
 
-        // Slots are packed, not fixed: resolving a query that was never
-        // written is a validation error, so a configuration without a beam
-        // pass must not leave a hole at the start of the set.
-        let (beam_slots, main_slots) = if self.beam_pipeline.is_some() {
-            ((0u32, 1u32), (2u32, 3u32))
-        } else {
-            ((0, 1), (0, 1))
-        };
-
         if let Some(beam) = &self.beam_pipeline {
+            let slot = next;
+            next += 2;
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("beam_pass"),
-                timestamp_writes: writes(beam_slots.0, beam_slots.1),
+                timestamp_writes: writes(slot),
             });
             pass.set_pipeline(beam);
             pass.set_bind_group(0, &self.bind_group, &[]);
@@ -684,9 +723,54 @@ impl Prepared {
                 1,
             );
         }
+        if let Some([primary, compact, sun]) = &self.split {
+            // The work list's length, cleared once a frame: a slot is stamped
+            // free, a counter is not.
+            encoder.clear_buffer(
+                &self.sun_claims_buffer,
+                bevox_render::pipeline::sun_work_count_offset(),
+                Some(4),
+            );
+            let slot = next;
+            next += 2;
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("march_primary_pass"),
+                    timestamp_writes: writes(slot),
+                });
+                pass.set_pipeline(primary);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.dispatch_workgroups(
+                    self.width.div_ceil(self.workgroup),
+                    self.height.div_ceil(self.workgroup),
+                    1,
+                );
+            }
+            let slot = next;
+            next += 2;
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("sun_compact_pass"),
+                    timestamp_writes: writes(slot),
+                });
+                pass.set_pipeline(compact);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.dispatch_workgroups(self.compact_workgroups(), 1, 1);
+            }
+            let slot = next;
+            next += 2;
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sun_pass"),
+                timestamp_writes: writes(slot),
+            });
+            pass.set_pipeline(sun);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(self.sun_workgroups(), 1, 1);
+        }
+        let slot = next;
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("march_pass"),
-            timestamp_writes: writes(main_slots.0, main_slots.1),
+            timestamp_writes: writes(slot),
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
@@ -694,10 +778,36 @@ impl Prepared {
         drop(pass);
 
         if timed && let Some(t) = &self.timestamps {
-            let used = if self.beam_pipeline.is_some() { 4 } else { 2 };
+            let used = used_slots(self);
             encoder.resolve_query_set(&t.set, 0..used, &t.resolve, 0);
             encoder.copy_buffer_to_buffer(&t.resolve, 0, &t.readback, 0, u64::from(used) * 8);
         }
+    }
+
+    /// Passes this configuration encodes, which is what sizes its timestamps.
+    fn pass_count(&self) -> u32 {
+        u32::from(self.beam_pipeline.is_some()) + u32::from(self.split.is_some()) * 3 + 1
+    }
+
+    /// Workgroups the compaction dispatches: one invocation per slot in the
+    /// table, sized from the table rather than the screen.
+    pub fn compact_workgroups(&self) -> u32 {
+        bevox_render::pipeline::SUN_SLOTS
+            .div_ceil(bevox_render::pipeline::SUN_PASS_WORKGROUP)
+    }
+
+    /// Workgroups the sun pass dispatches: one invocation per entry the work
+    /// list could hold, which is bounded by the pixels that could have
+    /// inserted.
+    pub fn sun_workgroups(&self) -> u32 {
+        (self.width * self.height)
+            .min(bevox_render::pipeline::SUN_SLOTS)
+            .div_ceil(bevox_render::pipeline::SUN_PASS_WORKGROUP)
+    }
+
+    /// Whether this configuration runs the three-pass lit path.
+    pub fn is_split(&self) -> bool {
+        self.split.is_some()
     }
 
     /// Dispatches once and reads back what the GPU says each pass took.
@@ -719,22 +829,26 @@ impl Prepared {
         t.readback.map_async(wgpu::MapMode::Read, ..u64::from(used_slots(self)) * 8, |_| {});
         device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
 
-        let used = if self.beam_pipeline.is_some() { 4usize } else { 2 };
+        let used = used_slots(self);
         let ticks: Vec<u64> = {
-            let view = t.readback.get_mapped_range(..u64::from(used as u32) * 8);
+            let view = t.readback.get_mapped_range(..u64::from(used) * 8);
             bytemuck::cast_slice::<u8, u64>(&view).to_vec()
         };
         t.readback.unmap();
 
-        // Ticks are a monotonic counter; a pass that never ran leaves its pair
-        // untouched, and saturating_sub keeps that at zero rather than wrapping
-        // into a nonsense duration.
+        // Ticks are a monotonic counter; a pass that never ran has no pair at
+        // all, so the slots are read in the order `encode` handed them out.
         let ms = |a: u64, b: u64| b.saturating_sub(a) as f32 * period / 1_000_000.0;
-        if self.beam_pipeline.is_some() {
-            Some(GpuTime { beam: ms(ticks[0], ticks[1]), main: ms(ticks[2], ticks[3]) })
-        } else {
-            Some(GpuTime { beam: 0.0, main: ms(ticks[0], ticks[1]) })
-        }
+        let mut at = 0usize;
+        let mut take = || {
+            let v = ms(ticks[at], ticks[at + 1]);
+            at += 2;
+            v
+        };
+        let beam = if self.beam_pipeline.is_some() { take() } else { 0.0 };
+        let (primary, compact, sun) =
+            if self.split.is_some() { (take(), take(), take()) } else { (0.0, 0.0, 0.0) };
+        Some(GpuTime { beam, primary, compact, sun, main: take() })
     }
 
     /// Submits one dispatch without waiting; the caller polls once per batch.
@@ -767,7 +881,8 @@ impl Prepared {
     /// `Prepared`.
     pub fn clear_sun_pixel_slots(&self, queue: &wgpu::Queue) {
         let base = u64::from(bevox_render::pipeline::SUN_SLOTS) * 3 * 4;
-        let bytes = vec![0xFFu8; (self.width * self.height) as usize * 4];
+        let words = self.width * self.height * bevox_render::pipeline::SUN_PIXEL_WORDS;
+        let bytes = vec![0xFFu8; words as usize * 4];
         queue.write_buffer(&self.sun_table_buffer, base, &bytes);
     }
 
@@ -779,12 +894,13 @@ impl Prepared {
 
         let claims = read_buffer_words(device, queue, &self.sun_claims_buffer, 0, slots);
         let keys = read_buffer_words(device, queue, &self.sun_table_buffer, 0, slots * 2);
+        let stride = bevox_render::pipeline::SUN_PIXEL_WORDS as usize;
         let pixels = read_buffer_words(
             device,
             queue,
             &self.sun_table_buffer,
             slots * 3,
-            self.width * self.height,
+            self.width * self.height * bevox_render::pipeline::SUN_PIXEL_WORDS,
         );
 
         let mut occupied = 0usize;
@@ -804,7 +920,9 @@ impl Prepared {
         SunStore {
             occupied,
             distinct_keys: seen.len(),
-            pixels_with_slot: pixels.iter().filter(|&&p| p != u32::MAX).count(),
+            // The slot is the record's first word, so a record's worth of
+            // stride separates one pixel's from the next.
+            pixels_with_slot: pixels.iter().step_by(stride).filter(|&&p| p != u32::MAX).count(),
         }
     }
 

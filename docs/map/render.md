@@ -53,15 +53,17 @@ be measured against each other in one session.
     4  march one ray per coarse pixel and record how far it got, capped at the
        distance where a voxel could slip between two beams
 
-  MAIN PASS, one dispatch at full resolution
+  PRIMARY PASS, one dispatch at full resolution
     5  seed the ray at the MINIMUM of the 3x3 beam neighbourhood around it
        -- a pixel sits anywhere inside its beam's cell, so the geometry it is
           about to meet may have been seen by the beam on either side
     6  skip empty space the distance field proves clear
     7  march the static world; then each body in turn, keeping the nearest hit
-    8  on a hit: the implicit normal, one shadow ray to the sun, and the
-       ambient term darkened by the fullness around the voxel
-    9  write the pixel
+    8  record the normal, the ambient term and a sun-store slot for this
+       (voxel, face). Sky and body hits are shaded here and marked done
+  COMPACT, then SUN, then COMPOSITE -- three more dispatches
+    9  gather the occupied slots dense, march ONE shadow ray each, then per
+       pixel verify the full 39-bit key and shade from the bit it wrote
 
   PRESENT
    10  a window-sized Sprite under a Camera2d draws the storage texture
@@ -135,7 +137,8 @@ bit-identical — or, for a feature, once its cost has been accepted knowingly.
 | `SUN_DIRECTION` | (0.4, 1, 0.25) | Where the sun is, shared by the renderer and the parity tests. |
 | `SUN_SLOTS` | 2 097 152 | Slots in the per-voxel sun store, a power of two so a probe masks. More than 1080p has pixels, and a measured 118 423 distinct voxel faces — one slot each — fill 5.7% of it. |
 | `SUN_STAMP_BITS` | 8 | Bits of a claim word the frame stamp takes; the other 24 are a tag cut from the key, so one compare-exchange settles both "free?" and "mine?" and an insert has no race to lose. `next_sun_stamp` cycles 1..255, never 0. |
-| `SUN_PIXEL_CAPACITY` | 8 294 400 | Pixels the store's per-pixel slot region holds, 3840x2160. Sized for a window rather than resized with one, as the beam buffer is; a pixel past it writes nothing. |
+| `SUN_PIXEL_CAPACITY` | 8 294 400 | Pixels the store's per-pixel record region holds, 3840x2160. Sized for a window rather than resized with one, as the beam buffer is; a window past it falls back to the single-pass `march`. |
+| `SUN_PIXEL_WORDS` / `SUN_PASS_WORKGROUP` | 7 / 64 | Words a pixel's record takes — slot, key, material, normal, occlusion — and invocations per workgroup in the two slot-indexed passes. Both are spelled in `march.wgsl` too and gated against it. |
 
 # Read next
 

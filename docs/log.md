@@ -1,6 +1,18 @@
 # Update Log
 
 ## 2026-10-03
+* **Measurement**: [the sun pass was lane-bound, not ray-bound](concepts/sun-pass-is-lane-bound.md).
+  The lit path is now four dispatches — primary, compact, sun, composite — and
+  **collects about 5.3 ms of the 8.36 ms ceiling at 1080p**, bit-identically, at
+  both resolutions and with bodies and without. The first form dispatched one
+  shadow ray per slot over the whole table and was **7.42 ms slower than doing
+  nothing**: 118,423 rays cost 15.01 ms where 1,092,019 per-pixel rays cost 8.14,
+  and the empty-slot floor is 0.05 ms, so **all of it was idle lanes** — a
+  64-lane workgroup of consecutive slots holds 3.6 occupied ones at a 5.65% load
+  factor, and 17x the cost a ray is 32/1.8. **A scan that packs the occupied
+  slots dense costs 0.12 ms and recovers 12.9.** The guard against a tag
+  collision has moved to the read side and is now an image break: 0 pixels
+  differ with the full-key check in place, 4,389 without it.
 * **Measurement**: [nine pixels a voxel face, and one slot each](concepts/sun-store-occupancy.md).
   The sun answer is recomputed **9.22 times a distinct voxel face at 1080p**, so
   the redundancy the per-voxel sun store is built to collect is there, and the
