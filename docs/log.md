@@ -1,5 +1,23 @@
 # Update Log
 
+## 2026-10-03
+* **Creation**: [the contree, and where the name comes from](reference/contree.md).
+  **Flori found it**: the term is on screen in devlog 22, and it is
+  `tetrahexaconta` — Greek for 64 — plus `tree`. The derivation matters more than
+  the etymology: **a contree is an octree with two layers squashed into one**, so
+  branching goes 8 to 8² and a node divides 4x4x4 instead of 2x2x2. Four per axis
+  is therefore not a parameter anyone chose — it is 2², and the 64-bit mask is 8².
+  The register argument this bundle has been giving as the *reason* for 64 is
+  really its *consequence*, and the right statement is that **two layers is the
+  largest squash that still fits a machine word**: three would be 512 children and
+  a 512-bit mask, and the structure loses the only trick it is built on.
+* **Creation**: the one outside measurement of the structure, from the same
+  source — squashing cuts encode time from 1700-1800 ms to **1048-1288**, about
+  1.4x, for **+0.196% in bits**. Worth keeping because it contradicts the obvious
+  intuition that a node covering 64 cells rather than 8 must waste bits on absent
+  children in sparse regions. Nothing here measures that and nothing here is
+  likely to.
+
 ## 2026-10-02
 * **Update**: a slow crush now breaks **stone** — the user-visible half of the
   two-regime change, and the thing a crush could not do when one constant had to

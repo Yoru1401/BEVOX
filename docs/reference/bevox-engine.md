@@ -54,8 +54,10 @@ falls believably, and merging so the debris stops costing anything.
 
 ## The tree
 
-A **sparse 64-tree**, called a contree. Every level divides by four on each axis,
-so a node has **64 children** and a leaf brick is 4×4×4 voxels. The root extent
+A **sparse 64-tree**, called a contree — *tetrahexaconta* plus *tree*, and
+structurally an octree with [two layers squashed into one](contree.md). Every
+level divides by four on each axis, so a node has **64 children** and a leaf brick
+is 4×4×4 voxels. The root extent
 goes to **4096³** — dense that would be 69 GB; sparse, a scene is tens of
 megabytes, because nothing walks empty space.
 

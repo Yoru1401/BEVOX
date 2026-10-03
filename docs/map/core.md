@@ -79,6 +79,25 @@ filter (AND it with `mask_table` and a zero means the ray cannot hit anything
 in this brick), and the uniform collapse that keeps construction, editing and
 traversal all sub-linear in voxel count.
 
+# Why sixty-four
+
+Four per axis is not a free parameter. **A contree is an octree with two layers
+squashed into one** — branching goes from 8 to 8², so a node divides space into
+4x4x4 instead of 2x2x2. The name is `tetrahexaconta` (Greek, 64) plus `tree`.
+
+That derivation is what picks the number, and the register argument above is its
+*consequence* rather than its reason:
+
+- **four per axis** is 2², the two merged levels;
+- **a 64-bit mask** is 8², their combined occupancy — and so exactly one machine
+  word, which is why a ray reads it once and then steps on bits;
+- **six levels to 4096** instead of twelve.
+
+**Two layers is the largest squash that still works.** Three would give 512
+children and a 512-bit mask, which no longer fits a register, and the structure
+loses the one trick it is built on. See
+[the contree, and where the name comes from](../reference/contree.md).
+
 # Two rules that are easy to break
 
 **Normals are never stored.** They are generated from neighbour occupancy at
