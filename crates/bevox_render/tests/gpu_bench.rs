@@ -1215,6 +1215,166 @@ fn what_the_adapter_allows() {
 /// Run with `cargo test --release -p bevox_render --test gpu_bench static_march
 /// -- --ignored --nocapture`.
 #[test]
+/// What the sun shadow ray costs, which bounds what a per-voxel sun store can win.
+///
+/// The shading path marches a second ray to the sun on every hit. The origin is
+/// snapped to the voxel centre, so **the answer is already per voxel** — a whole
+/// face is lit or shadowed together — while the work is per pixel. At 1080p a
+/// voxel covers many pixels and the same answer is recomputed for each of them.
+///
+/// This is a **cost probe, not a bit-identity test**: forcing the sun unshadowed
+/// changes pixels by construction. It measures the ceiling on any scheme that
+/// computes sun visibility once per voxel, and nothing more.
+#[test]
+#[ignore]
+fn what_the_sun_shadow_ray_costs() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    if !timestamps_supported(&device) {
+        eprintln!("adapter has no TIMESTAMP_QUERY, skipping");
+        return;
+    }
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    // The shading call site. Replacing the condition with `false` removes the
+    // march and leaves everything else — the hit, the normal, the ambient term —
+    // exactly as it was.
+    let needle = "if shadowed(origin, sun, max_ray_distance()) {";
+    assert_eq!(
+        shader.matches(needle).count(),
+        1,
+        "the shading call site moved; this probe edits it by text and must be updated with it",
+    );
+    let no_sun_march = shader.replace(needle, "if false {");
+
+    for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
+        let built: Vec<(&str, Prepared)> = vec![
+            ("with the shadow march", Prepared::new(
+                &device, &shader, "march", &tree, offset_from_clip, eye, w, h,
+                march_flags::DEFAULT, &[],
+            )),
+            ("without it", Prepared::new(
+                &device, &no_sun_march, "march", &tree, offset_from_clip, eye, w, h,
+                march_flags::DEFAULT, &[],
+            )),
+        ];
+        let gpu_ms = |p: &Prepared| {
+            p.dispatch(&device, &queue);
+            device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+            let mut t: Vec<f32> = (0..7)
+                .map(|_| p.dispatch_timed(&device, &queue).expect("timestamps").total())
+                .collect();
+            median(&mut t)
+        };
+        let mut rounds: Vec<Vec<f32>> = vec![Vec::new(); built.len()];
+        for _ in 0..3 {
+            for (i, (_, p)) in built.iter().enumerate() {
+                rounds[i].push(gpu_ms(p));
+            }
+        }
+        let with = median(&mut rounds[0]);
+        let without = median(&mut rounds[1]);
+        let spread = |v: &Vec<f32>| {
+            v.iter().fold(0.0f32, |a, &b| a.max(b)) - v.iter().fold(f32::MAX, |a, &b| a.min(b))
+        };
+        println!(
+            "\n{w}x{h}, GPU ms, median of 3 rounds x 7, interleaved:\n  \
+             {:<22} {with:.2} (spread {:.2})\n  {:<22} {without:.2} (spread {:.2})\n  \
+             the sun shadow march is {:.2} ms, {:.1}% of the frame",
+            built[0].0, spread(&rounds[0]), built[1].0, spread(&rounds[1]),
+            with - without,
+            (with - without) / with * 100.0,
+        );
+    }
+}
+
+/// What the static march costs at the resolution the target is written in.
+///
+/// The frame budget is quoted at 1280x720 because that is where every earlier
+/// number was taken. The target is **60 fps at 1920x1080**, which is 2.25x the
+/// rays — and whether the cost actually scales with rays is a measurement, not
+/// an assumption. The beam prepass runs at 1/8 per axis and the distance-field
+/// skip happens before a ray enters the tree, so there is no reason in advance
+/// to expect exactly 2.25x in either direction.
+///
+/// Both resolutions are timed in one invocation, interleaved, so the ratio
+/// cannot be an artefact of two runs.
+#[test]
+#[ignore]
+fn the_march_is_measured_at_both_resolutions() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    if !timestamps_supported(&device) {
+        eprintln!("adapter has no TIMESTAMP_QUERY, skipping");
+        return;
+    }
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    let sizes = [(1280u32, 720u32), (1920, 1080)];
+    let built: Vec<((u32, u32), Prepared)> = sizes
+        .iter()
+        .map(|&(w, h)| {
+            let p = Prepared::new(
+                &device, &shader, "march", &tree, offset_from_clip, eye, w, h,
+                march_flags::DEFAULT, &[],
+            );
+            ((w, h), p)
+        })
+        .collect();
+
+    let gpu_ms = |p: &Prepared| {
+        p.dispatch(&device, &queue);
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let mut t: Vec<f32> =
+            (0..7).map(|_| p.dispatch_timed(&device, &queue).expect("timestamps").total()).collect();
+        median(&mut t)
+    };
+    let mut rounds: Vec<Vec<f32>> = vec![Vec::new(); built.len()];
+    for _ in 0..3 {
+        for (i, (_, p)) in built.iter().enumerate() {
+            rounds[i].push(gpu_ms(p));
+        }
+    }
+
+    println!("\nstatic march at DEFAULT, GPU ms, median of 3 rounds x 7, interleaved:");
+    let mut base_ms = 0.0f32;
+    let mut base_px = 0.0f64;
+    for (((w, h), _), samples) in built.iter().zip(&mut rounds) {
+        let spread = samples.iter().fold(0.0f32, |a, &b| a.max(b))
+            - samples.iter().fold(f32::MAX, |a, &b| a.min(b));
+        let ms = median(samples);
+        let px = f64::from(*w) * f64::from(*h);
+        if base_ms == 0.0 {
+            base_ms = ms;
+            base_px = px;
+            println!("  {w}x{h}: {ms:.2} ms (spread {spread:.2})  -- baseline");
+        } else {
+            println!(
+                "  {w}x{h}: {ms:.2} ms (spread {spread:.2})  {:.2}x the time for {:.2}x the rays \
+                 -- {:.2} ms per megaray, against {:.2}",
+                ms / base_ms,
+                px / base_px,
+                f64::from(ms) / (px / 1e6),
+                f64::from(base_ms) / (base_px / 1e6),
+            );
+            println!(
+                "\n  60 fps at {w}x{h} needs 16.7 ms. This is {:.2} ms, so the speedup wanted \
+                 is {:.2}x.",
+                ms,
+                ms / 16.7,
+            );
+        }
+    }
+}
+
 #[ignore]
 fn the_static_march_is_measured() {
     let Some((device, queue)) = gpu_device() else {

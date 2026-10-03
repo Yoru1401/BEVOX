@@ -1,6 +1,21 @@
 # Update Log
 
 ## 2026-10-03
+* **Measurement**: **the sun shadow march is a third of the frame** — 7.98 and
+  8.36 ms of 26 at 1920x1080 (31%), 4.67 and 4.82 of 13.5 at 720p (33%), two runs
+  each, interleaved. And the static march scales **sublinearly**: 1.90-1.94x the
+  time for 2.25x the rays, so a ray is about 14% cheaper at 1080p than at 720p and
+  every figure in this bundle, all quoted at 720p, slightly overstates the per-ray
+  cost at the resolution the target is written in.
+* **Creation**: [sun visibility per voxel, not per pixel](superpowers/specs/2026-10-03-bevox-per-voxel-sun-design.md),
+  the spec for drift item F3. `shadow_origin` returns `voxel_centre(hit) +
+  face_normal * 0.75`, so **the shadow ray is a pure function of (voxel, face)**
+  and every pixel covering the same face marches an identical ray to an identical
+  answer. The engine already decided sun visibility is per-voxel — the comment on
+  `shadow_origin` says a whole face is lit or shadowed together — and then
+  collects it per pixel. **That makes the change bit-identical by construction**,
+  which is the strongest property an optimisation here can have.
+
 * **Creation**: [the contree, and where the name comes from](reference/contree.md).
   **Flori found it**: the term is on screen in devlog 22, and it is
   `tetrahexaconta` — Greek for 64 — plus `tree`. The derivation matters more than
