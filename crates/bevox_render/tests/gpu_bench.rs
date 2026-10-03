@@ -1189,32 +1189,6 @@ fn what_the_adapter_allows() {
         have.max_storage_buffer_binding_size as u64 / (1024 * 1024));
 }
 
-/// What the static march costs, and why — workgroup size, and how many steps a
-/// ray actually takes.
-///
-/// The static world is **13.23 ms of a 16.7 ms frame** before a body exists,
-/// against Dwyer's **7 ms for a Teardown castle on a 1660 Ti** with a primary
-/// and a shadow ray (his devlog 17). A 1650 is roughly a third down on a
-/// 1660 Ti, so the hardware explains part of a 2x gap and not all of it. This
-/// asks two questions the flag benchmarks cannot:
-///
-/// 1. **Is the marcher step-bound or bandwidth-bound?** The mean steps per ray
-///    divides the frame into "how many steps" and "what a step costs". If the
-///    mean is low and the frame is still slow, more traversal cleverness is the
-///    wrong lever.
-/// 2. **Does workgroup size matter?** `WORKGROUP` has been 8 since the shader
-///    was written, never measured. For a memory-bound kernel it sets occupancy
-///    and how neighbouring rays' reads coalesce. 16x16 is 256 invocations,
-///    exactly the WebGPU baseline's ceiling, which is one reason it was never
-///    tried; `device_limits` now asks for 1024 so 32x32 is reachable too.
-///
-/// The shader is read from disk, so the workgroup size is rewritten in the
-/// source and every variant is compiled and timed in this one invocation —
-/// cross-run drift here is routinely larger than the effect.
-///
-/// Run with `cargo test --release -p bevox_render --test gpu_bench static_march
-/// -- --ignored --nocapture`.
-#[test]
 /// What the sun shadow ray costs, which bounds what a per-voxel sun store can win.
 ///
 /// The shading path marches a second ray to the sun on every hit. The origin is
@@ -1375,6 +1349,31 @@ fn the_march_is_measured_at_both_resolutions() {
     }
 }
 
+/// What the static march costs, and why — workgroup size, and how many steps a
+/// ray actually takes.
+///
+/// The static world is **13.23 ms of a 16.7 ms frame** before a body exists,
+/// against Dwyer's **7 ms for a Teardown castle on a 1660 Ti** with a primary
+/// and a shadow ray (his devlog 17). A 1650 is roughly a third down on a
+/// 1660 Ti, so the hardware explains part of a 2x gap and not all of it. This
+/// asks two questions the flag benchmarks cannot:
+///
+/// 1. **Is the marcher step-bound or bandwidth-bound?** The mean steps per ray
+///    divides the frame into "how many steps" and "what a step costs". If the
+///    mean is low and the frame is still slow, more traversal cleverness is the
+///    wrong lever.
+/// 2. **Does workgroup size matter?** `WORKGROUP` has been 8 since the shader
+///    was written, never measured. For a memory-bound kernel it sets occupancy
+///    and how neighbouring rays' reads coalesce. 16x16 is 256 invocations,
+///    exactly the WebGPU baseline's ceiling, which is one reason it was never
+///    tried; `device_limits` now asks for 1024 so 32x32 is reachable too.
+///
+/// The shader is read from disk, so the workgroup size is rewritten in the
+/// source and every variant is compiled and timed in this one invocation —
+/// cross-run drift here is routinely larger than the effect.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench static_march
+/// -- --ignored --nocapture`.
 #[test]
 #[ignore]
 fn the_static_march_is_measured() {
