@@ -1,7 +1,7 @@
 ---
 type: Measurement
 title: 'The sun pass was lane-bound, not ray-bound'
-description: 'Marching one shadow ray per slot over a 5.65%-occupied table cost 15.01 ms for 118,423 rays against 8.14 ms for 1,092,019; the waste was idle lanes, and compacting the slots into a dense work list took it to 2.15 ms and collected 5.0 of the 8.36 ms ceiling. The 2.4x a ray left over was ray incoherence, and a surface-coherent hash halved it for free.'
+description: 'Marching one shadow ray per slot over a 5.65%-occupied table cost 15.01 ms for 118,423 rays against 8.14 ms for 1,092,019; the waste was idle lanes, and compacting the slots into a dense work list took it to 2.15 ms and collected 5.0 of the 8.36 ms ceiling. The 2.4x a ray left over was ray incoherence, and a surface-coherent hash halved it for free. The pass must be dispatched over the whole table, because an 8-bit stamp lets the work list exceed the pixel count.'
 tags: [performance, gpu, lighting, dispatch]
 generated: { by: claude-opus-5/claude-code, at: 2026-10-03T00:00:00Z }
 sources:
@@ -149,6 +149,48 @@ that cannot change a pixel has moved this shader by tenths of a millisecond, and
 the end-to-end number above is measured across the two source files for exactly
 that reason.
 
+# The sun pass is dispatched over the table, because nothing else bounds it
+
+**`dispatch_march` dispatched the sun pass over the pixel count, and the work
+list is not bounded by the pixel count.** `sun_compact` scans all `SUN_SLOTS`
+and queues every slot whose stamp is this frame's. With an 8-bit stamp cycling
+1..255 that set is the slots claimed this frame **plus** the slots claimed
+exactly 255 frames ago and not re-claimed since -- up to twice a frame's
+inserts. The doc comment claimed the pixel bound held "because a slot is
+occupied only because some pixel inserted it", which is true within a frame and
+says nothing across frames.
+
+**It was a wrong pixel, not wasted work.** `atomicAdd` hands out work-list
+indices in no particular order, so a slot claimed *this* frame with a *correct*
+key can land in the tail a short dispatch never marches. Its visibility word
+still holds an earlier frame's bit, the composite finds a valid slot, the full
+39-bit key check passes, and it shades from the stale bit. **The visibility word
+was the only part of the store that was neither stamped nor key-verified**, so
+no existing guard could see it.
+
+Both slot passes now dispatch `SUN_SLOTS`, which makes
+`work_count <= stamp-matching slots <= slots` structural. What the whole table
+costs, A/B/A in one invocation against the pixel-bounded dispatch, three
+invocations, sun pass alone on the GPU clock:
+
+| extra invocations | 1280x720 | 1920x1080 |
+|---|---|---|
+| workgroups | 18,368 of 32,768 | 368 of 32,768 |
+| **sun pass** | **+0.034, +0.038, +0.027 ms** | **+0.009, +0.010, +0.007 ms** |
+
+**About +0.03 ms at 720p and +0.01 at 1080p**, which is the 0.05 ms empty-slot
+floor pro-rated and is what `sun_compact` has always paid. End to end the same
+A/B/A read -0.13 to +0.28 ms with drift of the same size: not measurable, which
+is the honest statement for an effect this small.
+`what_the_whole_table_sun_dispatch_costs` is the bench.
+
+**The visibility word now carries the stamp above the bit**, and the composite
+requires it to match. That is two lines and no extra read -- the word was already
+loaded -- and it converts *any* unmarched slot, this path or a future one, into
+the existing fallback march rather than a wrong pixel. It cost nothing
+measurable on the shipped path: +0.13, -0.19, -0.10 ms across three
+configurations with drift 0.12-0.21, swinging both ways.
+
 # The read side is where the key guard lives now
 
 `sun_claim` returns a slot on a matching claim word without reading the key,
@@ -165,7 +207,34 @@ The check must sit in a later pass than the insert: done in the primary it would
 read the key at the instruction step another lane writes it, which is the race
 again, and every loser would fall back to marching.
 
-`the_sun_pass_is_what_the_image_depends_on` is the other half — a sun pass
-writing a constant moves 380,435 pixels, one switched off moves 16,264, and the
-two differ from each other, which is what rules out a composite that quietly
-marched its own ray all along.
+`the_sun_pass_is_what_the_image_depends_on` is the other half, and the stamp
+changed what its three cases mean. A sun pass writing a constant 1 moves
+**380,435** pixels and one writing a constant 0 moves **16,264** -- both are
+stamped, so the composite believes both, and the two differ from each other by
+396,699, which is what rules out a composite that quietly marched its own ray
+all along. **A sun pass switched off now moves 0**, where before the stamp it
+moved the same 16,264 by reading an unwritten word as *lit*. That 0 is the gate
+on the belt-and-braces: every slot the pass did not answer must reach the
+fallback march.
+
+It also cost that bench row its floor. `what_the_split_sun_pass_collects` used
+an emptied work list to isolate the marching, and an emptied work list now moves
+the shadow march into the composite instead of removing it -- the row would have
+read as the restructure's cost while paying for the march twice. The floor is a
+sun pass writing a constant bit instead, which keeps the dispatch and the
+stamped write and drops only the ray.
+
+# Nothing ever ran the split path twice
+
+Every image gate called `read_back`: one dispatch, on a freshly zeroed store,
+with `SUN_STAMP` a fixed constant -- so **no test anywhere changed the stamp on
+the GPU**, and the app's frame 2 was a state no test had rendered. Every claim
+word already stamped, every slot to be won again, every visibility word holding
+the last frame's answer: that whole class was ungated.
+
+`the_split_pass_changes_no_pixel` now dispatches the split path **twice under
+two different stamps** and compares both images against the single-pass
+reference. The harness advances the stamp on every submit, exactly as the app
+advances it per frame, so the second dispatch meets a store the first one filled.
+**0 differing pixels in both frames, at both cameras, both resolutions, with
+bodies and without** -- sixteen image comparisons where there were eight.

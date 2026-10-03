@@ -55,8 +55,9 @@ pub const STORAGE_BUFFERS_DECLARED: u32 = 10;
 /// and shrinking this to fit the measured number is a later task's job, not a
 /// guess made now.
 ///
-/// 8 MB of claim words and 25 MB of keys and visibility bits, with the
-/// per-pixel region past them taking the one binding to 58 MB in all.
+/// 8 MB of claim words in `sun_claims`. `sun_table` holds 25 MB of keys and
+/// visibility bits, 222 MB of per-pixel records at `SUN_PIXEL_CAPACITY`, and
+/// 8 MB of work list: `sun_table_words()` is 66,449,408 words, **266 MB**.
 pub const SUN_SLOTS: u32 = 1 << 21;
 
 /// Pixels the store's per-pixel record region holds.
@@ -842,12 +843,16 @@ pub fn dispatch_march(
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(invocations.div_ceil(SUN_PASS_WORKGROUP), 1, 1);
             };
-            // The compaction scans the whole table; the sun pass walks the list
-            // it built, which cannot be longer than the pixels that inserted
-            // into it, so the dispatch is bounded by the smaller of the two.
+            // Both slot passes are dispatched over the whole table, and the
+            // sun pass must be: the compaction queues every slot whose stamp
+            // is this frame's, which with an 8-bit stamp includes slots claimed
+            // exactly 255 frames ago, so the work list is bounded by the slot
+            // count and not by the pixel count. A shorter dispatch would leave
+            // its tail unmarched, and `march.wgsl`'s `sun_pass` says what that
+            // costs. The whole-table tail is 0.05 ms, which the compaction
+            // already pays.
             slot_pass(&mut encoder, "bevox_sun_compact_pass", compact, SUN_SLOTS);
-            let pixels = target.width * target.height;
-            slot_pass(&mut encoder, "bevox_sun_pass", sun, pixels.min(SUN_SLOTS));
+            slot_pass(&mut encoder, "bevox_sun_pass", sun, SUN_SLOTS);
             pixel_pass(&mut encoder, "bevox_march_composite_pass", composite);
         }
         None => pixel_pass(&mut encoder, "bevox_march_pass", compute),

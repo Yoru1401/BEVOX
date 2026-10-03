@@ -1591,13 +1591,21 @@ fn sun_compact(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// Pass 3 of 4: one invocation per *occupied* slot, one shadow march, one bit.
 ///
-/// Dispatched over as many invocations as there are pixels, which bounds the
-/// work list: a slot is occupied only because some pixel inserted it. Every
-/// invocation past the list's length does one load and leaves, and that tail was
-/// measured at 0.05 ms over the whole table.
+/// **Dispatched over `sun_slots()`, the same count the compaction scans, because
+/// that is the only bound the work list structurally obeys.** A pixel bound does
+/// not: `sun_compact` queues every slot whose stamp is this frame's, and with an
+/// 8-bit stamp that set is the slots claimed this frame *plus* the slots claimed
+/// exactly 255 frames ago and not re-claimed since -- up to twice a frame's
+/// inserts. Dispatching over the pixels would leave the tail of the list
+/// unmarched, and `atomicAdd` hands out indices in no particular order, so the
+/// tail can hold a slot this frame claimed with a correct key whose visibility
+/// word still carries an older frame's bit. Every invocation past the list's
+/// length does one load and leaves, and the whole-table tail is 0.05 ms over
+/// 32,768 workgroups -- a cost `sun_compact` already pays.
 ///
 /// A wrong answer is not reachable from here. The composite verifies the full
-/// 39-bit key before it believes a bit.
+/// 39-bit key, and the stamp this pass writes above the bit, before it believes
+/// either.
 @compute @workgroup_size(64, 1, 1)
 fn sun_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= sun_work_count() { return; }
@@ -1609,12 +1617,17 @@ fn sun_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     if shadowed(sun_key_origin(lo, hi), view.sun_direction.xyz, max_ray_distance()) {
         bit = 1u;
     }
-    sun_table[sun_vis_base() + slot] = bit;
+    // The stamp rides above the bit so that a slot this pass never reached
+    // cannot be mistaken for one it answered. Nothing else in the store leaves
+    // the visibility word verifiable: the claim word is stamped and the key is
+    // compared, but the bit by itself is indistinguishable from last cycle's.
+    sun_table[sun_vis_base() + slot] = (sun_stamp() << 1u) | bit;
 }
 
 /// Pass 4 of 4: read this pixel's record, read its slot's bit, shade.
 ///
-/// **The full 39-bit key is verified here, and a mismatch marches its own ray.**
+/// **The full 39-bit key and the visibility word's stamp are both verified
+/// here, and either mismatching marches this pixel's own ray.**
 /// That is not belt and braces. `sun_claim` returns a slot on a matching claim
 /// word *without reading the key*, because reading the key is what the insert
 /// race was, so until something checks further, two faces are told apart only
@@ -1624,6 +1637,16 @@ fn sun_pass(@builtin(global_invocation_id) id: vec3<u32>) {
 /// frames ago. This comparison is the only thing standing between that and a
 /// pixel reading another voxel's sun. `the_key_check_is_what_keeps_two_faces_apart`
 /// is the break.
+///
+/// **The stamp check is the belt to that braces, and it covers a different
+/// class**: the key tells two faces apart, but it says nothing about whether
+/// `sun_pass` ever answered *this* slot. A slot the pass did not reach -- a work
+/// list longer than its dispatch, or any future path that leaves one unmarched
+/// -- carries a correct key beside a visibility bit from an earlier frame, and
+/// no other guard in the store can see that. Requiring the bit to be stamped
+/// turns every such slot into the fallback march below instead of a wrong pixel.
+/// `the_sun_pass_is_what_the_image_depends_on` gates it by switching the pass
+/// off, which must now move no pixel at all.
 ///
 /// The fallback is also the overflow path the spec requires: a pixel whose
 /// insert gave up carries `SUN_NO_SLOT` and marches exactly as every pixel does
@@ -1644,9 +1667,17 @@ fn march_composite(@builtin(global_invocation_id) id: vec3<u32>) {
     let hi = packed & 0x7Fu;
 
     var blocked = false;
+    var answered = false;
     if slot != SUN_NO_SLOT && sun_table[slot * 2u] == lo && sun_table[slot * 2u + 1u] == hi {
-        blocked = sun_table[sun_vis_base() + slot] != 0u;
-    } else {
+        let vis = sun_table[sun_vis_base() + slot];
+        // The stamp `sun_pass` wrote above the bit, which is what makes an
+        // unanswered slot tell itself apart from a stale answer.
+        if (vis >> 1u) == sun_stamp() {
+            blocked = (vis & 1u) != 0u;
+            answered = true;
+        }
+    }
+    if !answered {
         blocked = shadowed(sun_key_origin(lo, hi), view.sun_direction.xyz, max_ray_distance());
     }
 
@@ -1845,8 +1876,13 @@ fn march_identity(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(output, vec2<i32>(id.xy), colour);
 }
 
-/// What the window shows: palette colour, diffuse from the implicit normal, and
-/// a shadow ray toward the sun.
+/// The whole lit frame in one pass: palette colour, diffuse from the implicit
+/// normal, and a shadow ray toward the sun.
+///
+/// **Shipped, not legacy.** `dispatch_march` takes this path for every debug
+/// view, for a window past `SUN_PIXEL_CAPACITY`, and for the frames before the
+/// four split pipelines finish compiling. It is also the A side of every image
+/// gate and every bench row, so it is left byte for byte as it was.
 @compute @workgroup_size(8, 8, 1)
 fn march(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = textureDimensions(output);
@@ -1859,10 +1895,14 @@ fn march(@builtin(global_invocation_id) id: vec3<u32>) {
         let n = shading_normal(hit);
         let sun = view.sun_direction.xyz;
 
-        // The store, written here and read by nothing. Shading still marches
-        // its own shadow ray, below, exactly as before: this revision is a
-        // deliberate regression that isolates the store's own overhead, which
-        // is the one number that cannot be measured once anything reads it.
+        // The store, written here and read by nothing: this pass shades from
+        // its own shadow ray below. It stays because removing code from this
+        // shader has cost +0.58 ms before -- see
+        // `docs/concepts/gpu-codegen-cliff.md` -- so deleting the call needs
+        // its own A/B/A, and until then every bench row and image gate that
+        // uses `march` as its A side would be comparing against a shader this
+        // one no longer is. It is also what `what_the_sun_store_costs`
+        // measures: the store's overhead with nothing reading it.
         sun_remember(hit, id, size);
 
         let origin = shadow_origin(hit, id, size);

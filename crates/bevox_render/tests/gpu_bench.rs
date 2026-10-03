@@ -1858,6 +1858,10 @@ fn the_store_changes_no_pixel() {
 /// **Near 1 means there is nothing to collect** and the plan should stop here,
 /// because a cache with no hits is all cost.
 ///
+/// This reports and does not gate, beyond asserting something was inserted.
+/// `nearly_every_hit_pixel_gets_a_slot` is the gate on the figure that caught
+/// both of this work's silent defects, and it is not ignored.
+///
 /// Run with `cargo test --release -p bevox_render --test gpu_bench sun_store --
 /// --ignored --nocapture`.
 #[test]
@@ -1910,6 +1914,187 @@ fn the_sun_store_occupancy_is_reported() {
             );
         }
     }
+}
+
+/// **What dispatching the sun pass over the whole table costs**, against the
+/// pixel-bounded dispatch it replaced.
+///
+/// The pixel bound was wrong, not merely tight. `sun_compact` queues every slot
+/// whose stamp is this frame's, and an 8-bit stamp makes that set the slots
+/// claimed this frame *plus* those claimed exactly 255 frames ago -- up to twice
+/// a frame's inserts -- so the work list is bounded by the table and not by the
+/// screen. The tail a short dispatch drops carries correct keys beside older
+/// frames' visibility bits. This bench is what it cost to make the bound
+/// structural.
+///
+/// Both rows are one compiled module, one `Prepared` each, differing only in the
+/// dispatch size, interleaved A/B/A in one invocation. The extra invocations are
+/// 18,368 workgroups at 720p and 368 at 1080p, so the 720p row is the one with
+/// anything to see.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench whole_table --
+/// --ignored --nocapture`.
+#[test]
+#[ignore]
+fn what_the_whole_table_sun_dispatch_costs() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    if !timestamps_supported(&device) {
+        eprintln!("adapter has no TIMESTAMP_QUERY, skipping");
+        return;
+    }
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let slots = bevox_render::pipeline::SUN_SLOTS;
+
+    for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
+        let build = || {
+            Prepared::new(
+                &device, &shader, "march_composite", &tree, offset_from_clip, eye, w, h,
+                march_flags::DEFAULT, &[],
+            )
+        };
+        let whole = build();
+        let bounded = build();
+        bounded.force_sun_dispatch((w * h).min(slots));
+
+        let (text, wall, gpu) = row_text(aba_both(&device, &queue, &bounded, &whole));
+        let sun_bounded = pass_times(&device, &queue, &bounded)[3];
+        let sun_whole = pass_times(&device, &queue, &whole)[3];
+        println!(
+            "\n{w}x{h}: the sun pass over {} invocations against {}\n  {text}\n  \
+             whole-table dispatch costs {gpu:+.3} ms on the GPU clock ({wall:+.3} wall)\n  \
+             the sun pass alone: {sun_whole:.3} ms against {sun_bounded:.3}, so \
+             {:+.3} ms over {} extra workgroups",
+            whole.sun_workgroups() * bevox_render::pipeline::SUN_PASS_WORKGROUP,
+            bounded.sun_workgroups() * bevox_render::pipeline::SUN_PASS_WORKGROUP,
+            sun_whole - sun_bounded,
+            whole.sun_workgroups() - bounded.sun_workgroups(),
+        );
+    }
+}
+
+/// The hash break: the face's local index taken from two *fixed* axes instead of
+/// the two tangent to the face, which is how the first brick index was wrong.
+const SUN_LOCAL_INDEX: &str = "    let local = (u << SUN_BRICK_BITS) | v;";
+
+/// The source with the local index wasting the axis a surface is flat in.
+///
+/// A floor varies in x and z and is constant in y, so `(x, y)` gives every face
+/// of one floor patch the same low 3 bits and only 8 of its run's 64 slots are
+/// ever reachable. That is the 3D brick index's failure in one line, and it is
+/// what `nearly_every_hit_pixel_gets_a_slot` exists to catch.
+fn with_the_flat_axis_wasted(shader: &str) -> String {
+    assert_eq!(
+        shader.matches(SUN_LOCAL_INDEX).count(),
+        1,
+        "the hash's local index moved; this break edits it by text",
+    );
+    shader.replace(SUN_LOCAL_INDEX, "    let local = (x << SUN_BRICK_BITS) | y;")
+}
+
+/// **Nearly every pixel that hits the static world must come away with a slot**,
+/// at the shipped slot count, on the bench camera.
+///
+/// This is the metric that caught the two silent defects this work has had, and
+/// until now it was asserted nowhere -- every use of it was a `println!` and the
+/// one test that reported it was `#[ignore]`d behind `distinct_keys > 0`. Both
+/// defects left the image perfectly correct, because a pixel with no slot
+/// marches its own ray, and both deleted most of the saving:
+///
+/// - a 3D brick index wasted the axis a surface is flat in, so **51% of hit
+///   pixels on the distant camera got no slot**;
+/// - linear probing could not escape a clustered run in eight tries, which cost
+///   17% on the near camera and 54% on the distant one.
+///
+/// 0.95 rather than 1.0 because eight probes at a 0.06 load factor is a
+/// statistical thing, not a guaranteed one, and
+/// `shrinking_the_table_until_it_overflows_is_measured` puts the first failed
+/// insert at 2^19 -- 25 pixels of 485,361. The measured figure at 2^21 is 100%.
+///
+/// The threshold is proved against a break that reproduces the first defect in
+/// one line, so the number is known to be able to fail.
+///
+/// Not ignored.
+#[test]
+fn nearly_every_hit_pixel_gets_a_slot() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (tree, extent) = bench_scene();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let wasted = with_the_flat_axis_wasted(&shader);
+
+    // Both cameras: the near one is the configuration the win is measured on,
+    // the distant one is where both defects were four to five times worse.
+    for (where_from, (eye, offset_from_clip)) in
+        [("bench", bench_camera(extent)), ("distant", distant_camera(extent))]
+    {
+        for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
+            let share = |source: &str| {
+                let p = Prepared::new(
+                    &device, source, "march_composite", &tree, offset_from_clip, eye, w, h,
+                    march_flags::DEFAULT, &[],
+                );
+                // A pixel that inserted nothing has to be distinguishable from
+                // one that took slot 0, and the record's done flag has to be
+                // set before the primary clears it.
+                p.clear_sun_pixel_slots(&queue);
+                let store = p.sun_store(&device, &queue);
+                let share = store.pixels_with_slot as f64 / store.static_hits.max(1) as f64;
+                (store, share)
+            };
+
+            let (store, got) = share(&shader);
+            eprintln!(
+                "{where_from} {w}x{h}: {} of {} pixels that hit the static world got a slot \
+                 ({:.1}%), filling {} slots with {} distinct faces",
+                store.pixels_with_slot,
+                store.static_hits,
+                got * 100.0,
+                store.occupied,
+                store.distinct_keys,
+            );
+            assert!(
+                store.static_hits > 0,
+                "{where_from} {w}x{h}: no pixel recorded a static-world hit, so this gate is \
+                 measuring nothing",
+            );
+            assert!(
+                got >= 0.95,
+                "{where_from} {w}x{h}: only {:.1}% of the {} pixels that hit the static world \
+                 got a slot. The image is still correct -- they march their own ray -- and the \
+                 saving the store exists for is gone for all of them",
+                got * 100.0,
+                store.static_hits,
+            );
+        }
+    }
+
+    // The break, at the one configuration it was worst on, so the threshold is
+    // known to be able to fail rather than argued to be.
+    let (eye, offset_from_clip) = distant_camera(extent);
+    let (w, h) = (1920u32, 1080u32);
+    let broken = {
+        let p = Prepared::new(
+            &device, &wasted, "march_composite", &tree, offset_from_clip, eye, w, h,
+            march_flags::DEFAULT, &[],
+        );
+        p.clear_sun_pixel_slots(&queue);
+        let store = p.sun_store(&device, &queue);
+        store.pixels_with_slot as f64 / store.static_hits.max(1) as f64
+    };
+    eprintln!("with the flat axis wasted, distant {w}x{h}: {:.1}%", broken * 100.0);
+    assert!(
+        broken < 0.95,
+        "the flat-axis break left {:.1}% of hit pixels with a slot, so it does not reproduce \
+         the defect and the gate above is not known to test anything",
+        broken * 100.0,
+    );
 }
 
 /// What the store costs when nothing reads it, which is its overhead alone.
@@ -2081,8 +2266,10 @@ fn reintroducing_the_insert_race_costs_slots_per_face() {
     );
     assert!(
         per_face(&before) > 1.5,
-        "putting the race back cost only {:.3} slots a face, so this break does not reproduce \
-         the defect it guards and the gate above is not known to test anything",
+        "putting the race back cost only {:.3} slots a face, against the 1.676 measured with \
+         this hash, so this break does not reproduce the defect it guards and the gate above \
+         is not known to test anything. The figure is hash-dependent -- it read 2.676 with the \
+         scrambling hash -- so re-read it rather than lowering the threshold",
         per_face(&before),
     );
 }
@@ -2134,14 +2321,18 @@ const SUN_PASS_MARCH: &str = concat!(
     "    }\n",
 );
 
-/// The source with the sun pass writing a constant instead of marching.
-fn with_a_constant_sun(shader: &str) -> String {
+/// The source with the sun pass writing a constant bit instead of marching.
+///
+/// Both constants are *believed* by the composite, because the pass still
+/// stamps the visibility word it writes -- which is what separates this break
+/// from `with_the_sun_pass_silenced`, where the word is never written at all.
+fn with_a_constant_sun(shader: &str, bit: u32) -> String {
     assert_eq!(
         shader.matches(SUN_PASS_MARCH).count(),
         1,
         "the sun pass's march moved; this break edits it by text",
     );
-    shader.replace(SUN_PASS_MARCH, "    var bit = 1u;\n")
+    shader.replace(SUN_PASS_MARCH, &format!("    var bit = {bit}u;\n"))
 }
 
 /// **The gate the whole plan rests on**: the three-pass lit path draws the same
@@ -2156,6 +2347,15 @@ fn with_a_constant_sun(shader: &str) -> String {
 ///
 /// Both sides are the same shader module, so this cannot accidentally compare
 /// two builds. `march` is left byte for byte as it was for exactly this reason.
+///
+/// **The split path is dispatched twice, under two different stamps, and both
+/// images are compared.** Until this did so, nothing anywhere in the suite ever
+/// ran the split path more than once: every image gate was a single dispatch on
+/// a freshly zeroed store, so the state the app is in from frame 2 onward --
+/// every slot already carrying a stamp, every claim word to be won again, the
+/// visibility words holding the last frame's answers -- was a state no test had
+/// rendered. That is the whole cross-frame class, and it is where an 8-bit
+/// stamp's wrap lives.
 ///
 /// Not ignored.
 #[test]
@@ -2188,18 +2388,27 @@ fn the_split_pass_changes_no_pixel() {
                     )
                 };
                 let before = build("march").read_back(&device, &queue);
-                let after = build("march_composite").read_back(&device, &queue);
-                let differing = before
-                    .chunks_exact(4)
-                    .zip(after.chunks_exact(4))
-                    .filter(|(a, b)| a != b)
-                    .count();
-                assert_eq!(
-                    differing, 0,
-                    "{where_from} {w}x{h}, {what}: the split pass moved {differing} pixels of \
-                     {}; the key does not identify what the shadow ray depends on",
-                    w * h,
-                );
+                // One `Prepared`, two submits. Each advances the stamp, so the
+                // second meets a store this same configuration filled under
+                // the previous one.
+                let split = build("march_composite");
+                let frames =
+                    [split.read_back(&device, &queue), split.read_back(&device, &queue)];
+                for (frame, after) in frames.iter().enumerate() {
+                    let differing = before
+                        .chunks_exact(4)
+                        .zip(after.chunks_exact(4))
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    assert_eq!(
+                        differing, 0,
+                        "{where_from} {w}x{h}, {what}, frame {}: the split pass moved \
+                         {differing} pixels of {}; the key does not identify what the shadow \
+                         ray depends on",
+                        frame + 1,
+                        w * h,
+                    );
+                }
             }
         }
     }
@@ -2367,11 +2576,20 @@ fn the_key_check_is_what_keeps_two_faces_apart() {
 /// A cached value nothing computes is not a cache: the sun pass is what the
 /// image depends on, twice over.
 ///
-/// Writing a constant bit shadows everything the store answers for. Switching
-/// the pass off instead leaves the visibility words as the buffer was zeroed,
-/// so the same faces read *lit*. The two images differ from today's, and from
-/// each other -- which is what rules out a composite that quietly marched its
-/// own ray and never read the store at all.
+/// Writing a constant 1 shadows everything the store answers for; writing a
+/// constant 0 lights it. Both still stamp the visibility word, so the composite
+/// believes both, and the two images differ from today's and from each other --
+/// which is what rules out a composite that quietly marched its own ray and
+/// never read the store at all.
+///
+/// **The third case is the stamp guard, and it is the one that must move
+/// nothing.** Switching the pass off leaves the visibility words unwritten, so
+/// every slot's word carries a stamp that is not this frame's and the composite
+/// marches its own ray for all of them. Before the stamp rode in that word, an
+/// unwritten word read as *lit* and moved 16,264 pixels -- which is the same
+/// failure an under-dispatched sun pass produces for the tail of its work list,
+/// except silently and for a handful of pixels rather than visibly for all of
+/// them. This asserting 0 is the belt to the key check's braces.
 ///
 /// Not ignored.
 #[test]
@@ -2383,7 +2601,8 @@ fn the_sun_pass_is_what_the_image_depends_on() {
     let (tree, extent) = bench_scene();
     let (eye, offset_from_clip) = bench_camera(extent);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
-    let constant = with_a_constant_sun(&shader);
+    let shadowing = with_a_constant_sun(&shader, 1);
+    let lighting = with_a_constant_sun(&shader, 0);
     let silent = with_the_sun_pass_silenced(&shader);
 
     let (w, h) = (1280u32, 720u32);
@@ -2394,8 +2613,9 @@ fn the_sun_pass_is_what_the_image_depends_on() {
         )
     };
     let honest = build(&shader).read_back(&device, &queue);
-    let all_dark = build(&constant).read_back(&device, &queue);
-    let all_lit = build(&silent).read_back(&device, &queue);
+    let all_dark = build(&shadowing).read_back(&device, &queue);
+    let all_lit = build(&lighting).read_back(&device, &queue);
+    let unanswered = build(&silent).read_back(&device, &queue);
     let differing = |a: &[u8], b: &[u8]| {
         a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(x, y)| x != y).count()
     };
@@ -2403,13 +2623,15 @@ fn the_sun_pass_is_what_the_image_depends_on() {
     let dark = differing(&honest, &all_dark);
     let lit = differing(&honest, &all_lit);
     let between = differing(&all_dark, &all_lit);
+    let stale = differing(&honest, &unanswered);
     eprintln!(
-        "sun pass writing a constant 1: {dark} pixels differ of {}. Sun pass switched off: \
-         {lit}. Between those two: {between}.",
+        "sun pass writing a constant 1: {dark} pixels differ of {}. Writing a constant 0: \
+         {lit}. Between those two: {between}. Sun pass switched off, so no visibility word \
+         carries this frame's stamp: {stale}.",
         w * h,
     );
     assert!(dark > 0, "a sun pass writing a constant moved no pixel, so nothing reads its bit");
-    assert!(lit > 0, "switching the sun pass off moved no pixel, so nothing reads its bit");
+    assert!(lit > 0, "a sun pass lighting everything moved no pixel, so nothing reads its bit");
     assert_ne!(
         dark, lit,
         "the two breaks moved the same number of pixels, which a shadowed-everything and a \
@@ -2419,6 +2641,13 @@ fn the_sun_pass_is_what_the_image_depends_on() {
         between > 0,
         "shadowing everything and lighting everything drew the same image, so the composite \
          is not reading the visibility word it claims to",
+    );
+    assert_eq!(
+        stale, 0,
+        "with the sun pass switched off, {stale} pixels of {} shaded from a visibility word \
+         this frame never wrote. The stamp the pass packs above the bit is what should send \
+         every one of them to the fallback march instead",
+        w * h,
     );
 }
 
@@ -2449,9 +2678,17 @@ fn pass_times(device: &wgpu::Device, queue: &wgpu::Queue, p: &Prepared) -> [f32;
 ///
 /// - the single-pass `march`, which is today;
 /// - the four passes;
-/// - the same four with the compaction gathering nothing, so the sun pass has an
-///   empty work list and marches no ray. The gap between that and the real one
-///   is the marching, separated from the rest of the restructure.
+/// - the same four with the sun pass writing a constant bit instead of marching.
+///   The gap between that and the real one is the marching, separated from the
+///   rest of the restructure.
+///
+/// **That third row used to empty the work list instead, and it cannot any
+/// more.** The composite now requires the visibility word to carry this frame's
+/// stamp, so a slot the sun pass never wrote sends its pixels to the fallback
+/// march -- which moves the shadow march into the composite rather than removing
+/// it, and the row would have read as the restructure's cost while measuring
+/// the march twice over. Writing a constant keeps the work list, the dispatch
+/// and the stamped write and drops only the ray.
 ///
 /// Run with `cargo test --release -p bevox_render --test gpu_bench collects --
 /// --ignored --nocapture`.
@@ -2469,7 +2706,7 @@ fn what_the_split_sun_pass_collects() {
     let (tree, extent) = bench_scene();
     let (eye, offset_from_clip) = bench_camera(extent);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
-    let silent = with_the_sun_pass_silenced(&shader);
+    let rayless = with_a_constant_sun(&shader, 0);
 
     for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
         let build = |source: &str, entry: &str| {
@@ -2480,7 +2717,7 @@ fn what_the_split_sun_pass_collects() {
         };
         let single = build(&shader, "march");
         let split = build(&shader, "march_composite");
-        let floor = build(&silent, "march_composite");
+        let floor = build(&rayless, "march_composite");
 
         let (text, wall, gpu) = row_text(aba_both(&device, &queue, &single, &split));
         println!("\n{w}x{h}  four passes against one:\n  {text}");
@@ -2490,7 +2727,7 @@ fn what_the_split_sun_pass_collects() {
             -gpu, -wall,
         );
         let (text, _, floor_gpu) = row_text(aba_both(&device, &queue, &single, &floor));
-        println!("  the same four passes with the work list left empty:\n  {text}");
+        println!("  the same four passes with the sun pass marching no ray:\n  {text}");
         println!(
             "  so the marching the sun pass does costs {:+.2} ms, and everything else about \
              the split costs {floor_gpu:+.2}",
@@ -2505,7 +2742,7 @@ fn what_the_split_sun_pass_collects() {
              one:  beam {:.2} + march {:.2} = {:.2}\n    \
              four: beam {:.2} + primary {:.2} + compact {:.2} + sun {:.2} + composite {:.2} \
              = {:.2}\n    \
-             with the work list left empty: compact {:.2} + sun {:.2}, over {} and {} \
+             with the sun pass marching no ray: compact {:.2} + sun {:.2}, over {} and {} \
              workgroups",
             one[0], one[4], one.iter().sum::<f32>(),
             three[0], three[1], three[2], three[3], three[4], three.iter().sum::<f32>(),
@@ -2527,4 +2764,5 @@ fn what_the_split_sun_pass_collects() {
         );
     }
 }
+
 

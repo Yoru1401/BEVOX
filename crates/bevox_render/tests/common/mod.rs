@@ -218,13 +218,18 @@ pub fn read_texture(
 /// Full-resolution pixels per beam sample, per axis. Must match BEAM_SCALE.
 pub const BEAM_SCALE: u32 = 8;
 
-/// The sun store's frame stamp in the harness: one fixed non-zero value, in the
-/// 1..255 the 8-bit stamp field holds.
+/// The sun store's *first* frame stamp in the harness, in the 1..255 the 8-bit
+/// stamp field holds. Not 0, which means "never used" -- with 0 the store would
+/// read as both free and claimed at once.
 ///
-/// The app advances a stamp per frame so a slot from the last frame reads as
-/// free; a harness dispatches the same frame over and over, so a fixed stamp is
-/// that frame. Not 0, which means "never used" -- with 0 the store would read as
-/// both free and claimed at once.
+/// **It is only the first.** Every submit advances it through
+/// `pipeline::next_sun_stamp`, exactly as the app advances it per frame, so the
+/// second and later dispatches of one `Prepared` re-claim slots their own
+/// previous dispatch left stamped. A fixed stamp made every lane hit
+/// `held == want` on its first probe from dispatch 2 onward -- no
+/// compare-exchange, no key write, no inter-lane contention -- which is a store
+/// state the app never has, and it fell entirely on the four-pass side of a
+/// bench against a storeless baseline.
 pub const SUN_STAMP: u32 = 1;
 
 pub struct Prepared {
@@ -263,6 +268,20 @@ pub struct Prepared {
     /// The rectangles uploaded, one per marched body, in table order.
     pub body_rects: Vec<GpuBodyRect>,
     body_rect_buffer: wgpu::Buffer,
+    /// Kept so every submit can advance the sun stamp in place, the way the app
+    /// rewrites its view uniform each frame.
+    uniform_buffer: wgpu::Buffer,
+    /// The stamp the next submit will use. `Cell`, because advancing it is a
+    /// detail of `&self` dispatch and no test drives one `Prepared` from two
+    /// threads.
+    sun_stamp: std::cell::Cell<u32>,
+    /// Invocations the sun pass is dispatched over, when something wants one
+    /// other than the shipped `SUN_SLOTS`.
+    ///
+    /// Exists for `what_the_whole_table_sun_dispatch_costs`, which is the A/B
+    /// of the dispatch bound itself: the pixel-bounded form it replaced cannot
+    /// be measured against the whole-table form without being runnable.
+    sun_dispatch: std::cell::Cell<Option<u32>>,
     sun_claims_buffer: wgpu::Buffer,
     sun_table_buffer: wgpu::Buffer,
     /// Slots the shader is told the sun store holds, which is
@@ -320,7 +339,6 @@ impl GpuTime {
 }
 
 impl Prepared {
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
@@ -467,7 +485,9 @@ impl Prepared {
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniform"),
             contents: bytemuck::bytes_of(&uniform),
-            usage: wgpu::BufferUsages::UNIFORM,
+            // COPY_DST so `advance_sun_stamp` can rewrite `ao_params.z` before
+            // each submit.
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let node_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("nodes"),
@@ -732,6 +752,9 @@ impl Prepared {
             body_count: uniform.volume_params[3],
             body_rects,
             body_rect_buffer,
+            uniform_buffer,
+            sun_stamp: std::cell::Cell::new(SUN_STAMP),
+            sun_dispatch: std::cell::Cell::new(None),
             sun_claims_buffer,
             sun_table_buffer,
             sun_slots: slots,
@@ -843,13 +866,52 @@ impl Prepared {
         self.sun_slots.div_ceil(bevox_render::pipeline::SUN_PASS_WORKGROUP)
     }
 
-    /// Workgroups the sun pass dispatches: one invocation per entry the work
-    /// list could hold, which is bounded by the pixels that could have
-    /// inserted.
+    /// Workgroups the sun pass dispatches: one invocation per *slot*, the same
+    /// count the compaction scans.
+    ///
+    /// The pixel count is not a bound on the work list. `sun_compact` queues
+    /// every slot whose stamp is this frame's, and an 8-bit stamp makes that
+    /// the slots claimed this frame plus the slots claimed exactly 255 frames
+    /// ago -- so a pixel-bounded dispatch can leave the tail of the list
+    /// unmarched. `pipeline::dispatch_march` dispatches `SUN_SLOTS` for the
+    /// same reason and this must agree with it, or the harness measures and
+    /// gates a dispatch the app does not run.
     pub fn sun_workgroups(&self) -> u32 {
-        (self.width * self.height)
-            .min(self.sun_slots)
-            .div_ceil(bevox_render::pipeline::SUN_PASS_WORKGROUP)
+        match self.sun_dispatch.get() {
+            Some(n) => n.div_ceil(bevox_render::pipeline::SUN_PASS_WORKGROUP),
+            None => self.compact_workgroups(),
+        }
+    }
+
+    /// Dispatches the sun pass over `invocations` rather than over the table.
+    ///
+    /// **Only a bench measuring the bound itself may use this.** A shorter
+    /// dispatch than the table is not correct -- `sun_workgroups` says why --
+    /// so anything gating an image or an occupancy figure has to leave it
+    /// alone.
+    pub fn force_sun_dispatch(&self, invocations: u32) {
+        self.sun_dispatch.set(Some(invocations));
+    }
+
+    /// Rewrites `ao_params.z` with the next frame's stamp, so the submit that
+    /// follows re-claims every slot instead of finding its own last dispatch's
+    /// claim already matching.
+    ///
+    /// Four bytes against a dispatch of milliseconds, and it is paid on both
+    /// sides of every A/B comparison.
+    fn advance_sun_stamp(&self, queue: &wgpu::Queue) {
+        let next = bevox_render::pipeline::next_sun_stamp(self.sun_stamp.get());
+        self.sun_stamp.set(next);
+        // `ao_params` is the last field of `TestUniform` and the stamp is its
+        // third word.
+        let at = size_of::<TestUniform>() - 16 + 8;
+        queue.write_buffer(&self.uniform_buffer, at as u64, bytemuck::bytes_of(&next));
+    }
+
+    /// The stamp the last submit used, which is what a store readback has to
+    /// filter the claim words by.
+    pub fn sun_stamp(&self) -> u32 {
+        self.sun_stamp.get()
     }
 
     /// Slots the shader was told the store holds.
@@ -874,6 +936,7 @@ impl Prepared {
         let t = self.timestamps.as_ref()?;
         let period = queue.get_timestamp_period();
 
+        self.advance_sun_stamp(queue);
         let mut encoder = device.create_command_encoder(&Default::default());
         self.encode(&mut encoder, true);
         queue.submit([encoder.finish()]);
@@ -905,6 +968,7 @@ impl Prepared {
 
     /// Submits one dispatch without waiting; the caller polls once per batch.
     pub fn dispatch(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.advance_sun_stamp(queue);
         let mut encoder = device.create_command_encoder(&Default::default());
         self.encode(&mut encoder, false);
         queue.submit([encoder.finish()]);
@@ -912,6 +976,7 @@ impl Prepared {
 
     /// Dispatches once and reads the result back as RGBA bytes.
     pub fn read_back(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u8> {
+        self.advance_sun_stamp(queue);
         let mut encoder = device.create_command_encoder(&Default::default());
         self.encode(&mut encoder, false);
         read_texture(device, queue, encoder, &self.texture, self.width, self.height)
@@ -958,10 +1023,11 @@ impl Prepared {
         let mut occupied = 0usize;
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let shift = 32 - bevox_render::pipeline::SUN_STAMP_BITS;
+        let stamp = self.sun_stamp.get();
         for (slot, &claim) in claims.iter().enumerate() {
             // A claim word is the stamp over the key's tag, so the stamp comes
             // out of the top bits rather than the whole word.
-            if claim >> shift != SUN_STAMP {
+            if claim >> shift != stamp {
                 continue;
             }
             occupied += 1;
@@ -975,6 +1041,16 @@ impl Prepared {
             // The slot is the record's first word, so a record's worth of
             // stride separates one pixel's from the next.
             pixels_with_slot: pixels.iter().step_by(stride).filter(|&&p| p != u32::MAX).count(),
+            // The record's third word is the key's high bits with the material
+            // and the done flag. `clear_sun_pixel_slots` fills it with 0xFF,
+            // which reads as done, so a cleared record is not counted and only
+            // a static-world hit clears the flag.
+            static_hits: pixels
+                .iter()
+                .skip(2)
+                .step_by(stride)
+                .filter(|&&p| p & 0x8000_0000 == 0)
+                .count(),
         }
     }
 
@@ -1015,6 +1091,13 @@ pub struct SunStore {
     /// Pixels that came away with a slot. Requires `clear_sun_pixel_slots`
     /// before the dispatch, or a pixel that inserted nothing reads as slot 0.
     pub pixels_with_slot: usize,
+    /// Pixels whose record says they hit the static world, so they asked the
+    /// store for a slot whether or not they got one.
+    ///
+    /// **Only meaningful for a `march_primary` or `march_composite`
+    /// configuration**, which is what writes the record's done flag; `march`
+    /// writes the slot word alone and leaves this at 0.
+    pub static_hits: usize,
 }
 
 /// A run of words copied back out of a storage buffer.

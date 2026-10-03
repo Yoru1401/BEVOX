@@ -1,7 +1,7 @@
 ---
 type: Measurement
 title: 'Nine pixels a voxel face, and one slot each'
-description: 'The sun shadow ray is recomputed 9.22 times a voxel face at 1080p on the near camera and 1.37 at the horizon, and break-even is the per-slot ray cost ratio rather than 1. A hash that indexes an 8x8 face patch in its low bits makes the compaction emit a surface-ordered work list for free, halving the per-slot ray to 9.9 ns and taking break-even from 2.2 to 1.2.'
+description: 'The sun shadow ray is recomputed 9.22 times a voxel face at 1080p on the near camera and 1.37 at the horizon, and break-even is the per-slot ray cost ratio rather than 1. A hash that indexes an 8x8 face patch in its low bits makes the compaction emit a surface-ordered work list for free, halving the per-slot ray to 9.9 ns and taking break-even from 2.2 to 1.2. The insert costs +1.0 ms at 1080p, not +0.4: a fixed harness stamp let every lane find its own last dispatch already claimed.'
 tags: [performance, gpu, lighting, atomics]
 generated: { by: claude-opus-5/claude-code, at: 2026-10-03T00:00:00Z }
 sources:
@@ -36,6 +36,18 @@ one slot a face means a pass over the occupied slots collects all of it.
 
 The factor over *inserting* pixels is the honest one. The factor over every
 pixel, 17.51 at 1080p, counts sky pixels that never marched a shadow ray.
+
+**That figure is now gated, and it was not before.** Every use of
+`pixels_with_slot` was a `println!`, and the one test that reported it was
+`#[ignore]`d behind `distinct_keys > 0` -- so the metric that caught both of
+this work's silent defects could not fail a suite run.
+`nearly_every_hit_pixel_gets_a_slot`, not ignored, asserts that at least 95% of
+the pixels recording a static-world hit came away with a slot, at both cameras
+and both resolutions. Measured: **100.0% at three of the four, and 689,320 of
+689,356 at the distant camera at 1080p**. The break is the flat-axis failure
+below in one line -- the local index taken from `(x, y)` instead of the two
+tangent axes -- and it reads **43.8%**, so the threshold is known to be able to
+fail.
 
 # The worst case: the horizon, and what a coherent hash did to it
 
@@ -73,10 +85,32 @@ And the near field did not pay for it -- the bench camera went **-2.1 to -2.6 ms
 at 720p and about -5.4 at 1080p** against the same baseline, which is the +5.3 ms
 Task 2 collected, intact.
 
-**It is still about half a millisecond slower at the horizon at 1080p**, and that
-is the reading whose margin over its own drift is thinnest on this page: about
-+0.5 ms against drift near 0.2. Against `4560d58`, the parent that inserts and
-reads nothing, the same configuration reads **-0.15 to -0.50 ms**, i.e. faster.
+**It is still slower at the horizon at 1080p, and the honest figure is +0.75 ms
+rather than +0.5.** The +0.43/+0.58/+0.59 above was taken with the harness
+holding one fixed frame stamp, which is a store state the app never has -- see
+[what a fixed stamp was hiding](#what-a-fixed-stamp-was-hiding) below. Re-read
+with the stamp advancing per submit, three invocations:
+
+| against `34f2d45`, stamp advancing | 1280x720 | 1920x1080 |
+|---|---|---|
+| **coherent hash** | **+1.70, +1.62, +1.62** | **+0.87, +0.78, +0.60** |
+| drift | 0.04-0.23 | 0.03-0.06 |
+
+It is a larger residue and a far better-conditioned reading: +0.75 ms against
+drift near 0.05 is a fifteenfold margin, where the figure it replaces was the
+thinnest on this page. The magnitudes are not comparable across sessions and
+only the within-session A/B/A stands, but the *conditioning* is the point --
+this number is now worth holding.
+
+**The two baselines still disagree on the sign, and that is not an artifact.**
+Against `4560d58`, the parent that inserts and reads nothing, the same
+configuration reads **-1.67 to -2.12 ms**, i.e. faster, where it read -0.15 to
+-0.50 with the fixed stamp. The gap grew rather than cancelling, because
+`4560d58` pays the insert in full and collects nothing for it: it is strictly a
+worse revision than either side of the comparison, and the distance between the
+two baselines is the insert's real cost at 503,650 distinct faces. **The
+disagreement is the question each baseline answers, not noise in either.**
+
 **Whether that residue wants a distance cutoff is a design decision and is not
 made here.**
 
@@ -243,10 +277,40 @@ key check is an image break — see [the sun pass was
 lane-bound](sun-pass-is-lane-bound.md), which also carries what the store
 collected once something read it.
 
+# What a fixed stamp was hiding
+
+`tests/common/mod.rs` held `SUN_STAMP` at 1 for every dispatch, and every timing
+path -- `pass_times`, `aba_both`, `time_dispatches` -- takes a median over seven
+or more submits of one `Prepared`, whose claim words persist between them.
+**From submit 2 onward every lane hit `held == want` on its first probe: no
+compare-exchange, no key write, no inter-lane contention.** The app advances the
+stamp every frame and re-claims every slot, so the harness was measuring a store
+state that exists for exactly one frame of the app's life.
+
+Every submit now writes `ao_params.z` through `pipeline::next_sun_stamp` -- four
+bytes against a dispatch of milliseconds, paid on both sides of every
+comparison. What moved:
+
+| insert on against off, bench camera, GPU clock | fixed stamp | stamp advancing |
+|---|---|---|
+| 1280x720 | +0.28 ms | **+0.39, +0.50, +0.87** |
+| 1920x1080 | about +0.4 ms | **+0.91, +0.95, +1.06** |
+
+**The insert costs about +1.0 ms at 1080p, not +0.4 -- 12% of the 8.36 ms
+ceiling rather than 5%.** Drift 0.02-0.39 on all six readings. Taking the claim
+loop out of the measurement took three fifths of its cost with it, which is what
+a compare-exchange that never has to exchange is worth.
+
+It also explains the baselines above. `4560d58` inserts and reads nothing, so
+the whole of that understated cost sat on it and on the four-pass side at once
+and cancelled; priced honestly, both pay it and the horizon's two baselines are
+2.5 ms apart rather than 1.0.
+
 # What the store costs when nothing reads it
 
 Five invocations, each A/B/A interleaved, insert on against off, GPU clock,
-after the fix:
+after the fix and **with the harness's fixed frame stamp**, which is why these
+are not the numbers above:
 
 | | readings | taken |
 |---|---|---|
@@ -257,7 +321,7 @@ One 1080p reading, +0.27, came with a baseline drift of 0.81 ms and is not a
 result. Drift was 0.00-0.29 ms on all the rest, against 0.42-2.32 for the raced
 form, which cost **+0.5 ms at 720p and about +0.9 at 1080p** — so the fix made
 the store cheaper as well as tighter, because it does a third of the claims and
-no key reads. **About 5% of the ceiling at 1080p.**
+no key reads.
 
 # The break, and what the cliff did to it
 
