@@ -1,7 +1,7 @@
 ---
 type: Measurement
 title: 'Nine pixels a voxel face, and one slot each'
-description: 'The sun shadow ray is recomputed 9.22 times a voxel face at 1080p, so the redundancy is there to collect; the insert claims exactly one slot per face, because the frame stamp and the key tag share one word and so one compare-exchange settles both.'
+description: 'The sun shadow ray is recomputed 9.22 times a voxel face at 1080p on the near camera, so the redundancy is there to collect, and the insert claims exactly one slot per face because the frame stamp and the key tag share one word. At the horizon the factor is 1.01-1.37 and the store is a 4.4-7.0 ms regression, because break-even needs about 2.2.'
 tags: [performance, gpu, lighting, atomics]
 generated: { by: claude-opus-5/claude-code, at: 2026-10-03T00:00:00Z }
 sources:
@@ -36,6 +36,103 @@ one slot a face means a pass over the occupied slots collects all of it.
 
 The factor over *inserting* pixels is the honest one. The factor over every
 pixel, 17.51 at 1080p, counts sky pixels that never marched a shadow ray.
+
+# The worst case: the horizon, where the factor is 1 and the store loses
+
+**`the_worst_case_is_measured_against_the_parent` is a failed gate and the
+number is on this page because it is a design input, not a bug to tune away.**
+
+`distant_camera` stands high and near one edge of the bench scene, aimed
+down-range at the far edge of the floor, so the frame is terrain at 800 to 1200
+voxels rather than half sky. A vertical field of 0.9 rad over 1080 rows is
+8.33e-4 rad a pixel, so a voxel subtends about a pixel at that distance — which
+is the condition the store has nothing to offer.
+
+| | 1280x720 | 1920x1080 |
+|---|---|---|
+| pixels that inserted | 306 403 | 689 285 |
+| distinct `(voxel, face)` keys | 304 731 | 503 636 |
+| **the redundancy** | **1.01** | **1.37** |
+| four passes against `34f2d45`, GPU clock | **+4.36 to +4.58 ms** | **+6.79 to +7.05 ms** |
+| the same against `4560d58`, which already inserts | +3.63 to +4.45 | +5.24 to +6.83 |
+| drift on those readings | 0.06-0.44 | 0.01-0.30 |
+
+Three invocations, each A/B/A interleaved in one command, across two source
+files rather than within one module. **No reading's drift came near its effect.**
+`4560d58` is this branch's parent and already pays the insert, so it is the
+flattering baseline of the two; `34f2d45` has no store at all and is the honest
+one.
+
+**Where it goes, at 1920x1080, GPU ms, median of seven:**
+
+| one dispatch | | four dispatches | |
+|---|---|---|---|
+| `march` | 21.76 | `march_primary` | 15.51 |
+| | | `sun_compact` | 0.12 |
+| | | `sun_pass` | 10.08 |
+| | | `march_composite` | 1.37 |
+
+Taking the shadow march out of the primary saved 6.25 ms. Putting it back as a
+sun pass over 503 636 slots cost 10.08. **The store did not fail to help; it
+actively spent 1.6x what it saved, before the compaction and the composite.**
+
+# Why 1 is not the break-even point: 2.2 is
+
+The sun pass marches **20.0 ns a ray** here against **9.1 ns** in the primary it
+came out of — the ray incoherence already measured in [the sun pass was
+lane-bound](sun-pass-is-lane-bound.md), where it is 18.2 against 7.5 on the near
+camera. A per-slot ray costs about 2.2x a per-pixel one, so the store has to
+share each answer **2.2 ways just to break even on the marching**, and more than
+that to pay for the insert, the compaction entry, the 7-word record and the
+composite's extra read.
+
+**So the premise "any redundancy above 1 is a win" is wrong, and the correct
+threshold is a measured ratio rather than a bound.** 9.22 clears 2.2 four times
+over, which is why the near camera collects 5.3 ms of an 8.36 ms ceiling. 1.37
+does not clear it at all. The same bench prints the ratio per resolution; at
+720p it read 1.64, where the primary's own reading is noisier.
+
+**Looking at distant terrain is something players do constantly, so this is not
+a corner.** Whether the store takes a distance cutoff, or the work list is
+ordered by voxel locality to attack the 2.2x itself, is an open decision and is
+not made here.
+
+# What it takes to overflow the table
+
+`shrinking_the_table_until_it_overflows_is_measured`, bench camera. The slot
+count travels in the uniform, so this shrinks it with no shader edit and no
+smaller buffer — one compiled module against itself, which is the only way to
+read an occupancy change without the codegen cliff in the way.
+
+Pixels that came away with a slot, against the 485 361 and 1 092 019 that do at
+2^21:
+
+| slots | 720p | 1080p | load in faces at 1080p |
+|---|---|---|---|
+| 2^20 | 100% | 100% | 0.11 |
+| 2^19 | 100% | 100% | 0.23 |
+| **2^18** | **99.8%** | **99.1%** | 0.45 |
+| **2^17** | **91.9%** | **79.7%** | 0.83 |
+| 2^16 | 46.1% | 32.6% | 1.00 |
+| 2^14 | 14.4% | 13.8% | 1.00 |
+
+**The first failed insert appears at 2^19 and it is 25 pixels of 485 361.** The
+table is twenty times the face count at 2^21, so the first four halvings cost
+nothing at all; overflow becomes a real fraction of the screen at **2^18**, and
+bites at **2^17**, a 0.83 load factor in faces. Eight probes is what buys that:
+a linear probe at a 0.45 load finds a free slot almost always and at 1.00 never.
+
+**The image did not move at any of it.**
+`overflowing_the_table_changes_no_pixel` runs the composite at **2^14 slots**,
+where 86% of pixels give up and the rest mostly collide, against the per-pixel
+`march` at both resolutions with no bodies and with sixteen: **0 differing pixels
+in all four**. It asserts the overflow happened before it asserts the image,
+because a bit-identity gate on a table that was never full proves nothing.
+
+Only the frame moved: **+3.01 ms at 720p and +7.04 at 1080p** at 2^16, +2.17 and
++6.98 at 2^14, drift 0.44-0.77. That is the saving being handed back as pixels
+return to marching their own rays while still paying for the store — which is
+the same arithmetic as the horizon above, reached from the other direction.
 
 # One slot a face, and the race that cost three
 

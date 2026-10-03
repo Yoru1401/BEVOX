@@ -86,6 +86,20 @@ length. 18.2 ns a ray against 7.5 is what that costs, and it is already priced
 into the +5.0 ms. Ordering the work list by voxel locality is the only lever
 left on this pass, and it has not been measured.
 
+# That 2.4x is also the break-even redundancy, and it is the reason the horizon loses
+
+A per-slot ray costing 2.2-2.4x a per-pixel one means the store must share each
+answer that many ways before it saves anything at all. **The break-even
+redundancy is this ratio, not 1.** On the bench camera 9.22 clears it four times
+over; on a distant view, where a voxel covers about a pixel, 1.37 does not clear
+it and the four passes are **6.8-7.1 ms slower than doing nothing at 1080p**.
+The measurement and what it leaves open are in [nine pixels a voxel
+face](sun-store-occupancy.md).
+
+So this page's last line — that ordering the work list is the only lever left —
+is now the lever that decides whether distant views need a distance cutoff
+instead. Halving the per-slot ray's cost would halve the break-even factor.
+
 # What the pixel side needed that the spec did not say
 
 The composite cannot re-derive the hit: marching the primary ray twice would

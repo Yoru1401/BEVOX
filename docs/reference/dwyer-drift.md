@@ -32,14 +32,19 @@ because the cause is what says whether a difference needs fixing.
 | **C — different constraints.** A `u16`, an extent of 4096, eight storage buffers, a ten-per-cent fracture load window | 5 | Forced, and correct under the constraint |
 | **D — not reached yet.** Deferred, not rejected | 6 | Fine, except one |
 | **E — improvements on him** | 5 | Ours is better, mostly because he taught us the problem |
-| **F — oversight.** Nobody decided | 7 | **This is the drift.** Five looked worth fixing; F7 is measured and resolved, leaving four |
+| **F — oversight.** Nobody decided | 7 | **This is the drift.** Five looked worth fixing; F7 and F3 are resolved, leaving three |
 
 **Seven real problems out of thirty-two differences**, five of which looked worth
-fixing. **F7 is now resolved rather than fixed** — the setting was exposed,
-measured, and left where it was — which leaves **F1 to F4** worth fixing. Of
-those four, **three are in the renderer** (F1 the missing bounding-sphere reject,
-F2 and F3); **F4 is the stress scene**, which is physics. The seventh, F7, was a
-solver setting nobody knew existed.
+fixing. Two are now closed: **F7 was resolved rather than fixed** — the setting
+was exposed, measured, and left where it was — and **F3 is built and measured**,
+which leaves **F1, F2 and F4** worth fixing. Of those three, **two are in the
+renderer** (F1 the missing bounding-sphere reject, and F2); **F4 is the stress
+scene**, which is physics.
+
+**F3's fix has an open edge, and it is not counted as drift.** Computing sun
+visibility per voxel face collects 5.3 ms of an 8.36 ms ceiling on a near
+camera and is a 4.4-7.0 ms *regression* on a distant one. Whether that wants a
+distance cutoff is a design decision, not an oversight nobody made.
 
 (The sentence here used to read "Four are in the renderer … leaves four worth
 fixing", which equated two different fours: the four renderer items as counted
@@ -111,8 +116,8 @@ Places BEVOX is better, usually because he documented the problem first.
 
 # F — Oversight: the actual drift
 
-Seven differences nobody decided on. Five looked worth fixing; **F7 is now
-resolved**, leaving four.
+Seven differences nobody decided on. Five looked worth fixing; **F7 is resolved
+and F3 is fixed**, leaving three.
 
 ## F1. The primary path has no bounding-sphere reject — **bad**
 
@@ -153,9 +158,9 @@ tightening on every hit made it look sufficient. In arbitrary order only about
 F1 and F2 are both specified in
 [body composition in ray order](../superpowers/specs/2026-09-29-bevox-body-composition-design.md).
 
-## F3. Sunlight costs a ray per pixel, not per visible voxel — **bad**
+## F3. Sunlight cost a ray per pixel, not per visible voxel — **fixed 2026-10-03, and the horizon is a separate question**
 
-**What differs.** His per-voxel hash map already enumerates the visible voxels, so
+**What differed.** His per-voxel hash map already enumerates the visible voxels, so
 he shades direct sunlight **once per voxel**, measured at **1-2 ms on a 1660 Ti
 even with path tracing off**.
 
@@ -163,9 +168,48 @@ even with path tracing off**.
 BEVOX has no path tracer to denoise — so the store was never built, and the
 optimisation riding on it was never separated from the feature that motivated it.
 
-**Good idea?** No, and it is the sharpest item here: BEVOX deliberately snaps the
-shadow ray's origin to the voxel centre so a whole face is lit or shadowed
-together. **It already pays for a per-voxel result and collects it per pixel.**
+It was the sharpest item on this page because BEVOX already snaps the shadow
+ray's origin to the voxel centre and offsets along the axis-aligned face normal,
+so a whole face is lit or shadowed together: **it was paying for a per-voxel
+result and collecting it per pixel.**
+
+**What it collected.** A `(voxel, face)` hash store written in the primary pass,
+compacted, marched once a slot, and read back in a composite pass. **+5.3 ms of
+the 8.36 ms ceiling at 1920x1080**, +1.4 of 4.67-4.82 at 720p — the ceiling
+being what the shadow march costs, not what the frame costs. The frame's
+dispatches went **25.78 → 20.33 ms** at 1080p. The image is **bit-identical, 0
+differing pixels at both resolutions with bodies and without**, which it has to
+be: sun visibility was already a per-face property and the key either identifies
+what the ray depends on or it does not.
+
+**Two findings worth keeping, because neither was predictable from the design.**
+
+1. **The engine was computing each sun answer 9.22 times at 1080p** and 5.16 at
+   720p. The factor grows with resolution — 2.25x the pixels found only 1.26x
+   the faces — which is the premise behaving exactly as stated. It is the number
+   that said the optimisation was worth building, and it was measured before the
+   pass that would collect it was written.
+2. **The obvious sparse dispatch was a 7.42 ms *regression*, and compaction was
+   not a tuning option.** One invocation per slot over the whole table cost
+   15.01 ms to march 118 423 rays where the per-pixel path marches 1 092 019 in
+   8.14 — **17x the cost a ray**. None of it was the empty invocations'
+   instructions: the same pass with every slot skipped costs 0.05 ms. At a 5.65%
+   load factor a 64-lane workgroup holds about 3.6 occupied slots, and **a
+   workgroup costs what its slowest lane costs**. Gathering the occupied slots
+   into a dense work list costs 0.12 ms and took the pass from 15.01 to 2.15.
+
+**Good idea? Yes on the near view, and not settled at the horizon.** A per-slot
+ray costs 2.2x a per-pixel one — the rays are incoherent where neighbouring
+pixels' are not — so the store needs a redundancy of about **2.2** to break even
+on marching alone. A distant camera where a voxel covers about one pixel has
+**1.01 at 720p and 1.37 at 1080p**, and there the four passes are **+4.4 ms and
++6.8 to +7.1 ms slower than `34f2d45`**, which is the revision before any of
+this. Looking at distant terrain is ordinary play, so a distance cutoff or a
+locality-ordered work list is an open decision rather than a corner case.
+
+The measurements are in [nine pixels a voxel
+face](../concepts/sun-store-occupancy.md) and [the sun pass was
+lane-bound](../concepts/sun-pass-is-lane-bound.md).
 
 ## F4. No stress scene, and no 2D prototype — **the stress scene is done; the 2D repo is not**
 
@@ -317,7 +361,9 @@ interesting open question in the engine.
 2. **F2**, his devlog 2, if F1 leaves the primary half worth attacking.
 3. **F4's stress scene — done** 2026-10-02, a fixture and no engine code, as
    predicted. Its 2D-repository half is not.
-4. **F3**, which needs a per-voxel store BEVOX does not have.
+4. **F3 — done** 2026-10-03. The store is built and the near view collects
+   5.3 ms of 8.36; what remains is the design call on the horizon, where it
+   loses 4.4-7.0 ms.
 5. **D's copy-region**, justified by detachment's speed rather than API
    completeness.
 6. F5 and F6 need a sentence each, not a change.

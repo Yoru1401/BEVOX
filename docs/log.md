@@ -1,6 +1,31 @@
 # Update Log
 
 ## 2026-10-03
+* **Measurement**: [the per-voxel sun store loses at the horizon, and the
+  break-even redundancy is 2.2 rather than 1](concepts/sun-store-occupancy.md).
+  A camera far enough that a voxel covers about one pixel has **1.01 pixels a
+  face at 720p and 1.37 at 1080p**, and there the four-pass lit path is **+4.4
+  and +6.8 to +7.1 ms SLOWER than `34f2d45`**, the revision before any of this
+  work — three invocations, A/B/A interleaved across two source files, drift
+  0.01-0.44. The cause is not the store's overhead: a per-slot shadow ray costs
+  **20.0 ns against 9.1** for the per-pixel one it replaced, because the rays
+  are incoherent where neighbouring pixels' are not, so the store must share
+  each answer about **2.2 ways just to break even on the marching**. 9.22 clears
+  that four times over; 1.37 does not clear it at all. **Whether this wants a
+  distance cutoff or a locality-ordered work list is an open decision and is not
+  made here.**
+* **Measurement**: the overflow fallback, gated by overflowing the table rather
+  than by argument — [nine pixels a voxel face](concepts/sun-store-occupancy.md).
+  The slot count rides in the uniform, so it shrinks with no shader edit: the
+  first failed insert appears at **2^19** and is 25 pixels of 485,361, overflow
+  becomes a real fraction of the screen at **2^18**, and at **2^17** — a 0.83
+  load factor in faces — 20% of pixels at 1080p give up and march their own ray.
+  At **2^14**, where 86% give up, the image is **bit-identical at both
+  resolutions with bodies and without**; only the frame moved, +3.0 ms at 720p
+  and +7.0 at 1080p.
+* **Resolution**: [F3 in the drift ledger](reference/dwyer-drift.md) is fixed
+  rather than bad. Five of the seven F items looked worth fixing and two are now
+  closed, leaving **F1, F2 and F4**.
 * **Measurement**: [the sun pass was lane-bound, not ray-bound](concepts/sun-pass-is-lane-bound.md).
   The lit path is now four dispatches — primary, compact, sun, composite — and
   **collects about 5.3 ms of the 8.36 ms ceiling at 1080p**, bit-identically, at

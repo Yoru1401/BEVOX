@@ -265,6 +265,19 @@ pub struct Prepared {
     body_rect_buffer: wgpu::Buffer,
     sun_claims_buffer: wgpu::Buffer,
     sun_table_buffer: wgpu::Buffer,
+    /// Slots the shader is told the sun store holds, which is
+    /// `pipeline::SUN_SLOTS` for every caller but the overflow gate.
+    ///
+    /// The count travels in the uniform, so shrinking it needs no shader edit
+    /// and no smaller buffer -- every region the shader addresses is derived
+    /// from it, so a smaller count simply uses a prefix of the same buffers.
+    /// That is what makes the overflow gate a comparison of one shader against
+    /// itself rather than against an edited copy, which
+    /// `docs/concepts/gpu-codegen-cliff.md` is the reason to want.
+    ///
+    /// Every offset this harness computes for itself has to read this and not
+    /// the constant, or the readback looks at a region the shader never used.
+    sun_slots: u32,
     width: u32,
     height: u32,
 }
@@ -345,6 +358,40 @@ impl Prepared {
         bodies: &[bevox_core::body::Body],
         workgroup: u32,
     ) -> Self {
+        Self::with_workgroup_and_slots(
+            device, source, entry_point, tree, offset_from_clip, eye, width, height, flags,
+            bodies, workgroup, bevox_render::pipeline::SUN_SLOTS,
+        )
+    }
+
+    /// The same, for a sun store the shader is told is smaller than it is.
+    ///
+    /// `slots` must be a power of two -- the probe wraps with a mask -- and no
+    /// larger than `pipeline::SUN_SLOTS`, which is what the buffers are sized
+    /// for. Shrinking it is how the overflow fallback is exercised: fewer slots
+    /// than visible voxel faces means inserts that spend every probe and give
+    /// up, and a pixel that gave up marches its own shadow ray.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_workgroup_and_slots(
+        device: &wgpu::Device,
+        source: &str,
+        entry_point: &str,
+        tree: &Contree,
+        offset_from_clip: Mat4,
+        eye: Vec3,
+        width: u32,
+        height: u32,
+        flags: u32,
+        bodies: &[bevox_core::body::Body],
+        workgroup: u32,
+        slots: u32,
+    ) -> Self {
+        assert!(slots.is_power_of_two(), "sun slots is {slots}, and the shader masks");
+        assert!(
+            slots <= bevox_render::pipeline::SUN_SLOTS,
+            "{slots} slots asked of buffers sized for {}",
+            bevox_render::pipeline::SUN_SLOTS,
+        );
         let field = bevox_core::distance_field::DistanceField::build(tree);
         // The static world packed with every body, in the same buffers and the
         // same layout `pack_bodies` gives the real render pipeline. An empty
@@ -388,7 +435,7 @@ impl Prepared {
             ],
             ao_params: [
                 bevox_render::upload::field_words(&field),
-                bevox_render::pipeline::SUN_SLOTS,
+                slots,
                 SUN_STAMP,
                 width * height,
             ],
@@ -687,6 +734,7 @@ impl Prepared {
             body_rect_buffer,
             sun_claims_buffer,
             sun_table_buffer,
+            sun_slots: slots,
             width,
             height,
         }
@@ -728,7 +776,7 @@ impl Prepared {
             // free, a counter is not.
             encoder.clear_buffer(
                 &self.sun_claims_buffer,
-                bevox_render::pipeline::sun_work_count_offset(),
+                u64::from(self.sun_slots) * 4,
                 Some(4),
             );
             let slot = next;
@@ -792,8 +840,7 @@ impl Prepared {
     /// Workgroups the compaction dispatches: one invocation per slot in the
     /// table, sized from the table rather than the screen.
     pub fn compact_workgroups(&self) -> u32 {
-        bevox_render::pipeline::SUN_SLOTS
-            .div_ceil(bevox_render::pipeline::SUN_PASS_WORKGROUP)
+        self.sun_slots.div_ceil(bevox_render::pipeline::SUN_PASS_WORKGROUP)
     }
 
     /// Workgroups the sun pass dispatches: one invocation per entry the work
@@ -801,8 +848,13 @@ impl Prepared {
     /// inserted.
     pub fn sun_workgroups(&self) -> u32 {
         (self.width * self.height)
-            .min(bevox_render::pipeline::SUN_SLOTS)
+            .min(self.sun_slots)
             .div_ceil(bevox_render::pipeline::SUN_PASS_WORKGROUP)
+    }
+
+    /// Slots the shader was told the store holds.
+    pub fn sun_slots(&self) -> u32 {
+        self.sun_slots
     }
 
     /// Whether this configuration runs the three-pass lit path.
@@ -880,7 +932,7 @@ impl Prepared {
     /// probe needs the distinction, so it is paid for there and not on every
     /// `Prepared`.
     pub fn clear_sun_pixel_slots(&self, queue: &wgpu::Queue) {
-        let base = u64::from(bevox_render::pipeline::SUN_SLOTS) * 3 * 4;
+        let base = u64::from(self.sun_slots) * 3 * 4;
         let words = self.width * self.height * bevox_render::pipeline::SUN_PIXEL_WORDS;
         let bytes = vec![0xFFu8; words as usize * 4];
         queue.write_buffer(&self.sun_table_buffer, base, &bytes);
@@ -888,7 +940,7 @@ impl Prepared {
 
     /// Dispatches once and reads back what the sun store holds.
     pub fn sun_store(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> SunStore {
-        let slots = bevox_render::pipeline::SUN_SLOTS;
+        let slots = self.sun_slots;
         self.dispatch(device, queue);
         device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
 

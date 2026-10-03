@@ -319,6 +319,219 @@ fn close_camera(tree: &bevox_core::contree::Contree, extent: u32) -> (Vec3, Mat4
     (close, (projection * view).inverse())
 }
 
+/// Far enough that a voxel covers about one pixel, looking along the floor so
+/// the frame is terrain rather than sky.
+///
+/// **This is the worst case for the sun store and the reason it exists as a
+/// camera.** The store's whole win is redundancy -- `bench_camera` has 9.22
+/// pixels sharing one voxel face's answer at 1080p -- and a voxel that covers
+/// one pixel has none to share. Every insert, every compaction entry, every
+/// per-pixel record and every extra read in the composite is then paid for a
+/// cache that is never hit twice.
+///
+/// At 1024 voxels a vertical field of 0.9 rad over 1080 rows gives 8.33e-4 rad
+/// a pixel, so a voxel subtends about a pixel at 1200 voxels' distance. The eye
+/// is high and near one edge, aimed down-range at the far edge of the floor, so
+/// the whole frame is floor at 800 to 1200 voxels rather than half sky. At 720p
+/// the same camera is harsher still -- 1.25e-3 rad a pixel, so a voxel covers
+/// about two thirds of one -- which is why the factor is reported per
+/// resolution rather than asserted as a constant.
+fn distant_camera(extent: u32) -> (Vec3, Mat4) {
+    let e = extent as f32;
+    let eye = Vec3::new(e * 0.5, e * 0.68, e * 0.04);
+    let target = Vec3::new(e * 0.5, 2.0, e);
+    let view = Mat4::look_at_rh(Vec3::ZERO, target - eye, Vec3::Y);
+    let projection = Mat4::perspective_rh(0.9, 1280.0 / 720.0, 0.1, e * 8.0);
+    (eye, (projection * view).inverse())
+}
+
+/// `march.wgsl` as some earlier revision wrote it, for an A/B/A across two
+/// source files rather than within one module.
+///
+/// Measuring the new path against `march` inside the *same* module flatters it:
+/// splitting the pass cost the byte-for-byte unedited `march` up to +0.67 ms at
+/// 1080p, measured in Task 2, so the in-module A side carries a penalty the
+/// shipped shader before this work did not. See
+/// `docs/concepts/gpu-codegen-cliff.md` -- the driver compiles the whole module
+/// and what it does with register pressure is not visible from the source.
+///
+/// Returns None rather than failing when git cannot answer, so a checkout
+/// without history still runs the rest of the suite.
+fn shader_at(revision: &str) -> Option<String> {
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let spec = format!("{revision}:crates/bevox_render/assets/shaders/march.wgsl");
+    let out = std::process::Command::new("git")
+        .args(["show", &spec])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+/// **The worst case: distant geometry, where there is no redundancy to
+/// collect.** The gate is that the four-pass path must not be SLOWER here.
+///
+/// Two baselines, because they answer different questions and differ by the
+/// store's own overhead:
+///
+/// - `34f2d45`, the revision before any of this work, whose shader has no store
+///   at all. This is "against doing nothing", which is the honest gate.
+/// - `4560d58`, this branch's parent, which inserts into the store and reads it
+///   nowhere. It already pays about +0.4 ms at 1080p on the bench camera, so an
+///   A side taken here flatters the four passes by roughly that much.
+///
+/// The redundancy factor for this camera is reported first, because a gate on a
+/// camera that turned out to have redundancy left would prove nothing. Near 1
+/// is what makes the measurement below worst-case.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench worst_case --
+/// --ignored --nocapture`.
+#[test]
+#[ignore]
+fn the_worst_case_is_measured_against_the_parent() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    if !timestamps_supported(&device) {
+        eprintln!("adapter has no TIMESTAMP_QUERY, skipping");
+        return;
+    }
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = distant_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
+        let build = |source: &str, entry: &str| {
+            Prepared::new(
+                &device, source, entry, &tree, offset_from_clip, eye, w, h,
+                march_flags::DEFAULT, &[],
+            )
+        };
+
+        let probe = build(&shader, "march");
+        probe.clear_sun_pixel_slots(&queue);
+        let store = probe.sun_store(&device, &queue);
+        let redundancy = store.pixels_with_slot as f64 / store.distinct_keys.max(1) as f64;
+        println!(
+            "\n{w}x{h} distant camera: {} of {} pixels inserted, {} distinct faces\n  \
+             REDUNDANCY {redundancy:.2} pixels per distinct face \
+             (bench_camera is 5.16 at 720p and 9.22 at 1080p)",
+            store.pixels_with_slot,
+            w * h,
+            store.distinct_keys,
+        );
+
+        let split = build(&shader, "march_composite");
+        let single = build(&shader, "march");
+        let one = pass_times(&device, &queue, &single);
+        let four = pass_times(&device, &queue, &split);
+        println!(
+            "  per pass, GPU ms, median of 7:\n    \
+             one:  beam {:.2} + march {:.2} = {:.2}\n    \
+             four: beam {:.2} + primary {:.2} + compact {:.2} + sun {:.2} + composite {:.2} \
+             = {:.2}\n    \
+             the sun pass marches {} rays where the per-pixel path marches {}\n    \
+             {:.1} ns a ray in the sun pass against {:.1} ns in the primary it was taken out \
+             of, so the store does not break even below {:.2} pixels a face before its own \
+             overhead is counted",
+            one[0], one[4], one.iter().sum::<f32>(),
+            four[0], four[1], four[2], four[3], four[4], four.iter().sum::<f32>(),
+            store.distinct_keys, store.pixels_with_slot,
+            four[3] * 1.0e6 / store.distinct_keys.max(1) as f32,
+            (one[4] - four[1]) * 1.0e6 / store.pixels_with_slot.max(1) as f32,
+            (four[3] / store.distinct_keys.max(1) as f32)
+                / ((one[4] - four[1]) / store.pixels_with_slot.max(1) as f32),
+        );
+        for revision in ["34f2d45", "4560d58"] {
+            let Some(parent) = shader_at(revision) else {
+                eprintln!("  git could not produce {revision}'s shader, skipping that baseline");
+                continue;
+            };
+            let base = build(&parent, "march");
+            let (text, wall, gpu) = row_text(aba_both(&device, &queue, &base, &split));
+            println!("  four passes against {revision}'s single pass:\n    {text}");
+            println!(
+                "    at {redundancy:.2} pixels a face the split is {:+.2} ms on the GPU clock \
+                 ({:+.2} wall); positive is SLOWER and is the gate",
+                gpu, wall,
+            );
+        }
+    }
+}
+
+/// **The overflow fallback, gated by actually overflowing the table.**
+///
+/// A pixel whose insert spends all `SUN_PROBES` probes carries `SUN_NO_SLOT`
+/// and marches its own shadow ray in the composite, which is the same fallback
+/// a key mismatch takes. Task 2 exercised it incidentally through a key-break;
+/// this fills the table instead, which is the condition the spec names.
+///
+/// The slot count travels in the uniform, so this shrinks it without editing
+/// one byte of the shader and without a smaller buffer -- what is compared is
+/// one compiled module against itself, with no codegen cliff in the way.
+///
+/// What it reports: how many pixels came away with a slot at each capacity, so
+/// the capacity at which inserts genuinely start failing is read off rather
+/// than assumed, and what the frame costs there.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench overflow --
+/// --ignored --nocapture`.
+#[test]
+#[ignore]
+fn shrinking_the_table_until_it_overflows_is_measured() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    if !timestamps_supported(&device) {
+        eprintln!("adapter has no TIMESTAMP_QUERY, skipping");
+        return;
+    }
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
+        let build = |entry: &str, slots: u32| {
+            Prepared::with_workgroup_and_slots(
+                &device, &shader, entry, &tree, offset_from_clip, eye, w, h,
+                march_flags::DEFAULT, &[], 8, slots,
+            )
+        };
+        println!("\n{w}x{h} as the table shrinks:");
+        let mut full = 0usize;
+        for power in (14u32..=21).rev() {
+            let slots = 1u32 << power;
+            let p = build("march", slots);
+            p.clear_sun_pixel_slots(&queue);
+            let store = p.sun_store(&device, &queue);
+            if power == 21 {
+                full = store.pixels_with_slot;
+            }
+            println!(
+                "  2^{power} = {slots:>9} slots: {:>7} pixels got one of {full} ({:>5.1}% gave \
+                 up and marched their own ray), {:>6} distinct faces, load {:.2}",
+                store.pixels_with_slot,
+                (full.saturating_sub(store.pixels_with_slot)) as f64 / full.max(1) as f64 * 100.0,
+                store.distinct_keys,
+                store.distinct_keys as f64 / f64::from(slots),
+            );
+        }
+        for power in [16u32, 14] {
+            let slots = 1u32 << power;
+            let a = build("march_composite", bevox_render::pipeline::SUN_SLOTS);
+            let b = build("march_composite", slots);
+            let (text, _, gpu) = row_text(aba_both(&device, &queue, &a, &b));
+            println!("  2^{power} slots against 2^21, four passes both sides:\n    {text}");
+            println!("    overflowing to 2^{power} costs {gpu:+.2} ms on the GPU clock");
+        }
+    }
+}
+
 /// What an edit actually costs: the CPU rewrite, and the bytes it uploads.
 ///
 /// The claim this milestone makes is "editing without full re-upload", and the
@@ -1899,21 +2112,122 @@ fn the_split_pass_changes_no_pixel() {
         return;
     };
     let (tree, extent) = bench_scene();
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let cube = body_cube();
+
+    // Both cameras, because they exercise different halves of the key. The
+    // bench camera is close, where one face covers nine pixels and the store is
+    // read back far more often than it is written. The distant one covers about
+    // one pixel a face, which is four times as many distinct keys at 1080p and
+    // so four times as much of the table -- and the nearest thing this suite
+    // has to the aliasing case, where neighbouring pixels land on faces that
+    // are neighbours in space and nothing alike in the hash.
+    for (where_from, (eye, offset_from_clip)) in
+        [("bench camera", bench_camera(extent)), ("distant camera", distant_camera(extent))]
+    {
+        let bodies = bench_bodies(eye, 120.0, &cube, 33.0);
+        for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
+            for (what, placed) in [("no bodies", &[][..]), ("sixteen bodies", &bodies[..])] {
+                let build = |entry: &str| {
+                    Prepared::new(
+                        &device, &shader, entry, &tree, offset_from_clip, eye, w, h,
+                        march_flags::DEFAULT, placed,
+                    )
+                };
+                let before = build("march").read_back(&device, &queue);
+                let after = build("march_composite").read_back(&device, &queue);
+                let differing = before
+                    .chunks_exact(4)
+                    .zip(after.chunks_exact(4))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert_eq!(
+                    differing, 0,
+                    "{where_from} {w}x{h}, {what}: the split pass moved {differing} pixels of \
+                     {}; the key does not identify what the shadow ray depends on",
+                    w * h,
+                );
+            }
+        }
+    }
+}
+
+/// **The overflow fallback's image gate: a table far too small to hold the
+/// scene draws the same picture.**
+///
+/// The B side is told the store has 2^14 slots for a view whose distinct voxel
+/// faces number six figures, so the overwhelming majority of inserts spend
+/// every probe and return `SUN_NO_SLOT`, and the pixels that do get a slot
+/// mostly share it with another voxel's key. Both the give-up and the key
+/// mismatch land in the composite's fallback, which marches the pixel's own
+/// shadow ray, and the image may not move by one pixel.
+///
+/// This is the spec's overflow path gated by overflowing, rather than by
+/// argument. Task 2 reached the same branch through a key break, which proved
+/// the fallback is bit-identical but not that the table filling is what
+/// reaches it.
+///
+/// No shader edit: the slot count travels in the uniform, so both sides are one
+/// compiled module and the comparison cannot be a codegen difference in
+/// disguise -- see `docs/concepts/gpu-codegen-cliff.md`.
+///
+/// `shrinking_the_table_until_it_overflows_is_measured` is the same condition
+/// with the occupancy and the frame time.
+///
+/// Not ignored.
+#[test]
+fn overflowing_the_table_changes_no_pixel() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (tree, extent) = bench_scene();
     let (eye, offset_from_clip) = bench_camera(extent);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
     let cube = body_cube();
     let bodies = bench_bodies(eye, 120.0, &cube, 33.0);
+    /// Slots the overflowing side is given: four orders of magnitude below the
+    /// distinct faces either resolution produces, so inserts fail in bulk
+    /// rather than at the margin.
+    const SMALL: u32 = 1 << 14;
 
     for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
         for (what, placed) in [("no bodies", &[][..]), ("sixteen bodies", &bodies[..])] {
-            let build = |entry: &str| {
-                Prepared::new(
+            let build = |entry: &str, slots: u32| {
+                Prepared::with_workgroup_and_slots(
                     &device, &shader, entry, &tree, offset_from_clip, eye, w, h,
-                    march_flags::DEFAULT, placed,
+                    march_flags::DEFAULT, placed, 8, slots,
                 )
             };
-            let before = build("march").read_back(&device, &queue);
-            let after = build("march_composite").read_back(&device, &queue);
+            // One configuration alive at a time. Each holds a sun table of
+            // `SUN_SLOTS * 4 + pixels * 7` words -- about 91 MB at 1080p -- and
+            // this suite runs its GPU tests in parallel on a 4 GB card, so
+            // three live `Prepared` here is an out-of-memory failure in every
+            // other test as well as this one.
+            //
+            // The A side is the per-pixel path, which never reads the store, so
+            // it is the same image at any capacity. The same configuration
+            // gives the roomy occupancy, because the overflow has to be shown
+            // to happen -- a bit-identity gate on a table that was never full
+            // proves nothing.
+            let (before, roomy) = {
+                let full = build("march", bevox_render::pipeline::SUN_SLOTS);
+                full.clear_sun_pixel_slots(&queue);
+                let roomy = full.sun_store(&device, &queue).pixels_with_slot;
+                (full.read_back(&device, &queue), roomy)
+            };
+            let cramped = {
+                let probe = build("march", SMALL);
+                probe.clear_sun_pixel_slots(&queue);
+                probe.sun_store(&device, &queue).pixels_with_slot
+            };
+            assert!(
+                cramped * 2 < roomy,
+                "{w}x{h}, {what}: {cramped} of {roomy} pixels still got a slot at {SMALL} \
+                 slots, so the table did not overflow and this gate proves nothing",
+            );
+
+            let after = build("march_composite", SMALL).read_back(&device, &queue);
             let differing = before
                 .chunks_exact(4)
                 .zip(after.chunks_exact(4))
@@ -1921,8 +2235,8 @@ fn the_split_pass_changes_no_pixel() {
                 .count();
             assert_eq!(
                 differing, 0,
-                "{w}x{h}, {what}: the split pass moved {differing} pixels of {}; the key does \
-                 not identify what the shadow ray depends on",
+                "{w}x{h}, {what}: with the table overflowing ({cramped} of {roomy} pixels got a \
+                 slot) {differing} pixels of {} moved; the fallback is not bit-identical",
                 w * h,
             );
         }
