@@ -129,10 +129,12 @@ bit-identical — or, for a feature, once its cost has been accepted knowingly.
 | `WORKGROUP` | 8 | Compute threads per axis. |
 | `BEAM_SCALE` | 8 | Full-resolution pixels per beam sample, per axis. Must match the shader's own copy. |
 | `BEAM_CAPACITY` | 518 400 | Coarse pixels the beam buffer holds — enough for 7680x4320, so it is sized once and never resized. |
-| `MARCH_BINDING_COUNT` | 10 | Bindings the shader declares, and so the number the layout must contain. A gate, because a mismatch is not a compile error. |
-| `STORAGE_BUFFERS_DECLARED` | 8 | How many of those are storage buffers — the one budget that has ever been binding. |
+| `MARCH_BINDING_COUNT` | 12 | Bindings the shader declares, and so the number the layout must contain. A gate, because a mismatch is not a compile error. |
+| `STORAGE_BUFFERS_DECLARED` | 10 | How many of those are storage buffers — the one budget that has ever been binding. |
 | `SHADER_PATH` | `shaders/march.wgsl` | Loaded at run time, which is what makes A/B/A of two shader sources possible. |
 | `SUN_DIRECTION` | (0.4, 1, 0.25) | Where the sun is, shared by the renderer and the parity tests. |
+| `SUN_SLOTS` | 2 097 152 | Slots in the per-voxel sun store, a power of two so a probe masks. More than 1080p has pixels, and a measured 118 215 distinct voxel faces fill 18% of it — the duplicate inserts, not the faces, are what load it. |
+| `SUN_PIXEL_CAPACITY` | 8 294 400 | Pixels the store's per-pixel slot region holds, 3840x2160. Sized for a window rather than resized with one, as the beam buffer is; a pixel past it writes nothing. |
 
 # Read next
 

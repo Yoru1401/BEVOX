@@ -38,12 +38,47 @@ pub const BEAM_CAPACITY: u32 = (7680 / BEAM_SCALE) * (4320 / BEAM_SCALE);
 /// compile error and no parity test catches it -- the test harness builds its
 /// own layout, so it kept passing while the app could not create its pipeline
 /// at all. `the_layout_declares_every_binding_the_shader_uses` is the gate.
-pub const MARCH_BINDING_COUNT: usize = 10;
+pub const MARCH_BINDING_COUNT: usize = 12;
 
 /// How many of those bindings are storage buffers, which is the one budget that
 /// has ever been binding. Kept beside `MARCH_BINDING_COUNT` so adding a storage
 /// binding has to touch both.
-pub const STORAGE_BUFFERS_DECLARED: u32 = 8;
+pub const STORAGE_BUFFERS_DECLARED: u32 = 10;
+
+/// Slots in the per-voxel sun visibility store.
+///
+/// A power of two, so a probe wraps with a mask rather than a modulo. 2^21 is
+/// 2,097,152, which is more slots than 1920x1080 has pixels -- and the number of
+/// distinct visible voxel faces cannot exceed the number of pixels, so the table
+/// cannot structurally fill. In practice it is a fraction of that: the occupancy
+/// is reported by `the_sun_store_occupancy_is_reported` in `tests/gpu_bench.rs`,
+/// and shrinking this to fit the measured number is a later task's job, not a
+/// guess made now.
+///
+/// 8 MB of claim words and 25 MB of keys and visibility bits, with the
+/// per-pixel region past them taking the one binding to 58 MB in all.
+pub const SUN_SLOTS: u32 = 1 << 21;
+
+/// Pixels the store's per-pixel slot region holds.
+///
+/// 3840x2160. Sized for a window rather than resized with one, the way the beam
+/// buffer is: these buffers are built with the scene and the window is not. A
+/// pixel past it writes nothing -- the shader checks -- so a larger window
+/// renders correctly and loses only the saving.
+pub const SUN_PIXEL_CAPACITY: u32 = 3840 * 2160;
+
+/// Words in `sun_claims`: one stamp per slot.
+pub const fn sun_claim_words() -> u32 {
+    SUN_SLOTS
+}
+
+/// Words in `sun_table`: two key words and one visibility word per slot, then
+/// one slot index per pixel. The regions ride behind one binding at offsets the
+/// shader derives from `SUN_SLOTS`, the way the fullness grid rides behind the
+/// distance field.
+pub const fn sun_table_words() -> u32 {
+    SUN_SLOTS * 3 + SUN_PIXEL_CAPACITY
+}
 
 /// Voxel data budget on the GPU. Checked at upload; exceeding it is an error,
 /// never an allocation attempt.
@@ -76,8 +111,10 @@ pub const VOXEL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 /// integrated parts too, so the hardware floor barely moves.
 pub fn device_limits() -> WgpuLimits {
     WgpuLimits {
-        // Ten are declared today; sixteen leaves room for the grids that would
-        // otherwise be packed behind an offset.
+        // Ten storage buffers are declared today; sixteen leaves room for the
+        // grids that would otherwise be packed behind an offset. The sun store
+        // took two of the spare, which is what made it two bindings rather than
+        // another offset behind an existing one.
         max_storage_buffers_per_shader_stage: 16,
         // None are used yet. The fullness grid wants to become one, sampled,
         // so the texture unit does the trilinear blend.
@@ -247,6 +284,10 @@ pub struct MarchBuffers {
     pub bodies: Buffer,
     /// One `GpuBodyRect` per entry of `bodies`, in the same order.
     pub body_rects: Buffer,
+    /// Per-voxel sun visibility store: one frame stamp per slot.
+    pub sun_claims: Buffer,
+    /// The same store's keys, visibility bits and per-pixel slot indices.
+    pub sun_table: Buffer,
     pub built_from: BuiltFrom,
 }
 
@@ -301,6 +342,7 @@ pub fn frame_uniform(
     placed: &[GpuBody],
     flags: u32,
     size: UVec2,
+    sun_stamp: u32,
 ) -> (MarchUniform, Vec<GpuBody>, Vec<GpuBodyRect>, Vec<GpuBody>) {
     let (table, rects) =
         crate::cull::bodies_to_march(placed, &scene.body_local_bounds, camera, flags, size);
@@ -319,7 +361,7 @@ pub fn frame_uniform(
             casters.len() as u32,
             body_room(placed.len()) as u32,
         ],
-        ao_params: [scene.fullness_base, 0, 0, 0],
+        ao_params: [scene.fullness_base, SUN_SLOTS, sun_stamp, SUN_PIXEL_CAPACITY],
     };
     (uniform, table, rects, casters)
 }
@@ -355,10 +397,13 @@ pub fn init_march_pipeline(
             // Rigid bodies: array<GpuBody>, one element minimum.
             storage_buffer_read_only_sized(false, NonZero::new(size_of::<GpuBody>() as u64)),
             // Body screen rectangles: array<GpuBodyRect>, one element minimum.
-            // The compute stage's eighth storage buffer, and wgpu's default
-            // max_storage_buffers_per_shader_stage is 8: no room for another
-            // storage binding without raising the device limits.
             storage_buffer_read_only_sized(false, NonZero::new(size_of::<GpuBodyRect>() as u64)),
+            // Sun store claim words: array<atomic<u32>>, written by the march,
+            // so read_write.
+            storage_buffer_sized(false, NonZero::new(4)),
+            // Sun store keys, visibility bits and per-pixel slot indices:
+            // array<u32>, also written by the march.
+            storage_buffer_sized(false, NonZero::new(4)),
         ),
     );
 
@@ -408,10 +453,22 @@ pub fn prepare_march_buffers(
     existing: Option<Res<MarchBuffers>>,
     target: Option<Res<MarchTarget>>,
     images: Res<RenderAssets<GpuImage>>,
+    mut sun_stamp: Local<u32>,
 ) {
     let (Some(scene), Some(camera)) = (scene, camera) else {
         return;
     };
+    // This frame's stamp for the sun store, advanced once per prepared frame.
+    //
+    // Never 0: a zero-initialised claim word means "never used", so a stamp of
+    // 0 would read as free and as this frame's at once. On wrap the stamp
+    // returns to 1 rather than 0, which at 60 fps is 2.3 years away and would
+    // at worst let one stale entry read as fresh -- the key verification is
+    // what catches that, as it catches a collision.
+    *sun_stamp = sun_stamp.wrapping_add(1);
+    if *sun_stamp == 0 {
+        *sun_stamp = 1;
+    }
     // The rectangles are in the pixels of the texture `dispatch_march` binds,
     // which the shader measures with `textureDimensions`: read from that same
     // `GpuImage`, not from `MarchTarget`'s recorded size, which could lag it.
@@ -437,7 +494,7 @@ pub fn prepare_march_buffers(
         // the camera.
         let placed = update.as_deref().map_or(&scene.bodies, |u| &u.bodies);
         let (uniform_value, table, rects, casters) =
-            frame_uniform(&scene, &camera, placed, march_flags::DEFAULT, size);
+            frame_uniform(&scene, &camera, placed, march_flags::DEFAULT, size, *sun_stamp);
         queue.write_buffer(&buffers.uniform, 0, bytemuck::bytes_of(&uniform_value));
         if !table.is_empty() {
             queue.write_buffer(&buffers.bodies, 0, bytemuck::cast_slice(&table));
@@ -503,7 +560,7 @@ pub fn prepare_march_buffers(
     let mut voxel_bytes = bytemuck::cast_slice(&scene.voxels).to_vec();
     voxel_bytes.resize(voxel_word_capacity as usize * 4, 0);
     let (uniform_value, table, rects, casters) =
-        frame_uniform(&scene, &camera, &scene.bodies, march_flags::DEFAULT, size);
+        frame_uniform(&scene, &camera, &scene.bodies, march_flags::DEFAULT, size, *sun_stamp);
     let body_bytes = bytemuck::cast_slice(&body_buffer_contents(
         &table,
         &casters,
@@ -568,6 +625,22 @@ pub fn prepare_march_buffers(
             contents: &rect_bytes,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         }),
+        // Left zeroed, which is load-bearing: wgpu zero-initialises buffers and
+        // stamp 0 is "never used", so the first frame finds every slot free
+        // without a clear pass. No pass ever clears it -- an entry whose stamp
+        // is not this frame's is free.
+        sun_claims: device.create_buffer(&BufferDescriptor {
+            label: Some("bevox_sun_claims"),
+            size: u64::from(sun_claim_words()) * 4,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        }),
+        sun_table: device.create_buffer(&BufferDescriptor {
+            label: Some("bevox_sun_table"),
+            size: u64::from(sun_table_words()) * 4,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        }),
         built_from: BuiltFrom { generation: scene.generation, world_region: scene.world_region },
     });
 }
@@ -615,6 +688,8 @@ pub fn dispatch_march(
             buffers.field.as_entire_binding(),
             buffers.bodies.as_entire_binding(),
             buffers.body_rects.as_entire_binding(),
+            buffers.sun_claims.as_entire_binding(),
+            buffers.sun_table.as_entire_binding(),
         )),
     );
 
@@ -690,6 +765,27 @@ mod tests {
             bindings,
             (0..MARCH_BINDING_COUNT).collect::<Vec<_>>(),
             "march.wgsl declares bindings {bindings:?}, but the layout in              init_march_pipeline is built for {MARCH_BINDING_COUNT}. Add the missing              entry to the tuple and update MARCH_BINDING_COUNT together."
+        );
+    }
+
+    /// `sun_insert` wraps a probe with `& (slots - 1)`, which is the mask only
+    /// for a power of two. A capacity that is not one sends every probe past
+    /// the end of the table.
+    #[test]
+    fn the_sun_store_is_a_power_of_two() {
+        assert!(SUN_SLOTS.is_power_of_two(), "SUN_SLOTS is {SUN_SLOTS}, and the shader masks");
+    }
+
+    /// The number of distinct visible voxel faces cannot exceed the number of
+    /// pixels, so a table with more slots than the target has pixels cannot
+    /// structurally fill. Probe clustering can still refuse an insert, which is
+    /// a correctness-preserving fallback.
+    #[test]
+    fn the_sun_store_has_a_slot_for_every_pixel_at_1080p() {
+        assert!(
+            u64::from(SUN_SLOTS) >= 1920 * 1080,
+            "{SUN_SLOTS} slots for {} pixels",
+            1920 * 1080,
         );
     }
 
@@ -839,7 +935,7 @@ mod tests {
         let bodies = vec![ahead; MAX_BODIES + 1];
         let scene = GpuSceneData { body_local_bounds: vec![Some(cube); bodies.len()], ..default() };
         let (uniform, table, _, _) =
-            frame_uniform(&scene, &camera, &bodies, march_flags::DEFAULT, UVec2::new(160, 90));
+            frame_uniform(&scene, &camera, &bodies, march_flags::DEFAULT, UVec2::new(160, 90), 1);
         // Every body is in view, so whether or not `DEFAULT` culls, only the
         // cap can stop the count short of them all.
         assert_eq!(table.len(), bodies.len(), "a body in view was culled; this case no longer reaches past the cap");
@@ -856,7 +952,7 @@ mod tests {
         let cull = march_flags::DEFAULT | march_flags::CULL_BODIES;
 
         let size = UVec2::new(160, 90);
-        let (uniform, table, rects, _) = frame_uniform(&scene, &camera, &[behind], cull, size);
+        let (uniform, table, rects, _) = frame_uniform(&scene, &camera, &[behind], cull, size, 1);
         assert!(table.is_empty(), "a body behind the camera was kept");
         assert_eq!(uniform.volume_params[3], 0, "the count includes a body the cull removed");
         assert!(rects.is_empty(), "a rectangle was kept for a body the cull removed");
@@ -866,7 +962,7 @@ mod tests {
         // marched slot would go to a body the cull then drops, and nothing would
         // be drawn; capped after it, the cap's worth of bodies ahead are.
         let placed = [vec![behind; MAX_BODIES], vec![ahead; MAX_BODIES + 1]].concat();
-        let (uniform, table, rects, _) = frame_uniform(&scene, &camera, &placed, cull, size);
+        let (uniform, table, rects, _) = frame_uniform(&scene, &camera, &placed, cull, size, 1);
         let kept = vec![ahead; MAX_BODIES + 1];
         assert_eq!(bytemuck::cast_slice::<GpuBody, u8>(&table), bytemuck::cast_slice::<GpuBody, u8>(&kept));
         let own =
@@ -886,7 +982,7 @@ mod tests {
         let cull = march_flags::DEFAULT | march_flags::CULL_BODIES;
         let size = UVec2::new(160, 90);
 
-        let (uniform, table, _, casters) = frame_uniform(&scene, &camera, &[behind, ahead], cull, size);
+        let (uniform, table, _, casters) = frame_uniform(&scene, &camera, &[behind, ahead], cull, size, 1);
         assert_eq!(table.len(), 1, "the cull no longer drops the body behind the camera");
         let placements = |b: &[GpuBody]| b.iter().map(|g| g.local_from_world).collect::<Vec<_>>();
         assert_eq!(placements(&casters), placements(&[behind, ahead]), "a body the cull dropped casts no shadow");
@@ -898,7 +994,7 @@ mod tests {
         assert_eq!(uniform.field_params[3], 2, "the casters do not start past the table's room");
 
         let placed = vec![behind; 2 * MAX_BODIES + 1];
-        let (uniform, _, _, casters) = frame_uniform(&scene, &camera, &placed, cull, size);
+        let (uniform, _, _, casters) = frame_uniform(&scene, &camera, &placed, cull, size, 1);
         assert_eq!(casters.len(), MAX_BODIES, "the casters are not capped");
         assert_eq!(uniform.field_params[2], MAX_BODIES as u32);
         assert_eq!(uniform.field_params[3], placed.len() as u32);
@@ -910,7 +1006,7 @@ mod tests {
 
         // A body with no voxels has nothing to cast.
         let empty = GpuSceneData { body_local_bounds: vec![None, Some(cube)], ..default() };
-        let (uniform, _, _, casters) = frame_uniform(&empty, &camera, &[behind, ahead], cull, size);
+        let (uniform, _, _, casters) = frame_uniform(&empty, &camera, &[behind, ahead], cull, size, 1);
         assert_eq!(placements(&casters), placements(&[ahead]));
         assert_eq!(uniform.field_params[2], 1);
     }

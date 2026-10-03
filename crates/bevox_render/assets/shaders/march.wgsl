@@ -69,6 +69,39 @@ var<private> hit_body: u32;
 struct GpuBodyRect { min: vec2<u32>, max: vec2<u32> };
 @group(0) @binding(9) var<storage, read> body_rects: array<GpuBodyRect>;
 
+// Sun visibility store, claim words: one frame stamp per slot.
+//
+// Atomic because every pixel covering the same voxel face races to claim the
+// same slot. Core WGSL has `atomic<u32>` and `atomic<i32>` and nothing wider,
+// and the key is 39 bits, so the key itself cannot be the atomic: the stamp is
+// claimed here with a compare-exchange and the full key is written to
+// `sun_table` after, to be verified by whoever reads it.
+//
+// Stamped, never cleared. A slot whose stamp is not this frame's is free, so no
+// pass has to walk the table to empty it -- a clear would give back part of what
+// the store is for. Stamp 0 is "never used", which is what the zero-initialised
+// buffer starts as, so `sun_stamp` is never 0.
+@group(0) @binding(10) var<storage, read_write> sun_claims: array<atomic<u32>>;
+// The rest of the store, three regions behind one binding the way the fullness
+// grid rides behind the distance field: `slots` key pairs (lo, hi), then
+// `slots` visibility words, then one slot index per pixel.
+//
+// The visibility words are written by nobody in this revision and the slot
+// indices are read by nobody. This revision pays the store's whole cost and
+// collects none of its benefit, deliberately: that is the only way to measure
+// the overhead on its own.
+@group(0) @binding(11) var<storage, read_write> sun_table: array<u32>;
+
+/// Slots an insert probes before it gives up.
+///
+/// Giving up is correct, not a failure: the pixel marches its own shadow ray,
+/// which is what every pixel does today. Only the saving degrades.
+const SUN_PROBES: u32 = 8u;
+/// No slot: what an insert returns when it gave up, and what a pixel with no
+/// usable entry carries. Not a valid index, so a reader cannot mistake it for
+/// slot 0.
+const SUN_NO_SLOT: u32 = 0xFFFFFFFFu;
+
 const BRICK_EDGE: u32 = 4u;
 const CHILDREN: u32 = 64u;
 const MAX_STEPS: u32 = 4096u;
@@ -1116,6 +1149,126 @@ fn shadow_origin(hit: Hit, id: vec3<u32>, size: vec2<u32>) -> vec3<f32> {
     return vec3<f32>(hit.voxel) + vec3<f32>(0.5) + hit.face_normal * 0.75;
 }
 
+/// How many slots the store holds. A power of two, so a probe wraps with a mask
+/// rather than a modulo.
+fn sun_slots() -> u32 { return view.ao_params.y; }
+/// This frame's stamp. Never 0: 0 is a slot that was never used.
+fn sun_stamp() -> u32 { return view.ao_params.z; }
+/// Pixels the per-pixel slot region holds, so a window past it writes nothing
+/// rather than off the end of the buffer.
+fn sun_pixels() -> u32 { return view.ao_params.w; }
+/// Where the visibility bits start inside `sun_table`: past the key pairs.
+fn sun_vis_base() -> u32 { return sun_slots() * 2u; }
+/// Where the per-pixel slot indices start: past the keys and the bits.
+fn sun_pixel_base() -> u32 { return sun_slots() * 3u; }
+
+/// Which of the six faces a hit's face normal names, 0..5 as axis * 2 + sign.
+///
+/// The face is part of the key and not an afterthought: `shadow_origin` offsets
+/// along the FACE normal, so one voxel has six origins and six answers. Keying
+/// on the voxel alone would hand a lit face the shadowed face's bit.
+///
+/// The static world's face normal is axis-aligned with exactly one component at
+/// +/-1, so the axis is read off the two tests and the sign off the sum.
+fn sun_face(face_normal: vec3<f32>) -> u32 {
+    let a = abs(face_normal);
+    let axis = select(select(0u, 2u, a.z > 0.5), 1u, a.y > 0.5);
+    let positive = (face_normal.x + face_normal.y + face_normal.z) > 0.0;
+    return axis * 2u + u32(positive);
+}
+
+/// The low word of the key: x, y and the low byte of z.
+///
+/// 12 bits an axis covers `MAX_EXTENT` 4096 exactly, and 3 for the face makes 39
+/// -- past what one atomic word holds, which is why the key lives outside the
+/// atomic and is verified on read.
+fn sun_key_lo(voxel: vec3<u32>) -> u32 {
+    return (voxel.x & 0xFFFu) | ((voxel.y & 0xFFFu) << 12u) | ((voxel.z & 0xFFu) << 24u);
+}
+
+/// The high word: the top 4 bits of z, then the face.
+fn sun_key_hi(voxel: vec3<u32>, face: u32) -> u32 {
+    return ((voxel.z >> 8u) & 0xFu) | (face << 4u);
+}
+
+/// A slot for a key. Two rounds of an integer finaliser over both words: the key
+/// is dense in x and y, and the low bits of a position would otherwise send
+/// whole scanlines down one probe chain.
+fn sun_hash(lo: u32, hi: u32) -> u32 {
+    var h = lo ^ (hi * 0x9E3779B9u);
+    h ^= h >> 16u;
+    h *= 0x7FEB352Du;
+    h ^= h >> 15u;
+    h *= 0x846CA68Bu;
+    h ^= h >> 16u;
+    return h;
+}
+
+/// Claims a slot for this hit's (voxel, face) and returns it, or `SUN_NO_SLOT`.
+///
+/// Claim with a compare-exchange on the stamp, write the full key after, verify
+/// the full key on any later read. The verification is not belt and braces: the
+/// hash folds 39 bits into 21, so two different voxel faces sharing a slot is
+/// the normal case and not a rare one, and the stored key is the only thing that
+/// tells them apart. Probe linearly on collision.
+///
+/// A loser of the race re-examines the same slot rather than advancing, so it
+/// sees the winner's stamp on the next turn and compares keys there.
+///
+/// The key write is not ordered against another invocation's read of the stamp,
+/// so a racing inserter can see this frame's stamp beside a key left by an
+/// earlier frame. It then compares keys and either probes on -- a second slot
+/// for the same face, which costs capacity and no correctness -- or, if that
+/// stale key happens to equal its own, settles on a slot whose key the winner
+/// then overwrites. That slot's key no longer matches the face that returned it,
+/// which is exactly what the read-side verification catches: the pixel marches
+/// its own ray. Wrong pixels are not reachable through it.
+///
+/// A body hit gets no slot. Its `voxel` is a coordinate in the body's own
+/// volume and means nothing against the static grid, so keying it would alias
+/// two bodies and the terrain onto one answer. Bodies keep the per-pixel path.
+fn sun_insert(hit: Hit) -> u32 {
+    if hit.from_body {
+        return SUN_NO_SLOT;
+    }
+    let mask = sun_slots() - 1u;
+    let stamp = sun_stamp();
+    let lo = sun_key_lo(hit.voxel);
+    let hi = sun_key_hi(hit.voxel, sun_face(hit.face_normal));
+    var slot = sun_hash(lo, hi) & mask;
+    for (var probe = 0u; probe < SUN_PROBES; probe = probe + 1u) {
+        let held = atomicLoad(&sun_claims[slot]);
+        if held == stamp {
+            // Taken this frame. Ours only if the full key says so.
+            if sun_table[slot * 2u] == lo && sun_table[slot * 2u + 1u] == hi {
+                return slot;
+            }
+            slot = (slot + 1u) & mask;
+            continue;
+        }
+        let claimed = atomicCompareExchangeWeak(&sun_claims[slot], held, stamp);
+        if claimed.exchanged {
+            sun_table[slot * 2u] = lo;
+            sun_table[slot * 2u + 1u] = hi;
+            return slot;
+        }
+    }
+    return SUN_NO_SLOT;
+}
+
+/// Inserts this hit and records the slot for this pixel.
+///
+/// Only on a hit: a sky pixel has no face, and a reader of the per-pixel region
+/// reads it only where there was one, so leaving last frame's index there costs
+/// nothing and a write for every pixel would not be free.
+fn sun_remember(hit: Hit, id: vec3<u32>, size: vec2<u32>) {
+    let slot = sun_insert(hit);
+    let pixel = id.y * size.x + id.x;
+    if pixel < sun_pixels() {
+        sun_table[sun_pixel_base() + pixel] = slot;
+    }
+}
+
 /// Shadow flag in red: 255 shadowed, 0 lit.
 @compute @workgroup_size(8, 8, 1)
 fn march_shadow(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -1315,6 +1468,12 @@ fn march(@builtin(global_invocation_id) id: vec3<u32>) {
     if hit.hit {
         let n = shading_normal(hit);
         let sun = view.sun_direction.xyz;
+
+        // The store, written here and read by nothing. Shading still marches
+        // its own shadow ray, below, exactly as before: this revision is a
+        // deliberate regression that isolates the store's own overhead, which
+        // is the one number that cannot be measured once anything reads it.
+        sun_remember(hit, id, size);
 
         let origin = shadow_origin(hit, id, size);
         var diffuse = max(dot(n, sun), 0.0) * 0.75;

@@ -40,6 +40,7 @@ lifted out of the plan that produced it.
 * [An inference is not an observation](concepts/an-inference-is-not-an-observation.md) - a claim about behaviour names the code that makes it true, because no gate can read prose.
 * [The body cap, and what a body costs](concepts/body-cap.md) - 0.629 ms per visible body, and why MAX_BODIES is 16.
 * [The frame budget, and where it goes](concepts/frame-budget.md) - sixteen bodies with shadows take 22.6 ms against 16.7.
+* [Seven pixels a voxel face, and three slots a face](concepts/sun-store-occupancy.md) - the sun answer is recomputed 7.5 times a face at 1080p, and a lockstep insert claims 3.2 slots for each.
 * [Nine steps a ray, so the walk is not the cost](concepts/nine-steps-a-ray.md) - a primary ray takes nine steps, so the static march is bound by what a step costs, not how many.
 * [Solver convergence is a setting, and the spec reached for the wrong one](concepts/solver-convergence-is-a-setting.md) - raising the biased count alone bought no stability on a 240:1 load, and the design cannot separate convergence from the bias:relax ratio; both counts stay at 1.
 * [Both coarse grids ride in one storage buffer](concepts/coarse-grids-share-one-buffer.md) *(premise corrected)* - eight was wgpu's browser baseline, not the hardware's limit; the adapter allows 524,288.

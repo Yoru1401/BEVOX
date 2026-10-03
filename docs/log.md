@@ -1,6 +1,15 @@
 # Update Log
 
 ## 2026-10-03
+* **Measurement**: [seven pixels a voxel face, and three slots a face](concepts/sun-store-occupancy.md).
+  The sun answer is recomputed **7.50 times a distinct voxel face at 1080p**, so
+  the redundancy the per-voxel sun store is built to collect is there — and the
+  store, written and read by nothing, costs only about **0.9 ms of the 8.36 ms
+  ceiling**. But the insert claims **3.20 slots a face**: the 39-bit key is
+  written after the compare-exchange that claims the stamp, and a workgroup's
+  lanes read it at the instruction step the winner writes it, so each face takes
+  several slots. Correct, and it would leave a pass dispatched over occupied
+  slots collecting 2.33 pixels an answer instead of 7.50.
 * **Measurement**: **the sun shadow march is a third of the frame** — 7.98 and
   8.36 ms of 26 at 1920x1080 (31%), 4.67 and 4.82 of 13.5 at 720p (33%), two runs
   each, interleaved. And the static march scales **sublinearly**: 1.90-1.94x the

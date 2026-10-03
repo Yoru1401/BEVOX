@@ -218,6 +218,14 @@ pub fn read_texture(
 /// Full-resolution pixels per beam sample, per axis. Must match BEAM_SCALE.
 pub const BEAM_SCALE: u32 = 8;
 
+/// The sun store's frame stamp in the harness: one fixed non-zero value.
+///
+/// The app advances a stamp per frame so a slot from the last frame reads as
+/// free; a harness dispatches the same frame over and over, so a fixed stamp is
+/// that frame. Not 0, which means "never used" -- with 0 the store would read as
+/// both free and claimed at once.
+pub const SUN_STAMP: u32 = 1;
+
 pub struct Prepared {
     /// Threads per axis in the shader's `@workgroup_size`, so the dispatch can
     /// match it. Eight for every caller but the workgroup bench, which rewrites
@@ -247,6 +255,8 @@ pub struct Prepared {
     /// The rectangles uploaded, one per marched body, in table order.
     pub body_rects: Vec<GpuBodyRect>,
     body_rect_buffer: wgpu::Buffer,
+    sun_claims_buffer: wgpu::Buffer,
+    sun_table_buffer: wgpu::Buffer,
     width: u32,
     height: u32,
 }
@@ -359,7 +369,12 @@ impl Prepared {
                 casters.len() as u32,
                 room as u32,
             ],
-            ao_params: [bevox_render::upload::field_words(&field), 0, 0, 0],
+            ao_params: [
+                bevox_render::upload::field_words(&field),
+                bevox_render::pipeline::SUN_SLOTS,
+                SUN_STAMP,
+                width * height,
+            ],
         };
 
         // Root first, arena shifted by one: the layout the shader indexes.
@@ -425,6 +440,26 @@ impl Prepared {
             contents: bytemuck::cast_slice(&field_words),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        // The sun store. Sized from SUN_SLOTS as the app sizes it, but the
+        // per-pixel region is this target's pixels rather than the app's fixed
+        // capacity: the harness knows the size it is about to render, and a
+        // readback of a 33 MB region nobody wrote is time spent for nothing.
+        // COPY_SRC, so a test can read the occupancy back.
+        let sun_claims_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sun_claims"),
+            size: u64::from(bevox_render::pipeline::SUN_SLOTS) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let sun_table_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sun_table"),
+            size: u64::from(bevox_render::pipeline::SUN_SLOTS * 3 + width * height) * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Sized for every packed body, as the app sizes it, with the culled
         // table at the front and zeroes after. A zero-length storage buffer is
         // invalid, so a body-free scene still uploads room for one zeroed
@@ -478,6 +513,26 @@ impl Prepared {
                     count: None,
                 },
                 storage_entry(5, 8),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(4),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(4),
+                    },
+                    count: None,
+                },
                 wgpu::BindGroupLayoutEntry {
                     binding: 6,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -538,6 +593,14 @@ impl Prepared {
                 wgpu::BindGroupEntry { binding: 8, resource: body_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: body_rect_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: sun_claims_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: sun_table_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&view),
                 },
@@ -580,6 +643,8 @@ impl Prepared {
             body_count: uniform.volume_params[3],
             body_rects,
             body_rect_buffer,
+            sun_claims_buffer,
+            sun_table_buffer,
             width,
             height,
         }
@@ -691,6 +756,54 @@ impl Prepared {
         queue.write_buffer(&self.body_rect_buffer, 0, bytemuck::cast_slice(rects));
     }
 
+    /// Fills the per-pixel slot region with `SUN_NO_SLOT`, so a pixel that
+    /// inserted nothing is distinguishable from one that took slot 0.
+    ///
+    /// The buffer is otherwise zero-initialised, which is what the app relies
+    /// on for the claim words -- stamp 0 is "never used" -- but makes a
+    /// never-written slot index read as the legal slot 0. Only the occupancy
+    /// probe needs the distinction, so it is paid for there and not on every
+    /// `Prepared`.
+    pub fn clear_sun_pixel_slots(&self, queue: &wgpu::Queue) {
+        let base = u64::from(bevox_render::pipeline::SUN_SLOTS) * 3 * 4;
+        let bytes = vec![0xFFu8; (self.width * self.height) as usize * 4];
+        queue.write_buffer(&self.sun_table_buffer, base, &bytes);
+    }
+
+    /// Dispatches once and reads back what the sun store holds.
+    pub fn sun_store(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> SunStore {
+        let slots = bevox_render::pipeline::SUN_SLOTS;
+        self.dispatch(device, queue);
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+
+        let claims = read_buffer_words(device, queue, &self.sun_claims_buffer, 0, slots);
+        let keys = read_buffer_words(device, queue, &self.sun_table_buffer, 0, slots * 2);
+        let pixels = read_buffer_words(
+            device,
+            queue,
+            &self.sun_table_buffer,
+            slots * 3,
+            self.width * self.height,
+        );
+
+        let mut occupied = 0usize;
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (slot, &stamp) in claims.iter().enumerate() {
+            if stamp != SUN_STAMP {
+                continue;
+            }
+            occupied += 1;
+            let lo = u64::from(keys[slot * 2]);
+            let hi = u64::from(keys[slot * 2 + 1]);
+            seen.insert(lo | (hi << 32));
+        }
+        SunStore {
+            occupied,
+            distinct_keys: seen.len(),
+            pixels_with_slot: pixels.iter().filter(|&&p| p != u32::MAX).count(),
+        }
+    }
+
     /// Writes a staged update exactly the way `prepare_march_buffers` does.
     ///
     /// Duplicating the offset arithmetic here would let the test agree with a
@@ -715,4 +828,49 @@ impl Prepared {
             queue.write_buffer(&self.field_buffer, offset, bytemuck::cast_slice(&write.words));
         }
     }
+}
+
+/// What the sun store held after a dispatch.
+#[derive(Clone, Copy, Debug)]
+pub struct SunStore {
+    /// Slots carrying this frame's stamp.
+    pub occupied: usize,
+    /// Distinct keys among them. Below `occupied` when the insert race gave one
+    /// voxel face two slots, which costs capacity and not correctness.
+    pub distinct_keys: usize,
+    /// Pixels that came away with a slot. Requires `clear_sun_pixel_slots`
+    /// before the dispatch, or a pixel that inserted nothing reads as slot 0.
+    pub pixels_with_slot: usize,
+}
+
+/// A run of words copied back out of a storage buffer.
+///
+/// Its own staging buffer per call: these are tens of megabytes and the probe
+/// that reads them runs once, so holding one would cost more than it saves.
+pub fn read_buffer_words(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    offset_words: u32,
+    words: u32,
+) -> Vec<u32> {
+    let bytes = u64::from(words) * 4;
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("word_readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_buffer_to_buffer(buffer, u64::from(offset_words) * 4, &staging, 0, bytes);
+    queue.submit([encoder.finish()]);
+
+    let slice = staging.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll failed");
+    let view = slice.get_mapped_range();
+    let out = bytemuck::cast_slice::<u8, u32>(&view).to_vec();
+    drop(view);
+    staging.unmap();
+    out
 }

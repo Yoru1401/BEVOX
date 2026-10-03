@@ -1471,3 +1471,240 @@ fn the_static_march_is_measured() {
          for a Teardown castle on a 1660 Ti, primary and shadow ray."
     );
 }
+
+/// The one line the sun store adds to the shading path, which every probe here
+/// removes to get its baseline.
+///
+/// Removing the call leaves both bindings declared, so what the probes compare
+/// is the insert and not the declarations. The declarations were measured
+/// separately, against the parent revision's shader, when they were added.
+const SUN_INSERT_CALL: &str = "        sun_remember(hit, id, size);\n";
+
+/// The source with the insert removed and everything else, bindings included,
+/// left where it is.
+fn without_the_sun_store(shader: &str) -> String {
+    assert_eq!(
+        shader.matches(SUN_INSERT_CALL).count(),
+        1,
+        "the insert call site moved; every sun-store probe edits it by text and must be \
+         updated with it",
+    );
+    shader.replace(SUN_INSERT_CALL, "")
+}
+
+/// Inserting into the sun store moves no pixel, at either resolution, with
+/// bodies and without.
+///
+/// The premise of the whole plan is that sun visibility is *already* a per-voxel
+/// property, so a store nothing reads cannot move a pixel. This revision writes
+/// the store and shading still marches its own shadow ray, so the image is the
+/// image. A differing pixel here is not a trade-off: it means the insert changed
+/// something it was not supposed to touch.
+///
+/// Not ignored. It is the gate the rest of the plan rests on and it costs one
+/// scene build shared with the benches in this binary.
+#[test]
+fn the_store_changes_no_pixel() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let baseline = without_the_sun_store(&shader);
+    let cube = body_cube();
+    let bodies = bench_bodies(eye, 120.0, &cube, 33.0);
+
+    for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
+        for (what, placed) in [("no bodies", &[][..]), ("sixteen bodies", &bodies[..])] {
+            let build = |source: &str| {
+                Prepared::new(
+                    &device, source, "march", &tree, offset_from_clip, eye, w, h,
+                    march_flags::DEFAULT, placed,
+                )
+            };
+            let before = build(&baseline).read_back(&device, &queue);
+            let after = build(&shader).read_back(&device, &queue);
+            let differing = before
+                .chunks_exact(4)
+                .zip(after.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                differing, 0,
+                "{w}x{h}, {what}: the sun store moved {differing} pixels, and nothing reads it",
+            );
+        }
+    }
+}
+
+/// How many times the engine computes each sun answer today, which is the
+/// number that predicts the entire win.
+///
+/// The store is keyed on `(voxel, face)` and nothing reads it, so after one
+/// dispatch the occupied slots are the distinct voxel faces on screen. Pixels
+/// that inserted, divided by those faces, is the redundancy factor: literally
+/// how many pixels share one shadow ray's answer.
+///
+/// **Near 1 means there is nothing to collect** and the plan should stop here,
+/// because a cache with no hits is all cost.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench sun_store --
+/// --ignored --nocapture`.
+#[test]
+#[ignore]
+fn the_sun_store_occupancy_is_reported() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    println!("\nthe sun store after one dispatch, {} slots:", bevox_render::pipeline::SUN_SLOTS);
+    for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
+        let prepared = Prepared::new(
+            &device, &shader, "march", &tree, offset_from_clip, eye, w, h, march_flags::DEFAULT,
+            &[],
+        );
+        prepared.clear_sun_pixel_slots(&queue);
+        let store = prepared.sun_store(&device, &queue);
+        let pixels = (w * h) as f64;
+        println!(
+            "  {w}x{h}: {} pixels, {} inserted, {} slots occupied, {} distinct faces\n    \
+             load factor {:.4}\n    \
+             REDUNDANCY {:.2} pixels per distinct face ({:.2} counting sky pixels too)\n    \
+             {:.2} slots per face, so a pass over the occupied slots would compute each \
+             answer that many times and collect {:.2} pixels per answer instead",
+            w * h,
+            store.pixels_with_slot,
+            store.occupied,
+            store.distinct_keys,
+            store.occupied as f64 / f64::from(bevox_render::pipeline::SUN_SLOTS),
+            store.pixels_with_slot as f64 / store.distinct_keys.max(1) as f64,
+            pixels / store.distinct_keys.max(1) as f64,
+            store.occupied as f64 / store.distinct_keys.max(1) as f64,
+            store.pixels_with_slot as f64 / store.occupied.max(1) as f64,
+        );
+        assert!(store.distinct_keys > 0, "nothing was inserted; the store is not being written");
+    }
+}
+
+/// What the store costs when nothing reads it, which is its overhead alone.
+///
+/// This revision is a deliberate regression: it pays for the atomic claim, the
+/// key write and the per-pixel slot write, and shading still marches its own
+/// shadow ray. Measuring here is the only chance to see the overhead on its
+/// own, because once anything reads the store the two move together.
+///
+/// Interleaved A/B/A in one invocation at both resolutions, drift reported
+/// beside the difference, per `docs/concepts/gpu-codegen-cliff.md`. The ceiling
+/// this comes out of is the 7.98-8.36 ms the shadow march costs at 1080p.
+///
+/// Run with `cargo test --release -p bevox_render --test gpu_bench sun_store --
+/// --ignored --nocapture`.
+#[test]
+#[ignore]
+fn what_the_sun_store_costs() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    if !timestamps_supported(&device) {
+        eprintln!("adapter has no TIMESTAMP_QUERY, skipping");
+        return;
+    }
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    let baseline = without_the_sun_store(&shader);
+
+    for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
+        let build = |source: &str| {
+            Prepared::new(
+                &device, source, "march", &tree, offset_from_clip, eye, w, h,
+                march_flags::DEFAULT, &[],
+            )
+        };
+        let (a, b) = (build(&baseline), build(&shader));
+        let (text, wall, gpu) = row_text(aba_both(&device, &queue, &a, &b));
+        println!("\n{w}x{h}  insert on against off:\n  {text}");
+        println!(
+            "  the store costs {gpu:+.2} ms on the GPU clock ({wall:+.2} wall), against the \
+             {:.2} ms ceiling the shadow march sets at 1080p",
+            8.36,
+        );
+    }
+}
+
+/// Two different voxel faces sharing one slot is what the stored key guards, and
+/// the guard is load-bearing rather than defensive.
+///
+/// The hash folds a 39-bit key into 21 bits. Forcing every key comparison to
+/// report equal makes an insert accept the first occupied slot a probe lands on,
+/// whoever owns it, so every face that collided is swallowed by the face that
+/// got there first. The number swallowed is the number of voxel faces that would
+/// read another voxel's answer, and it is reported here rather than asserted
+/// away.
+///
+/// It is a birthday count, `n^2 / 2m` for `n` faces in `m` slots -- about 2,100
+/// of 94,000 faces at 1280x720 against 2^21 slots. **Not "most", which is what a
+/// table at a 4.5% load factor buys**, and not nothing either: without the
+/// stored key those thousands of faces are wrong, and at 1080p there are four
+/// times as many.
+///
+/// **This revision cannot show that as a broken image, and saying otherwise
+/// would be a lie:** nothing reads the store yet, so no pixel can depend on it.
+/// What it shows is the sharing itself, in the store. The image break belongs to
+/// the task that adds the read.
+#[test]
+fn forcing_every_key_to_match_shares_slots_between_voxels() {
+    let Some((device, queue)) = gpu_device() else {
+        eprintln!("no GPU adapter available, skipping");
+        return;
+    };
+    let (tree, extent) = bench_scene();
+    let (eye, offset_from_clip) = bench_camera(extent);
+    let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+
+    let needle = "if sun_table[slot * 2u] == lo && sun_table[slot * 2u + 1u] == hi {";
+    assert_eq!(
+        shader.matches(needle).count(),
+        1,
+        "the key verification moved; this break edits it by text and must be updated with it",
+    );
+    let blind = shader.replace(needle, "if true {");
+
+    let (w, h) = (1280u32, 720u32);
+    let build = |source: &str| {
+        Prepared::new(
+            &device, source, "march", &tree, offset_from_clip, eye, w, h, march_flags::DEFAULT,
+            &[],
+        )
+    };
+    let honest = build(&shader).sun_store(&device, &queue);
+    let shared = build(&blind).sun_store(&device, &queue);
+    let swallowed = honest.distinct_keys.saturating_sub(shared.distinct_keys);
+    let slots = f64::from(bevox_render::pipeline::SUN_SLOTS);
+    let expected = honest.distinct_keys.pow(2) as f64 / (2.0 * slots);
+
+    eprintln!(
+        "keys verified: {} faces in {} slots. Keys reported equal: {} faces, so {swallowed} \
+         voxel faces took a slot another voxel owns -- a birthday count predicts {expected:.0}.",
+        honest.distinct_keys, honest.occupied, shared.distinct_keys,
+    );
+    assert!(
+        swallowed > 0,
+        "with every key reported equal, no face took another's slot; either nothing collides \
+         or the comparison is not what decides a slot's owner",
+    );
+    // Half the prediction, not the prediction: the count is a race between
+    // pixels and the exact number moves between runs.
+    assert!(
+        (swallowed as f64) > expected * 0.5,
+        "{swallowed} faces shared a slot against about {expected:.0} predicted; the collision \
+         the key guards is not happening at the rate the capacity implies",
+    );
+}
