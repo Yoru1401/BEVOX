@@ -1,7 +1,7 @@
 ---
 type: Measurement
 title: 'The sun pass was lane-bound, not ray-bound'
-description: 'Marching one shadow ray per slot over a 5.65%-occupied table cost 15.01 ms for 118,423 rays against 8.14 ms for 1,092,019; the waste was idle lanes, and compacting the slots into a dense work list took it to 2.15 ms and collected 5.0 of the 8.36 ms ceiling.'
+description: 'Marching one shadow ray per slot over a 5.65%-occupied table cost 15.01 ms for 118,423 rays against 8.14 ms for 1,092,019; the waste was idle lanes, and compacting the slots into a dense work list took it to 2.15 ms and collected 5.0 of the 8.36 ms ceiling. The 2.4x a ray left over was ray incoherence, and a surface-coherent hash halved it for free.'
 tags: [performance, gpu, lighting, dispatch]
 generated: { by: claude-opus-5/claude-code, at: 2026-10-03T00:00:00Z }
 sources:
@@ -86,19 +86,33 @@ length. 18.2 ns a ray against 7.5 is what that costs, and it is already priced
 into the +5.0 ms. Ordering the work list by voxel locality is the only lever
 left on this pass, and it has not been measured.
 
-# That 2.4x is also the break-even redundancy, and it is the reason the horizon loses
+# That 2.4x is also the break-even redundancy, and a coherent hash halved it
 
 A per-slot ray costing 2.2-2.4x a per-pixel one means the store must share each
-answer that many ways before it saves anything at all. **The break-even
-redundancy is this ratio, not 1.** On the bench camera 9.22 clears it four times
-over; on a distant view, where a voxel covers about a pixel, 1.37 does not clear
-it and the four passes are **6.8-7.1 ms slower than doing nothing at 1080p**.
-The measurement and what it leaves open are in [nine pixels a voxel
+answer that many ways before it saves anything. **The break-even redundancy is
+this ratio, not 1.** On the bench camera 9.22 clears it four times over; at the
+horizon, where a voxel covers about a pixel, 1.37 did not clear it and the four
+passes were **6.8 to 7.1 ms slower than doing nothing at 1080p**.
+
+**This page's closing line above -- that ordering the work list is the only lever
+left -- was right, and the lever turned out to cost nothing to pull.** The
+compaction already walks the table in index order, so a hash whose low bits are a
+face's position in an 8x8 patch of its surface makes the work list come out
+surface-ordered **with no sort and no extra pass**:
+
+| 1920x1080, distant camera | sun pass | ns a ray | break-even |
+|---|---|---|---|
+| scrambling hash | 9.47-9.75 ms | 19.4 | 2.21 |
+| **face-patch hash** | **4.96-5.06 ms** | **9.9** | **1.20-1.22** |
+
+**The incoherence was about half the per-slot ray's cost, and it was
+addressable.** On the bench camera the same change took the sun pass from 2.19 to
+1.26 ms. The measurement, the two ways of getting the index wrong, and the
+probe-sequence change it needs are in [nine pixels a voxel
 face](sun-store-occupancy.md).
 
-So this page's last line — that ordering the work list is the only lever left —
-is now the lever that decides whether distant views need a distance cutoff
-instead. Halving the per-slot ray's cost would halve the break-even factor.
+What that leaves is **9.9 ns a slot ray against about 8.2 ns a pixel ray** -- a
+ratio near 1.2 rather than 2.4, and most of what remains is no longer ordering.
 
 # What the pixel side needed that the spec did not say
 

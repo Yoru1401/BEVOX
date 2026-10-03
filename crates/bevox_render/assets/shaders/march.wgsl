@@ -1238,17 +1238,84 @@ fn sun_key_hi(voxel: vec3<u32>, face: u32) -> u32 {
     return ((voxel.z >> 8u) & 0xFu) | (face << 4u);
 }
 
-/// A slot for a key. Two rounds of an integer finaliser over both words: the key
-/// is dense in x and y, and the low bits of a position would otherwise send
-/// whole scanlines down one probe chain.
+/// Voxels an axis of a face patch holds, as a bit count: 3 is an 8x8 patch and
+/// 6 bits of patch-local index.
+///
+/// The one number that trades ray coherence against probe length. Larger packs
+/// more of one patch into consecutive slots, which is the whole point, and
+/// leaves the scrambled part above it fewer bits to spread patches over, so two
+/// patches share a run of slots sooner.
+const SUN_BRICK_BITS: u32 = 3u;
+/// Slots one face patch occupies, consecutively. Derived, so the width is
+/// spelled once: a disagreement would overlap the scrambled part with the local
+/// index and there would be no picture to show it.
+///
+/// **Two, not three, powers of `SUN_BRICK_BITS`**, because a face is a flat
+/// thing. See `sun_hash`.
+const SUN_BRICK_SLOTS: u32 = 1u << (SUN_BRICK_BITS * 2u);
+
+/// A slot for a key: **an 8x8 patch-local index in the low bits, a scrambled
+/// patch and face above it.** Faces near each other on a surface land near each
+/// other in the table, on purpose.
+///
+/// **This is the opposite of what the first version did, and the reason is the
+/// sun pass, not the insert.** A fully scrambled index gives the table an even
+/// load and neighbouring slots unrelated voxels, so the compaction -- which
+/// walks the table in index order -- emits a work list in which no two adjacent
+/// entries have anything to do with each other. A shadow ray then costs 20.0 ns
+/// against 9.1 for the per-pixel one it replaced, because neighbouring pixels
+/// march near-identical rays and neighbouring slots do not. That ratio is the
+/// store's break-even redundancy, and at the horizon there is not enough
+/// redundancy to clear it -- see `docs/concepts/sun-store-occupancy.md`.
+///
+/// So the low `SUN_BRICK_BITS * 2` bits are the face's position within an 8x8
+/// patch of the surface it lies on, and the bits above are a finaliser over
+/// everything else in the key. **The compaction then emits a roughly
+/// surface-ordered list for free**: no sort, no extra pass, no run-time cost.
+/// A run of 64 consecutive slots is one 8x8 patch of one surface, which is one
+/// 64-lane workgroup marching 64 near-identical rays.
+///
+/// **The local index is two-dimensional, and getting that wrong cost half the
+/// inserts.** The first form used a 3D brick index -- 9 bits over all three
+/// axes of an 8x8x8 brick -- and a floor is flat in y, so every floor face in a
+/// brick shared one value of `y & 7` and only 64 of that run's 512 slots were
+/// ever reachable. Four patches a run each wanting the same 64 of 512 saturated
+/// it: **51% of hit pixels on the distant camera came away with no slot**, which
+/// is correct (they march their own ray) and collects nothing. Indexing by the
+/// two axes *tangent* to the face instead uses every slot in the run.
+///
+/// The voxel's position **along** the face normal therefore has to ride in the
+/// scrambled part rather than being dropped, or two parallel faces one voxel
+/// apart would collide in every run they ever tried.
+///
+/// The voxel and face are unpacked inline rather than through `sun_key_voxel`,
+/// which is declared below this: WGSL has no forward declarations, and moving a
+/// function to satisfy one has twice moved this shader's timings on its own.
 fn sun_hash(lo: u32, hi: u32) -> u32 {
-    var h = lo ^ (hi * 0x9E3779B9u);
+    let m = (1u << SUN_BRICK_BITS) - 1u;
+    // z's low byte is the key's top byte, so its low bits come out of `lo` too.
+    let x = lo & m;
+    let y = (lo >> 12u) & m;
+    let z = (lo >> 24u) & m;
+    let face = (hi >> 4u) & 7u;
+    let axis = face >> 1u;
+    // The two axes tangent to this face, and the one along its normal.
+    let u = select(x, y, axis == 0u);
+    let v = select(y, z, axis < 2u);
+    let n = select(select(x, y, axis == 1u), z, axis == 2u);
+    let local = (u << SUN_BRICK_BITS) | v;
+
+    let zf = (lo >> 24u) | ((hi & 0xFu) << 8u);
+    var h = ((lo >> SUN_BRICK_BITS) & 0x1FFu)
+        | (((lo >> (12u + SUN_BRICK_BITS)) & 0x1FFu) << 9u)
+        | (((zf >> SUN_BRICK_BITS) & 0x1FFu) << 18u);
+    h ^= (face * 0x9E3779B9u) ^ (n * 0x85EBCA6Bu);
     h ^= h >> 16u;
     h *= 0x7FEB352Du;
     h ^= h >> 15u;
     h *= 0x846CA68Bu;
     h ^= h >> 16u;
-    return h;
+    return (h * SUN_BRICK_SLOTS) | local;
 }
 
 /// A tag for a key: 24 bits of a *second*, independent mix.
@@ -1333,8 +1400,23 @@ fn sun_claim(lo: u32, hi: u32) -> u32 {
             return slot;
         }
         if (held >> SUN_STAMP_SHIFT) == stamp {
-            // This frame's, and another face's. Probe on.
-            slot = (slot + 1u) & mask;
+            // This frame's, and another face's. Probe on by a whole brick run
+            // rather than by one slot.
+            //
+            // `sun_hash` puts a brick's faces in a run of `SUN_BRICK_SLOTS`
+            // consecutive slots, so a collision means another *brick* holds
+            // this run and the slots just past it are that brick's too. Walking
+            // +1 into them cannot escape a whole run in `SUN_PROBES` tries:
+            // measured with a 512-slot run, that lost a slot for 17% of hit
+            // pixels on the near camera and 54% on the distant one, where the
+            // image stayed correct -- they march their own ray -- and the
+            // saving collapsed.
+            //
+            // Adding the run width instead tries eight *different* runs, and
+            // because the width is a power of two it leaves the low bits alone,
+            // so this face keeps its own local offset in whichever run takes
+            // it. The coherence the hash exists for survives the probe.
+            slot = (slot + SUN_BRICK_SLOTS) & mask;
             continue;
         }
         let claimed = atomicCompareExchangeWeak(&sun_claims[slot], held, want);

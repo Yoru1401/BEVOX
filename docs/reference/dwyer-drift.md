@@ -41,10 +41,11 @@ which leaves **F1, F2 and F4** worth fixing. Of those three, **two are in the
 renderer** (F1 the missing bounding-sphere reject, and F2); **F4 is the stress
 scene**, which is physics.
 
-**F3's fix has an open edge, and it is not counted as drift.** Computing sun
-visibility per voxel face collects 5.3 ms of an 8.36 ms ceiling on a near
-camera and is a 4.4-7.0 ms *regression* on a distant one. Whether that wants a
-distance cutoff is a design decision, not an oversight nobody made.
+**F3's fix has a thin open edge, and it is not counted as drift.** Computing sun
+visibility per voxel face collects 5.3 ms of an 8.36 ms ceiling on a near camera
+and was a 4.4-7.0 ms *regression* on a distant one until a surface-coherent hash
+took that to about +0.5 ms. Whether the residue wants a distance cutoff is a
+design decision, not an oversight nobody made.
 
 (The sentence here used to read "Four are in the renderer … leaves four worth
 fixing", which equated two different fours: the four renderer items as counted
@@ -198,14 +199,25 @@ what the ray depends on or it does not.
    workgroup costs what its slowest lane costs**. Gathering the occupied slots
    into a dense work list costs 0.12 ms and took the pass from 15.01 to 2.15.
 
-**Good idea? Yes on the near view, and not settled at the horizon.** A per-slot
-ray costs 2.2x a per-pixel one — the rays are incoherent where neighbouring
-pixels' are not — so the store needs a redundancy of about **2.2** to break even
-on marching alone. A distant camera where a voxel covers about one pixel has
-**1.01 at 720p and 1.37 at 1080p**, and there the four passes are **+4.4 ms and
-+6.8 to +7.1 ms slower than `34f2d45`**, which is the revision before any of
-this. Looking at distant terrain is ordinary play, so a distance cutoff or a
-locality-ordered work list is an open decision rather than a corner case.
+**Good idea? Yes, and the horizon is nearly settled too.** A per-slot ray was
+costing 2.2x a per-pixel one — the rays are incoherent where neighbouring
+pixels' are not — so the store needed a redundancy of about **2.2** to break
+even on marching alone, and a distant camera where a voxel covers one pixel has
+only **1.01 at 720p and 1.37 at 1080p**. There the four passes were **+4.4 and
++6.8 to +7.1 ms slower than `34f2d45`**, the revision before any of this.
+
+**A third finding closed most of that, and it costs nothing at run time.** The
+compaction walks the table in index order, so making the hash's low bits a
+face's position within an 8x8 patch of its surface makes the work list come out
+surface-ordered with no sort and no extra pass. The per-slot ray halved, 19.4 to
+**9.9 ns**, break-even fell from 2.2 to **1.20-1.22**, and the horizon went from
++6.9 ms to **about +0.5 ms at 1080p** and +1.3 at 720p, with the near field's
+win intact at about -5.4 ms. Slots a face stayed at 1.0000 and the image stayed
+bit-identical.
+
+**What is left is roughly half a millisecond at 1080p**, the thinnest margin over
+drift on this page. Whether that residue wants a distance cutoff is an open
+design decision rather than drift nobody decided.
 
 The measurements are in [nine pixels a voxel
 face](../concepts/sun-store-occupancy.md) and [the sun pass was

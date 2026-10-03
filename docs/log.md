@@ -1,6 +1,25 @@
 # Update Log
 
 ## 2026-10-03
+* **Update**: [a surface-coherent hash halves the per-slot shadow ray, for
+  free](concepts/sun-store-occupancy.md). The compaction already walks the table
+  in index order, so putting a face's position within an **8x8 patch of its own
+  surface** in the low bits of the slot index makes the work list come out
+  surface-ordered — **no sort, no extra pass, no run-time cost**. A run of 64
+  consecutive slots is one patch of one surface, which is one 64-lane workgroup
+  marching 64 near-identical rays. The per-slot ray went **19.4 → 9.9 ns**, so
+  **break-even redundancy fell from 2.2 to 1.20-1.22**, and the horizon's loss
+  went from **+6.9 ms to about +0.5 at 1080p** and +4.5 to +1.3 at 720p, with
+  the near field's win intact at about **-5.4 ms**. Slots a face stayed
+  **1.0000** and the image stayed bit-identical at both cameras, both
+  resolutions, bodies on and off. **Two ways of getting it wrong, each costing
+  half the inserts:** a 3D brick index wastes the axis a surface is flat in — a
+  floor reached only 64 of each run's 512 slots and **51% of distant hit pixels
+  came away with no slot** — and linear probing cannot escape a clustered run in
+  eight tries, so the probe advances by a whole run instead. **The clustering
+  cost the primary pass nothing measurable**: twelve readings swung both ways for
+  the same configuration. What is left is half a millisecond at the horizon, and
+  whether that wants a distance cutoff is still open.
 * **Measurement**: [the per-voxel sun store loses at the horizon, and the
   break-even redundancy is 2.2 rather than 1](concepts/sun-store-occupancy.md).
   A camera far enough that a voxel covers about one pixel has **1.01 pixels a
@@ -13,7 +32,7 @@
   each answer about **2.2 ways just to break even on the marching**. 9.22 clears
   that four times over; 1.37 does not clear it at all. **Whether this wants a
   distance cutoff or a locality-ordered work list is an open decision and is not
-  made here.**
+  made here.** *(Mostly closed the same day by the coherent hash above.)*
 * **Measurement**: the overflow fallback, gated by overflowing the table rather
   than by argument — [nine pixels a voxel face](concepts/sun-store-occupancy.md).
   The slot count rides in the uniform, so it shrinks with no shader edit: the

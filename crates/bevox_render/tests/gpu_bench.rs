@@ -371,21 +371,29 @@ fn shader_at(revision: &str) -> Option<String> {
     String::from_utf8(out.stdout).ok()
 }
 
-/// **The worst case: distant geometry, where there is no redundancy to
-/// collect.** The gate is that the four-pass path must not be SLOWER here.
+/// **The worst case, and whether a spatially coherent hash closes it.**
 ///
-/// Two baselines, because they answer different questions and differ by the
-/// store's own overhead:
+/// Two cameras. `bench_camera` is close, 9.22 pixels a face, and is where the
+/// +5.3 ms was collected. `distant_camera` covers about one pixel a face and is
+/// where the four-pass path was measured 6.8-7.1 ms SLOWER than doing nothing.
 ///
-/// - `34f2d45`, the revision before any of this work, whose shader has no store
-///   at all. This is "against doing nothing", which is the honest gate.
-/// - `4560d58`, this branch's parent, which inserts into the store and reads it
-///   nowhere. It already pays about +0.4 ms at 1080p on the bench camera, so an
-///   A side taken here flatters the four passes by roughly that much.
+/// Three baselines, because they answer three different questions:
 ///
-/// The redundancy factor for this camera is reported first, because a gate on a
-/// camera that turned out to have redundancy left would prove nothing. Near 1
-/// is what makes the measurement below worst-case.
+/// - `34f2d45`, before any of this work, whose shader has no store at all.
+///   **This is the gate**: positive means the whole change is a loss.
+/// - `9fb62ba`, the same four passes with the **scrambling** hash, which
+///   isolates the hash change from everything else.
+/// - `4560d58`, which inserts and reads nothing. It already pays the insert, so
+///   an A side taken here flatters the four passes.
+///
+/// The redundancy factor is reported first: a gate on a camera that turned out
+/// to have redundancy left would prove nothing.
+///
+/// The number this exists for is **ns a ray in the sun pass**. A per-slot ray
+/// cost 20.0 ns against 9.1 for the per-pixel one it replaced, and that ratio
+/// is the break-even redundancy -- so halving it halves what the store needs to
+/// share before it pays. The primary pass is printed beside it because
+/// clustering lengthens probes and the probes are paid there.
 ///
 /// Run with `cargo test --release -p bevox_render --test gpu_bench worst_case --
 /// --ignored --nocapture`.
@@ -401,64 +409,90 @@ fn the_worst_case_is_measured_against_the_parent() {
         return;
     }
     let (tree, extent) = bench_scene();
-    let (eye, offset_from_clip) = distant_camera(extent);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
+    /// The revision whose `march.wgsl` is the same four passes with the
+    /// scrambling hash, so the hash can be measured on its own.
+    const SCRAMBLED: &str = "9fb62ba";
 
-    for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
-        let build = |source: &str, entry: &str| {
-            Prepared::new(
-                &device, source, entry, &tree, offset_from_clip, eye, w, h,
-                march_flags::DEFAULT, &[],
-            )
-        };
-
-        let probe = build(&shader, "march");
-        probe.clear_sun_pixel_slots(&queue);
-        let store = probe.sun_store(&device, &queue);
-        let redundancy = store.pixels_with_slot as f64 / store.distinct_keys.max(1) as f64;
-        println!(
-            "\n{w}x{h} distant camera: {} of {} pixels inserted, {} distinct faces\n  \
-             REDUNDANCY {redundancy:.2} pixels per distinct face \
-             (bench_camera is 5.16 at 720p and 9.22 at 1080p)",
-            store.pixels_with_slot,
-            w * h,
-            store.distinct_keys,
-        );
-
-        let split = build(&shader, "march_composite");
-        let single = build(&shader, "march");
-        let one = pass_times(&device, &queue, &single);
-        let four = pass_times(&device, &queue, &split);
-        println!(
-            "  per pass, GPU ms, median of 7:\n    \
-             one:  beam {:.2} + march {:.2} = {:.2}\n    \
-             four: beam {:.2} + primary {:.2} + compact {:.2} + sun {:.2} + composite {:.2} \
-             = {:.2}\n    \
-             the sun pass marches {} rays where the per-pixel path marches {}\n    \
-             {:.1} ns a ray in the sun pass against {:.1} ns in the primary it was taken out \
-             of, so the store does not break even below {:.2} pixels a face before its own \
-             overhead is counted",
-            one[0], one[4], one.iter().sum::<f32>(),
-            four[0], four[1], four[2], four[3], four[4], four.iter().sum::<f32>(),
-            store.distinct_keys, store.pixels_with_slot,
-            four[3] * 1.0e6 / store.distinct_keys.max(1) as f32,
-            (one[4] - four[1]) * 1.0e6 / store.pixels_with_slot.max(1) as f32,
-            (four[3] / store.distinct_keys.max(1) as f32)
-                / ((one[4] - four[1]) / store.pixels_with_slot.max(1) as f32),
-        );
-        for revision in ["34f2d45", "4560d58"] {
-            let Some(parent) = shader_at(revision) else {
-                eprintln!("  git could not produce {revision}'s shader, skipping that baseline");
-                continue;
+    for (where_from, (eye, offset_from_clip)) in
+        [("bench", bench_camera(extent)), ("distant", distant_camera(extent))]
+    {
+        for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
+            let build = |source: &str, entry: &str| {
+                Prepared::new(
+                    &device, source, entry, &tree, offset_from_clip, eye, w, h,
+                    march_flags::DEFAULT, &[],
+                )
             };
-            let base = build(&parent, "march");
-            let (text, wall, gpu) = row_text(aba_both(&device, &queue, &base, &split));
-            println!("  four passes against {revision}'s single pass:\n    {text}");
+
+            let store = {
+                let probe = build(&shader, "march");
+                probe.clear_sun_pixel_slots(&queue);
+                probe.sun_store(&device, &queue)
+            };
+            let redundancy = store.pixels_with_slot as f64 / store.distinct_keys.max(1) as f64;
             println!(
-                "    at {redundancy:.2} pixels a face the split is {:+.2} ms on the GPU clock \
-                 ({:+.2} wall); positive is SLOWER and is the gate",
-                gpu, wall,
+                "\n{where_from} camera {w}x{h}: {} of {} pixels inserted, {} distinct faces, \
+                 {:.4} slots a face\n  REDUNDANCY {redundancy:.2} pixels per distinct face",
+                store.pixels_with_slot,
+                w * h,
+                store.distinct_keys,
+                store.occupied as f64 / store.distinct_keys.max(1) as f64,
             );
+
+            // One timing configuration at a time past here: each holds a sun
+            // table of about 91 MB at 1080p and this card is shared.
+            let one = {
+                let single = build(&shader, "march");
+                pass_times(&device, &queue, &single)
+            };
+            let four = {
+                let split = build(&shader, "march_composite");
+                pass_times(&device, &queue, &split)
+            };
+            let ns_slot = four[3] * 1.0e6 / store.distinct_keys.max(1) as f32;
+            let ns_pixel = (one[4] - four[1]) * 1.0e6 / store.pixels_with_slot.max(1) as f32;
+            println!(
+                "  per pass, GPU ms, median of 7:\n    \
+                 one:  beam {:.2} + march {:.2} = {:.2}\n    \
+                 four: beam {:.2} + primary {:.2} + compact {:.2} + sun {:.2} + composite \
+                 {:.2} = {:.2}\n  \
+                 SUN RAY {ns_slot:.1} ns against {ns_pixel:.1} ns per pixel, so BREAK-EVEN is \
+                 {:.2} pixels a face before the store's own overhead",
+                one[0], one[4], one.iter().sum::<f32>(),
+                four[0], four[1], four[2], four[3], four[4], four.iter().sum::<f32>(),
+                ns_slot / ns_pixel,
+            );
+
+            if let Some(scrambled) = shader_at(SCRAMBLED) {
+                let old = {
+                    let p = build(&scrambled, "march_composite");
+                    pass_times(&device, &queue, &p)
+                };
+                println!(
+                    "  {SCRAMBLED}'s scrambling hash, same four passes: primary {:.2} (against \
+                     {:.2}), sun {:.2} (against {:.2})\n    \
+                     so the coherent hash moves the primary {:+.2} ms -- where the probes are \
+                     paid -- and the sun pass {:+.2}",
+                    old[1], four[1], old[3], four[3], four[1] - old[1], four[3] - old[3],
+                );
+            }
+
+            let split = build(&shader, "march_composite");
+            for revision in [SCRAMBLED, "34f2d45", "4560d58"] {
+                let Some(parent) = shader_at(revision) else {
+                    eprintln!("  git could not produce {revision}'s shader, skipping it");
+                    continue;
+                };
+                let entry = if revision == SCRAMBLED { "march_composite" } else { "march" };
+                let base = build(&parent, entry);
+                let (text, wall, gpu) = row_text(aba_both(&device, &queue, &base, &split));
+                println!("  against {revision} ({entry}):\n    {text}");
+                println!(
+                    "    at {redundancy:.2} pixels a face this is {gpu:+.2} ms on the GPU clock \
+                     ({wall:+.2} wall); positive is SLOWER",
+                );
+            }
         }
     }
 }
@@ -1723,18 +1757,25 @@ fn with_the_insert_race(shader: &str) -> String {
     // never had: with no tag it cannot fire, and leaving dead code in the loop
     // is exactly the kind of thing this project has watched move a frame by
     // tens of percent.
-    let other = concat!(
-        "        if (held >> SUN_STAMP_SHIFT) == stamp {\n",
-        "            // This frame's, and another face's. Probe on.\n",
-        "            slot = (slot + 1u) & mask;\n",
-        "            continue;\n",
-        "        }\n",
-    );
-    assert_eq!(
-        shader.matches(other).count(),
-        1,
-        "the insert's probe-on branch moved; this break edits it by text",
-    );
+    // Matched from the branch's head to its tail rather than quoted whole: the
+    // commentary inside it is a dozen lines explaining the run-width stride,
+    // and a break that has to be re-typed every time a comment is reworded is a
+    // break that gets deleted.
+    let other_head = "        if (held >> SUN_STAMP_SHIFT) == stamp {\n";
+    let other_tail = "            continue;\n        }\n";
+    let other = {
+        assert_eq!(
+            shader.matches(other_head).count(),
+            1,
+            "the insert's probe-on branch moved; this break edits it by text",
+        );
+        let from = shader.find(other_head).expect("checked above");
+        let to = shader[from..].find(other_tail).expect("the probe-on branch has no tail")
+            + from
+            + other_tail.len();
+        shader[from..to].to_string()
+    };
+    let other = other.as_str();
     without_the_key_tag(shader).replace(other, "").replace(
         mine,
         "        if held == want {\n\
@@ -1827,35 +1868,47 @@ fn the_sun_store_occupancy_is_reported() {
         return;
     };
     let (tree, extent) = bench_scene();
-    let (eye, offset_from_clip) = bench_camera(extent);
     let shader = std::fs::read_to_string("assets/shaders/march.wgsl").expect("shader missing");
 
     println!("\nthe sun store after one dispatch, {} slots:", bevox_render::pipeline::SUN_SLOTS);
-    for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
-        let prepared = Prepared::new(
-            &device, &shader, "march", &tree, offset_from_clip, eye, w, h, march_flags::DEFAULT,
-            &[],
-        );
-        prepared.clear_sun_pixel_slots(&queue);
-        let store = prepared.sun_store(&device, &queue);
-        let pixels = (w * h) as f64;
-        println!(
-            "  {w}x{h}: {} pixels, {} inserted, {} slots occupied, {} distinct faces\n    \
-             load factor {:.4}\n    \
-             REDUNDANCY {:.2} pixels per distinct face ({:.2} counting sky pixels too)\n    \
-             {:.2} slots per face, so a pass over the occupied slots would compute each \
-             answer that many times and collect {:.2} pixels per answer instead",
-            w * h,
-            store.pixels_with_slot,
-            store.occupied,
-            store.distinct_keys,
-            store.occupied as f64 / f64::from(bevox_render::pipeline::SUN_SLOTS),
-            store.pixels_with_slot as f64 / store.distinct_keys.max(1) as f64,
-            pixels / store.distinct_keys.max(1) as f64,
-            store.occupied as f64 / store.distinct_keys.max(1) as f64,
-            store.pixels_with_slot as f64 / store.occupied.max(1) as f64,
-        );
-        assert!(store.distinct_keys > 0, "nothing was inserted; the store is not being written");
+    // Both cameras. The slots-per-face figure is the one that has to stay at
+    // 1.000, and a spatially coherent hash clusters by design, so the distant
+    // camera -- four times the distinct faces at 1080p, and the faces arriving
+    // in spatial runs rather than scattered -- is where clustering would break
+    // the dedup if it were going to.
+    for (where_from, (eye, offset_from_clip)) in
+        [("bench", bench_camera(extent)), ("distant", distant_camera(extent))]
+    {
+        for &(w, h) in &[(1280u32, 720u32), (1920u32, 1080u32)] {
+            let prepared = Prepared::new(
+                &device, &shader, "march", &tree, offset_from_clip, eye, w, h,
+                march_flags::DEFAULT, &[],
+            );
+            prepared.clear_sun_pixel_slots(&queue);
+            let store = prepared.sun_store(&device, &queue);
+            let pixels = (w * h) as f64;
+            println!(
+                "  {where_from} {w}x{h}: {} pixels, {} inserted, {} slots occupied, {} distinct \
+                 faces\n    \
+                 load factor {:.4}\n    \
+                 REDUNDANCY {:.2} pixels per distinct face ({:.2} counting sky pixels too)\n    \
+                 {:.4} SLOTS PER FACE, so a pass over the occupied slots would compute each \
+                 answer that many times and collect {:.2} pixels per answer instead",
+                w * h,
+                store.pixels_with_slot,
+                store.occupied,
+                store.distinct_keys,
+                store.occupied as f64 / f64::from(bevox_render::pipeline::SUN_SLOTS),
+                store.pixels_with_slot as f64 / store.distinct_keys.max(1) as f64,
+                pixels / store.distinct_keys.max(1) as f64,
+                store.occupied as f64 / store.distinct_keys.max(1) as f64,
+                store.pixels_with_slot as f64 / store.occupied.max(1) as f64,
+            );
+            assert!(
+                store.distinct_keys > 0,
+                "nothing was inserted; the store is not being written",
+            );
+        }
     }
 }
 

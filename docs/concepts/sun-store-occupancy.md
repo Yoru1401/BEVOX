@@ -1,7 +1,7 @@
 ---
 type: Measurement
 title: 'Nine pixels a voxel face, and one slot each'
-description: 'The sun shadow ray is recomputed 9.22 times a voxel face at 1080p on the near camera, so the redundancy is there to collect, and the insert claims exactly one slot per face because the frame stamp and the key tag share one word. At the horizon the factor is 1.01-1.37 and the store is a 4.4-7.0 ms regression, because break-even needs about 2.2.'
+description: 'The sun shadow ray is recomputed 9.22 times a voxel face at 1080p on the near camera and 1.37 at the horizon, and break-even is the per-slot ray cost ratio rather than 1. A hash that indexes an 8x8 face patch in its low bits makes the compaction emit a surface-ordered work list for free, halving the per-slot ray to 9.9 ns and taking break-even from 2.2 to 1.2.'
 tags: [performance, gpu, lighting, atomics]
 generated: { by: claude-opus-5/claude-code, at: 2026-10-03T00:00:00Z }
 sources:
@@ -37,65 +37,116 @@ one slot a face means a pass over the occupied slots collects all of it.
 The factor over *inserting* pixels is the honest one. The factor over every
 pixel, 17.51 at 1080p, counts sky pixels that never marched a shadow ray.
 
-# The worst case: the horizon, where the factor is 1 and the store loses
+# The worst case: the horizon, and what a coherent hash did to it
 
-**`the_worst_case_is_measured_against_the_parent` is a failed gate and the
-number is on this page because it is a design input, not a bug to tune away.**
-
-`distant_camera` stands high and near one edge of the bench scene, aimed
-down-range at the far edge of the floor, so the frame is terrain at 800 to 1200
-voxels rather than half sky. A vertical field of 0.9 rad over 1080 rows is
-8.33e-4 rad a pixel, so a voxel subtends about a pixel at that distance — which
-is the condition the store has nothing to offer.
+`the_worst_case_is_measured_against_the_parent`. `distant_camera` stands high
+and near one edge of the bench scene, aimed down-range at the far edge of the
+floor, so the frame is terrain at 800 to 1200 voxels rather than half sky. A
+vertical field of 0.9 rad over 1080 rows is 8.33e-4 rad a pixel, so a voxel
+subtends about a pixel at that distance -- the condition where the store has
+nothing to offer.
 
 | | 1280x720 | 1920x1080 |
 |---|---|---|
-| pixels that inserted | 306 403 | 689 285 |
-| distinct `(voxel, face)` keys | 304 731 | 503 636 |
+| pixels that inserted | 306 403 | 689 321 |
+| distinct `(voxel, face)` keys | 304 731 | 503 650 |
 | **the redundancy** | **1.01** | **1.37** |
-| four passes against `34f2d45`, GPU clock | **+4.36 to +4.58 ms** | **+6.79 to +7.05 ms** |
-| the same against `4560d58`, which already inserts | +3.63 to +4.45 | +5.24 to +6.83 |
-| drift on those readings | 0.06-0.44 | 0.01-0.30 |
+| slots a face | 1.0000 | 1.0000 |
 
-Three invocations, each A/B/A interleaved in one command, across two source
-files rather than within one module. **No reading's drift came near its effect.**
-`4560d58` is this branch's parent and already pays the insert, so it is the
-flattering baseline of the two; `34f2d45` has no store at all and is the honest
-one.
+**With the scrambling hash this was a 4.4 to 7.1 ms regression**, measured
+against `34f2d45` -- the revision before any of this work, whose shader has no
+store at all. The store did not merely fail to help: at 1080p, taking the shadow
+march out of the primary saved 6.25 ms and putting it back as a sun pass over
+503 650 slots cost **10.08**.
 
-**Where it goes, at 1920x1080, GPU ms, median of seven:**
+**The spatially coherent hash below closed most of it.** Three invocations, each
+A/B/A interleaved in one command across two source files, GPU clock, positive is
+slower:
 
-| one dispatch | | four dispatches | |
-|---|---|---|---|
-| `march` | 21.76 | `march_primary` | 15.51 |
-| | | `sun_compact` | 0.12 |
-| | | `sun_pass` | 10.08 |
-| | | `march_composite` | 1.37 |
+| against `34f2d45` | 1280x720 | 1920x1080 |
+|---|---|---|
+| scrambling hash | +4.36, +4.43, +4.58 | +6.79, +6.83, +7.05 |
+| **coherent hash** | **+1.03, +1.32, +1.56** | **+0.43, +0.58, +0.59** |
+| drift | 0.04-0.21 | 0.01-0.24 |
 
-Taking the shadow march out of the primary saved 6.25 ms. Putting it back as a
-sun pass over 503 636 slots cost 10.08. **The store did not fail to help; it
-actively spent 1.6x what it saved, before the compaction and the composite.**
+And the near field did not pay for it -- the bench camera went **-2.1 to -2.6 ms
+at 720p and about -5.4 at 1080p** against the same baseline, which is the +5.3 ms
+Task 2 collected, intact.
 
-# Why 1 is not the break-even point: 2.2 is
+**It is still about half a millisecond slower at the horizon at 1080p**, and that
+is the reading whose margin over its own drift is thinnest on this page: about
++0.5 ms against drift near 0.2. Against `4560d58`, the parent that inserts and
+reads nothing, the same configuration reads **-0.15 to -0.50 ms**, i.e. faster.
+**Whether that residue wants a distance cutoff is a design decision and is not
+made here.**
 
-The sun pass marches **20.0 ns a ray** here against **9.1 ns** in the primary it
-came out of — the ray incoherence already measured in [the sun pass was
-lane-bound](sun-pass-is-lane-bound.md), where it is 18.2 against 7.5 on the near
-camera. A per-slot ray costs about 2.2x a per-pixel one, so the store has to
-share each answer **2.2 ways just to break even on the marching**, and more than
-that to pay for the insert, the compaction entry, the 7-word record and the
-composite's extra read.
+# Why 1 is not the break-even point, and why it is now 1.2 rather than 2.2
 
-**So the premise "any redundancy above 1 is a win" is wrong, and the correct
-threshold is a measured ratio rather than a bound.** 9.22 clears 2.2 four times
-over, which is why the near camera collects 5.3 ms of an 8.36 ms ceiling. 1.37
-does not clear it at all. The same bench prints the ratio per resolution; at
-720p it read 1.64, where the primary's own reading is noisier.
+The sun pass's ray is incoherent where the per-pixel ray is not, and that ratio
+-- not 1 -- is what the store must share an answer across before it saves
+anything:
 
-**Looking at distant terrain is something players do constantly, so this is not
-a corner.** Whether the store takes a distance cutoff, or the work list is
-ordered by voxel locality to attack the 2.2x itself, is an open decision and is
-not made here.
+| per-slot ray, 1920x1080 distant | ns a ray | break-even redundancy |
+|---|---|---|
+| scrambling hash | 19.4 | **2.21** |
+| **brick-coherent hash** | **9.9** | **1.20-1.22** |
+
+Three invocations give 1.22, 1.21 and 1.20 at that camera, which is the
+best-conditioned of the four configurations: the comparator is a difference of
+two separately-measured pass times and is noisy at 720p, where the same
+calculation ranged 0.81 to 1.20.
+
+**So the premise "any redundancy above 1 is a win" was wrong, and the threshold
+is a measured ratio.** 9.22 clears 2.2 four times over, which is why the near
+camera collected 5.3 ms even before the hash. 1.37 did not clear 2.2 and does
+clear 1.2 -- which is exactly why the horizon went from a 7 ms loss to roughly
+break-even rather than to a win.
+
+# The hash: a face-patch index below, a scrambled key above
+
+**`sun_hash` puts the low `SUN_BRICK_BITS * 2` bits of the slot index at the
+face's position within an 8x8 patch of the surface it lies on, and a finaliser
+over everything else in the key above that.** Faces near each other on a surface
+land near each other in the table, deliberately.
+
+The compaction already walks the table in index order, so **it emits a roughly
+surface-ordered work list for free** -- no sort, no extra pass, no run-time cost
+at all. A run of 64 consecutive slots is one 8x8 patch of one surface, which is
+one 64-lane workgroup marching 64 near-identical rays. That is the whole
+mechanism, and it halved the per-slot ray.
+
+**Two things had to be right, and getting either wrong cost half the inserts.**
+
+1. **The local index is two-dimensional, because a face is flat.** The first form
+   used a 3D brick index -- 9 bits over all three axes of an 8x8x8 brick -- and a
+   floor is flat in y, so every floor face in a brick shared one value of
+   `y & 7` and only 64 of that run's 512 slots were ever reachable. Four patches
+   a run each wanting the same 64 of 512 saturated it: **51% of hit pixels on the
+   distant camera came away with no slot**, and 17% on the near one. Indexing by
+   the two axes *tangent* to the face uses every slot in the run, and both
+   figures went to zero. The position *along* the normal moves into the scrambled
+   part rather than being dropped, or two parallel faces one voxel apart would
+   collide in every run they tried.
+2. **The probe must advance by a run, not by a slot.** A collision means another
+   patch holds this run, and the slots just past it are that patch's too, so
+   linear probing cannot escape a run in `SUN_PROBES` tries. Adding
+   `SUN_BRICK_SLOTS` tries eight *different* runs, and because the width is a
+   power of two it leaves the low bits alone -- so a face keeps its own local
+   offset in whichever run takes it, and the coherence survives the probe.
+
+**The clustering did not cost the primary pass, which is where the probes are
+paid and where the cost would have landed.** Twelve readings across three
+invocations and four configurations gave +0.44 to -0.73 ms, swinging both ways
+for the *same* configuration between invocations (bench 1080p read -0.22, -0.18
+and +0.22). That is noise, not an effect, and the honest statement is that no
+probe cost was measurable -- plausibly because the insert gets the same cache
+locality the sun pass does.
+
+**Slots a face stayed 1.0000** at both cameras and both resolutions, which was
+the gate that outranked any speed result: two faces of one patch cannot collide
+at all, since their local indices differ by construction. What collides is two
+*patches* landing on one run, and that is what the probe and the load factor are
+for.
 
 # What it takes to overflow the table
 
@@ -211,10 +262,20 @@ no key reads. **About 5% of the ceiling at 1080p.**
 # The break, and what the cliff did to it
 
 `reintroducing_the_insert_race_costs_slots_per_face` puts the old form back by
-text and reads the store twice in one invocation: 1.000 slots a face against
-**2.676**, which is the 2.68 the first form measured on its own. The gate asserts
-the fixed form is under 1.02 and the raced one over 1.5, so neither half can pass
-by accident.
+text and reads the store twice in one invocation: 1.000 slots a face against the
+raced form's. The gate asserts the fixed form is under 1.02 and the raced one
+over 1.5, so neither half can pass by accident.
+
+**The raced form's own figure depends on the hash, and it moved when the hash
+did: 2.676 with the scrambling hash, 1.676 with the coherent one.** That is the
+defect behaving as described rather than a weaker reproduction — the race is
+lanes of one workgroup reaching one slot in lockstep, and a coherent hash sends
+a workgroup's faces to *different* slots in the same run by construction, so
+fewer of them collide in the first place. It leaves the >1.5 threshold with
+little margin, which is worth knowing before anyone changes
+`SUN_BRICK_BITS`: the gate would start failing as a false alarm rather than
+silently passing, which is the safe direction, but it would still need its
+number re-read rather than its threshold lowered.
 
 Getting that reproduction to agree took one more edit than expected, and it is
 the codegen cliff again. Putting the key read back while **leaving the tag-less
